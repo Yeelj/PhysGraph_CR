@@ -544,10 +544,19 @@ class DexHandManipRHEnv(VecTask):
                 packed_data[k] = fill_data(mano_joints)
             elif type(data[0][k]) == torch.Tensor:
                 stack_data = [d[k] for d in data]
-                if k != "obj_verts":
-                    packed_data[k] = fill_data(stack_data)
-                else:
+                if k in [
+                    "obj_verts",
+                    # Stage 2 tool-region tensors describe static mesh data.
+                    "tool_contact_verts",
+                    "tool_noncontact_verts",
+                    "tool_contact_region_valid",
+                    "tool_noncontact_region_valid",
+                    "tool_contact_region_vertex_count",
+                    "tool_noncontact_region_vertex_count",
+                ]:
                     packed_data[k] = torch.stack(stack_data).squeeze()
+                else:
+                    packed_data[k] = fill_data(stack_data)
             elif type(data[0][k]) == np.ndarray:
                 raise RuntimeError("Using np is very slow.")
             else:

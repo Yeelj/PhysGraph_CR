@@ -226,6 +226,9 @@ def launch_rlg_hydra(cfg: DictConfig):
             "play": cfg.test,
             "checkpoint": cfg.checkpoint,
             "from_ckpt_epoch": cfg.from_ckpt_epoch,
+            # Stage 2 uses checkpoint as an internal frozen base policy rather
+            # than restoring it over the residual policy at runner level.
+            "contact_refine": cfg.get("contactRefine", False),
             "sigma": cfg.sigma if cfg.sigma != "" else None,
             "save_rollouts": {
                 "save_rollouts": cfg.save_rollouts,

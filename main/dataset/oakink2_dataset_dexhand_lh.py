@@ -19,7 +19,7 @@ from typing import List
 from main.dataset.oakink2_layer.smplx import SMPLXLayer
 from main.dataset.transform import aa_to_rotmat, caculate_align_mat, rotmat_to_aa
 from .base import ManipData
-from .oakink2_dataset_utils import load_obj_map, as_mesh
+from .oakink2_dataset_utils import load_obj_map, as_mesh, sample_contact_region_vertices
 from .decorators import register_manipdata
 
 
@@ -193,12 +193,32 @@ class OakInk2DatasetDexHandLH(ManipData):
         )
 
         rs_verts_obj = self.random_sampling_pc(mesh)
+        # Keep the same data schema on both hands. Stage 2 currently consumes
+        # only the right-hand regions, while the left-hand policy stays frozen.
+        (
+            contact_verts,
+            noncontact_verts,
+            has_contact_regions,
+            has_noncontact_regions,
+            contact_region_vertex_count,
+            noncontact_region_vertex_count,
+        ) = sample_contact_region_vertices(obj_mesh_trimesh)
 
         data = {
             "data_path": self.data_pathes[idx],
             "obj_id": obj_id,
             "obj_mesh_path": obj_mesh_path,
             "obj_verts": rs_verts_obj,
+            "tool_contact_verts": torch.from_numpy(contact_verts).to(self.device),
+            "tool_noncontact_verts": torch.from_numpy(noncontact_verts).to(self.device),
+            "tool_contact_region_valid": torch.tensor([float(has_contact_regions)], device=self.device),
+            "tool_noncontact_region_valid": torch.tensor([float(has_noncontact_regions)], device=self.device),
+            "tool_contact_region_vertex_count": torch.tensor(
+                [contact_region_vertex_count], device=self.device, dtype=torch.long
+            ),
+            "tool_noncontact_region_vertex_count": torch.tensor(
+                [noncontact_region_vertex_count], device=self.device, dtype=torch.long
+            ),
             "obj_trajectory": obj_transf_map[obj_id],
             "scene_objs": [],  #! BUG: NO TRANSFER
             "wrist_pos": wrist_pos,

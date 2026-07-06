@@ -23,6 +23,17 @@ env:
   rolloutLen: ${resolve_default:None,${...rolloutLen}}
   rolloutBegin: ${resolve_default:None,${...rolloutBegin}}
 
+  # Stage 2 enables semantic right-hand/tool contact rewards without changing
+  # the collision mesh used for tool-object interaction.
+  contactRefine: ${resolve_default:False,${...contactRefine}}
+  contactRefineSide: "rh"
+  contactRewardScale: 1.0
+  nonContactPenaltyScale: 2.0
+  contactRegionThreshold: 0.02
+  nonContactRegionThreshold: 0.015
+  # Stage 2 contact forces below this value are treated as PhysX noise.
+  contactForceThreshold: 0.1
+
   clipObservations: 5.0
   clipActions: 1.0
 

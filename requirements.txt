@@ -41,5 +41,5 @@ vhacdx==0.0.8.post1
 xatlas==0.0.9
 xxhash==3.4.1
 yourdfpy==0.0.56
-manotorch @ git+https://github.com/lixiny/manotorch.git@933be97d6fa05c729656669640084251ce644b0a
-chamfer_distance @ git+https://github.com/otaheri/chamfer_distance@f86f6f7cadd3aca642704573d1626c67ca2e2846
+# manotorch @ git+https://github.com/lixiny/manotorch.git@933be97d6fa05c729656669640084251ce644b0a
+# chamfer_distance @ git+https://github.com/otaheri/chamfer_distance@f86f6f7cadd3aca642704573d1626c67ca2e2846

@@ -63,6 +63,8 @@ class ModelA2CContinuousLogStdBiH(BaseModel):
                     "rnn_states": states,
                     "mus": mu,
                     "sigmas": sigma,
+                    # Stage 2 runner compares this frozen mean with mus to log
+                    # the applied wrist residual without exploration noise.
                     "base_actions": base_action,
                 }
                 return result

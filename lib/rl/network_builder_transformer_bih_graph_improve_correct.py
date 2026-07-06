@@ -603,7 +603,25 @@ class BimanualHandToolPolicy(A2CBuilder.Network):
         #super().__init__()
         NetworkBuilder.BaseNetwork.__init__(self)
         self.tau = 0.01
+        contact_refine_cfg = params.get("contact_refine", {}) if isinstance(params, dict) else {}
+        self.contact_refine_enabled = bool(contact_refine_cfg.get("enabled", False))
+        self.contact_refine_residual_scale = float(contact_refine_cfg.get("residual_scale", 0.25))
+        self.contact_refine_fixed_logstd = float(contact_refine_cfg.get("frozen_action_logstd", -8.0))
+        # self.contact_refine_trainable_logstd = float(contact_refine_cfg.get("trainable_action_logstd", -3.0))
+        self.contact_refine_trainable_logstd = float(contact_refine_cfg.get("trainable_action_logstd", -5.0))
         self.latent_encoder = LATENT_ENCODER()
+        # Stage 2 receives red/black region geometry through an encoder that is
+        # absent from Stage 1. This keeps the old policy architecture and input
+        # semantics unchanged while giving the residual branch new information.
+        self.contact_refine_encoder = None
+        self.contact_refine_fuser = None
+        if self.contact_refine_enabled:
+            self.contact_refine_encoder = MLP_new(258)
+            self.contact_refine_fuser = nn.Sequential(
+                nn.Linear(128, 64),
+                nn.SiLU(),
+                nn.Linear(64, 64),
+            )
         action_dim = 56
         
         try:
@@ -615,17 +633,106 @@ class BimanualHandToolPolicy(A2CBuilder.Network):
         self.value_head  = MLP_value()
         self.sigma = nn.Parameter(-torch.ones(action_dim, dtype=torch.float),
                                   requires_grad=True)
+        action_mask = torch.zeros(action_dim, dtype=torch.float)
+        # Stage 2 currently corrects only right-wrist translation/rotation.
+        # Right-hand finger and all left-hand actions remain the Stage-1 output.
+        refine_action_indices = contact_refine_cfg.get("action_indices", list(range(6)))
+        action_mask[torch.tensor(refine_action_indices, dtype=torch.long)] = 1.0
+        self.register_buffer("contact_refine_action_mask", action_mask)
+
+        self.base_policy = None
+        if self.contact_refine_enabled:
+            # Start Stage 2 with small wrist exploration (std ~= 0.0067) so the
+            # zero residual initially reproduces the frozen policy closely.
+            nn.init.constant_(self.sigma, self.contact_refine_trainable_logstd)
+            self._zero_init_residual_head()
+            base_checkpoint = contact_refine_cfg.get("base_checkpoint", None)
+            if base_checkpoint is None:
+                raise ValueError("contact_refine.enabled=True requires contact_refine.base_checkpoint")
+            base_params = copy.deepcopy(params)
+            base_params.setdefault("contact_refine", {})
+            base_params["contact_refine"]["enabled"] = False
+            self.base_policy = BimanualHandToolPolicy(base_params, **kwargs)
+            self._load_base_policy(base_checkpoint)
+            for p in self.base_policy.parameters():
+                p.requires_grad = False
+            self.base_policy.eval()
+
+    def _zero_init_residual_head(self):
+        last_layer = self.action_miu_head.net[-1]
+        if isinstance(last_layer, nn.Linear):
+            nn.init.zeros_(last_layer.weight)
+            nn.init.zeros_(last_layer.bias)
+
+    def _load_base_policy(self, checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        state_dict = checkpoint.get("model", checkpoint)
+        policy_state = {}
+        for key, value in state_dict.items():
+            if key.startswith("a2c_network."):
+                policy_state[key[len("a2c_network.") :]] = value
+            elif key.startswith("module.a2c_network."):
+                policy_state[key[len("module.a2c_network.") :]] = value
+            elif key.startswith("running_mean_std") or key.startswith("value_mean_std"):
+                continue
+            else:
+                policy_state[key] = value
+        base_keys = self.base_policy.state_dict().keys()
+        base_uses_orig_mod = any(k.startswith("latent_encoder._orig_mod.") for k in base_keys)
+        state_uses_orig_mod = any(k.startswith("latent_encoder._orig_mod.") for k in policy_state.keys())
+        if base_uses_orig_mod and not state_uses_orig_mod:
+            policy_state = {
+                ("latent_encoder._orig_mod." + k[len("latent_encoder.") :])
+                if k.startswith("latent_encoder.")
+                else k: v
+                for k, v in policy_state.items()
+            }
+        elif state_uses_orig_mod and not base_uses_orig_mod:
+            policy_state = {
+                ("latent_encoder." + k[len("latent_encoder._orig_mod.") :])
+                if k.startswith("latent_encoder._orig_mod.")
+                else k: v
+                for k, v in policy_state.items()
+            }
+        missing, unexpected = self.base_policy.load_state_dict(policy_state, strict=False)
+        print(
+            f"Loaded contact-refine base policy from {checkpoint_path}; "
+            f"missing={len(missing)}, unexpected={len(unexpected)}"
+        )
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.base_policy is not None:
+            self.base_policy.eval()
+        return self
 
     def forward(self, obs: Dict[str, Any], pre_action=None) -> Dict[str, torch.Tensor]:
         z = self.latent_encoder(obs, pre_action)
+        if self.contact_refine_enabled:
+            if "contact_refine" not in obs:
+                raise KeyError("Stage 2 policy requires the 'contact_refine' observation")
+            contact_z = self.contact_refine_encoder(obs["contact_refine"])
+            z = self.contact_refine_fuser(torch.cat([z, contact_z], dim=-1))
         action_miu = self.action_miu_head(z)
         sigma = self.sigma
+        base_action = None
+        if self.contact_refine_enabled:
+            # The frozen base sees the original full-BPS observation. Only the
+            # trainable branch above consumes red/black semantic features.
+            with torch.no_grad():
+                base_action, _, _, _, _ = self.base_policy(obs, pre_action)
+            action_mask = self.contact_refine_action_mask.to(action_miu.device)
+            # Masked residual composition guarantees all non-wrist dimensions
+            # retain the Stage-1 mean action exactly.
+            action_miu = base_action + self.contact_refine_residual_scale * action_miu * action_mask
+            frozen_logstd = torch.full_like(sigma, self.contact_refine_fixed_logstd)
+            sigma = torch.where(action_mask > 0, sigma, frozen_logstd)
         value  = self.value_head(torch.cat([z, obs['privileged']], dim=-1))
         return (action_miu,
                 sigma,
                 value,
                 None,
-                None
+                base_action
                 )
     
 class ResBiHDictObsBuilder(A2CBuilder):

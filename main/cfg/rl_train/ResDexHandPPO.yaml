@@ -16,6 +16,18 @@ params:
   network:
     name: ${res_side:${....side},dict_obs_actor_critic}
     separate: False
+    # Stage 2 wraps the old checkpoint as a frozen policy and learns a masked
+    # right-wrist residual from the independent semantic-region observation.
+    contact_refine:
+      enabled: ${resolve_default:False,${contactRefine}}
+      base_checkpoint: ${if:${contactRefineBaseCheckpoint},${contactRefineBaseCheckpoint},${checkpoint}}
+      residual_scale: 0.25
+      frozen_action_logstd: -8.0
+      # # exp(-3) ~= 0.05 wrist-action exploration at Stage-2 startup.
+      # trainable_action_logstd: -3.0
+      # exp(-5) ~= 0.0067 wrist-action exploration at Stage-2 startup.
+      trainable_action_logstd: ${contactRefineTrainableActionLogstd}
+      action_indices: [0, 1, 2, 3, 4, 5]
 
     space:
       continuous:
@@ -106,8 +118,10 @@ params:
         regularizer:
           name: None
 
-  load_checkpoint: False #True #${if:${...checkpoint},True,False} # flag which sets whether to load the checkpoint
-  load_path: #'/home/blark/Desktop/2025/ManipTrans1/runs/cross_083f7@0_artimano__12-21-11-29-25/nn/cross_083f7@0_artimano_ep_2303_rew_6285.7876_sr_0.6802303791046143_fr_0.3197695016860962.pth' #${...checkpoint} # path to the checkpoint to load
+  # Stage 2 loads checkpoint inside the frozen base branch, not as the complete
+  # trainable policy state.
+  load_checkpoint: ${if:${contactRefine},False,${if:${checkpoint},True,False}}
+  load_path: ${...checkpoint} # path to the checkpoint to load
   # base_model_checkpoint: runs/ckpt/righthand_1030_final.pth
   rh_base_model_checkpoint: ${...rh_base_model_checkpoint}
   lh_base_model_checkpoint: ${...lh_base_model_checkpoint}
@@ -140,9 +154,24 @@ params:
     warmup_steps: 10
     schedule_type: standard
     kl_threshold: 0.008
-    score_to_win: 10000
-    max_epochs: ${resolve_default:10000,${....max_iterations}}
+    # Total imitation reward must not terminate Stage 2 before contact metrics
+    # converge; its contact-specific stop rule below owns that decision.
+    score_to_win: ${if:${contactRefine},1000000000,10000}
+    # Stage 2 uses a finite independent budget; Stage 1 keeps its existing
+    # max_iterations behavior.
+    max_epochs: ${if:${contactRefine},${contactRefineMaxIterations},${resolve_default:10000,${....max_iterations}}}
     early_stop_epochs: ${resolve_default:500,${....early_stop_epochs}}
+    contact_refine_early_stop:
+      # Absolute interpolation is intentional: this block is nested one level
+      # deeper than the surrounding PPO config.
+      enabled: ${contactRefine}
+      min_epoch: ${contactRefineEarlyStopMinEpoch}
+      patience: ${contactRefineEarlyStopPatience}
+      slope_window: ${contactRefineEarlyStopSlopeWindow}
+      slope_tolerance: ${contactRefineEarlyStopSlopeTolerance}
+      good_ratio_threshold: ${contactRefineGoodRatioThreshold}
+      bad_ratio_threshold: ${contactRefineBadRatioThreshold}
+      min_active_ratio: ${contactRefineMinActiveRatio}
     save_best_after: 2
     save_frequency: 100
     print_stats: True
