@@ -28,7 +28,7 @@ class OakInk2DatasetDexHandLH(ManipData):
     def __init__(
         self,
         *,
-        data_dir: str = "data/OakInk-v2",
+        data_dir: str = "/home/ps/data/ylj/ManipTrans/data/OakInk-v2",
         split: str = "all",
         skip: int = 2,  # OakInk2 120Hz, while DEXHAND 60Hz
         device="cuda:0",
@@ -59,12 +59,12 @@ class OakInk2DatasetDexHandLH(ManipData):
         SMPLX_DIM_SHAPE_ALL = 300
 
         self.smplx_layer = SMPLXLayer(
-            "data/body_utils/body_models/smplx",
+            "/home/ps/data/ylj/ManipTrans/data/body_utils/body_models/smplx",
             dtype=torch.float32,
             rot_mode=SMPLX_ROT_MODE,
             num_betas=SMPLX_DIM_SHAPE_ALL,
             gender="neutral",
-            use_body_upper_asset="data/smplx_extra/body_upper_idx.pt",
+            use_body_upper_asset="/home/ps/data/ylj/ManipTrans/data/smplx_extra/body_upper_idx.pt",
         ).to(self.device)
         self.smplx_faces_np = self.smplx_layer.body_upper_faces.detach().clone().cpu().numpy()
         self.smplx_body_upper_idx = self.smplx_layer.body_upper_vert_idx.detach().clone().cpu().numpy()
@@ -227,7 +227,7 @@ class OakInk2DatasetDexHandLH(ManipData):
         }
         obj_mesh_path_dir, obj_mesh_path_file = os.path.split(obj_mesh_path)
         obj_urdf_path_dir = obj_mesh_path_dir.replace(
-            "data/OakInk-v2/object_preview", "data/OakInk-v2/coacd_object_preview"
+            "/home/ps/data/ylj/ManipTrans/data/OakInk-v2/object_preview", "/home/ps/data/ylj/ManipTrans/data/OakInk-v2/coacd_object_preview"
         )
         obj_urdf_path_file = obj_mesh_path_file.replace(".obj", ".urdf").replace(".ply", ".urdf")
         data["obj_urdf_path"] = os.path.join(obj_urdf_path_dir, obj_urdf_path_file)
@@ -235,7 +235,7 @@ class OakInk2DatasetDexHandLH(ManipData):
         self.process_data(data, idx, rs_verts_obj)
 
         # todo load retargeted data
-        OPT_INSPIRE_PATH = f"data/retargeting/OakInk-v2/mano2{str(self.dexhand)}"
+        OPT_INSPIRE_PATH = f"/home/ps/data/ylj/ManipTrans/data/retargeting/OakInk-v2/mano2{str(self.dexhand)}"
         opt_path = os.path.join(
             OPT_INSPIRE_PATH, os.path.split(self.data_pathes[idx])[-1].replace(".pkl", f"@{stage}.pkl")
         )
@@ -246,5 +246,5 @@ class OakInk2DatasetDexHandLH(ManipData):
 
 
 if __name__ == "__main__":
-    fdata = OakInk2DatasetDexHandLH(data_dir="data/OakInk-v2", mujoco2gym_transf=torch.eye(4, device="cuda:0"))
+    fdata = OakInk2DatasetDexHandLH(data_dir="/home/ps/data/ylj/ManipTrans/data/OakInk-v2", mujoco2gym_transf=torch.eye(4, device="cuda:0"))
     print(fdata[34])
