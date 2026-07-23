@@ -189,3 +189,60 @@ make*.py
 
 runs
 runs/*
+
+# Local agent/workspace metadata
+.agents/
+.codex/
+
+# Local comparison/backup copy
+PhysGraph_contact/
+
+# Experiment/output directories not covered above
+outputs/
+.hydra/
+checkpoints/
+logs/
+tensorboard/
+wandb/
+videos/
+recordings/
+
+# Additional generated model and array files
+*.pt
+*.bin
+*.onnx
+*.safetensors
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.h5
+
+# Test, lint, and type-check caches
+.pytest_cache/
+.ruff_cache/
+.pyright/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Local environments and secrets
+env/
+ENV/
+.env.*
+!.env.example
+
+# Local databases, tabular logs, and archives
+*.db
+*.sqlite
+*.sqlite3
+*.csv
+*.zip
+*.7z
+*.tar
+*.gz
+
+# Local editor/workspace files
+*.code-workspace
+
+# Keep the project's dependency manifest despite the broad *.txt rule above.
+!requirements.txt
