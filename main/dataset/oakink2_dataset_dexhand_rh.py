@@ -235,7 +235,7 @@ class OakInk2DatasetDexHandRH(ManipData):
         self.process_data(data, idx, rs_verts_obj)
 
         # todo load retargeted data
-        OPT_INSPIRE_PATH = f"/home/ps/data/ylj/ManipTrans/data/retargeting/OakInk-v2/mano2{str(self.dexhand)}"
+        OPT_INSPIRE_PATH = f"/home/ps/data/ylj/PhysGraph/data/retargeting/OakInk-v2/mano2{str(self.dexhand)}"
         opt_path = os.path.join(
             OPT_INSPIRE_PATH, os.path.split(self.data_pathes[idx])[-1].replace(".pkl", f"@{stage}.pkl")
         )
