@@ -250,6 +250,9 @@ class MyA2CBase(BaseAlgorithm):
         # Stage 2 convergence is defined by contact quality, not by the total
         # imitation reward used by the original training stage.
         self.contact_refine_early_stop = self.config.get("contact_refine_early_stop", {})
+        # Optional Stage-2 regularizers are consumed by PPOAgent while the
+        # rollout buffer below supplies the previous applied translation.
+        self.contact_refine_aux_loss = self.config.get("contact_refine_aux_loss", {})
         self.contact_refine_metric_history = []
         self.contact_refine_converged_epochs = 0
 
@@ -901,6 +904,11 @@ class MyA2CBase(BaseAlgorithm):
             if torch.any(self.dones):
                 self.obs, _ = self.vec_env.env.reset_done()
                 self.obs = self.obs_to_tensors(self.obs)
+            if self.contact_refine_aux_enabled:
+                # Do not compare the first residual of a new episode with the
+                # final residual of the preceding episode.
+                not_done = 1.0 - self.dones.float()
+                self.previous_contact_residual *= not_done.unsqueeze(-1)
             if self.use_action_masks:
                 masks = self.vec_env.get_action_masks()
                 res_dict = self.get_masked_action_values(self.obs, masks)
@@ -920,9 +928,15 @@ class MyA2CBase(BaseAlgorithm):
                     # observation; preserve it directly in the PPO buffer.
                     obs_dict_cat.update({k: v})
             self.experience_buffer.update_data("obses", n, obs_dict_cat)
+            if self.contact_refine_aux_enabled:
+                self.experience_buffer.update_data(
+                    "contact_prev_residuals", n, self.previous_contact_residual
+                )
 
             for k in update_list:
                 self.experience_buffer.update_data(k, n, res_dict[k])
+            if self.contact_refine_aux_enabled:
+                self.previous_contact_residual = res_dict["contact_residuals"].detach()
             if self.has_central_value:
                 self.experience_buffer.update_data("states", n, self.obs["states"])
 
@@ -1178,6 +1192,23 @@ class MyContinuousA2CBase(MyA2CBase):
         self.update_list = ["actions", "neglogpacs", "values", "mus", "sigmas"]
         self.tensor_list = self.update_list + ["obses", "states", "dones"]
         self.tensor_list = self.tensor_list + ["error_masks"]
+        self.contact_refine_aux_enabled = bool(
+            self.contact_refine_aux_loss.get("enabled", False)
+        )
+        if self.contact_refine_aux_enabled:
+            # Store the previous applied 3-D translation residual for each
+            # rollout sample so temporal regularization survives minibatching.
+            self.experience_buffer.tensor_dict[
+                "contact_prev_residuals"
+            ] = self.experience_buffer._create_tensor_from_space(
+                gym.spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
+                self.experience_buffer.obs_base_shape,
+            )
+            self.tensor_list.append("contact_prev_residuals")
+            batch_size = self.num_agents * self.num_actors
+            self.previous_contact_residual = torch.zeros(
+                (batch_size, 3), dtype=torch.float32, device=self.ppo_device
+            )
 
     def train_epoch(self):
         super().train_epoch()
@@ -1333,6 +1364,9 @@ class MyContinuousA2CBase(MyA2CBase):
         dataset_dict["error_masks"] = error_masks
         dataset_dict["mu"] = mus
         dataset_dict["sigma"] = sigmas
+        dataset_dict["contact_prev_residuals"] = batch_dict.get(
+            "contact_prev_residuals", None
+        )
 
         self.dataset.update_values_dict(dataset_dict)
 

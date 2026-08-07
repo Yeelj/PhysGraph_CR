@@ -16,18 +16,15 @@ params:
   network:
     name: ${res_side:${....side},dict_obs_actor_critic}
     separate: False
-    # Stage 2 wraps the old checkpoint as a frozen policy and learns a masked
-    # right-wrist residual from the independent semantic-region observation.
+    # Stage 2 reuses the frozen Stage-1 state/action and learns a dynamically
+    # gated residual for right-wrist translation only.
     contact_refine:
       enabled: ${resolve_default:False,${contactRefine}}
       base_checkpoint: ${if:${contactRefineBaseCheckpoint},${contactRefineBaseCheckpoint},${checkpoint}}
       residual_scale: 0.25
-      frozen_action_logstd: -8.0
-      # # exp(-3) ~= 0.05 wrist-action exploration at Stage-2 startup.
-      # trainable_action_logstd: -3.0
-      # exp(-5) ~= 0.0067 wrist-action exploration at Stage-2 startup.
-      trainable_action_logstd: ${contactRefineTrainableActionLogstd}
-      action_indices: [0, 1, 2, 3, 4, 5]
+      num_contact_bodies: 5
+      dynamic_feature_dim: 21
+      action_indices: [0, 1, 2]
 
     space:
       continuous:
@@ -172,6 +169,13 @@ params:
       good_ratio_threshold: ${contactRefineGoodRatioThreshold}
       bad_ratio_threshold: ${contactRefineBadRatioThreshold}
       min_active_ratio: ${contactRefineMinActiveRatio}
+    # Auxiliary constraints complement PPO/contact reward: close the residual
+    # away from bad contact, keep it small, and suppress temporal jitter.
+    contact_refine_aux_loss:
+      enabled: ${contactRefine}
+      zero_residual_coef: ${contactRefineZeroResidualCoef}
+      magnitude_coef: ${contactRefineMagnitudeCoef}
+      smoothness_coef: ${contactRefineSmoothnessCoef}
     save_best_after: 2
     save_frequency: 100
     print_stats: True

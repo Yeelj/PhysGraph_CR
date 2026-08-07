@@ -33,9 +33,10 @@ contactRefineEarlyStopSlopeTolerance: 0.0001
 contactRefineGoodRatioThreshold: 0.8
 contactRefineBadRatioThreshold: 0.05
 contactRefineMinActiveRatio: 0.01
-# Stage 2 samples final wrist actions around the frozen mean. A small initial
-# standard deviation preserves the Stage-1 trajectory while retaining exploration.
-contactRefineTrainableActionLogstd: -5.0
+# Conservative defaults for Stage-2 translation-residual regularization.
+contactRefineZeroResidualCoef: 0.01
+contactRefineMagnitudeCoef: 0.001
+contactRefineSmoothnessCoef: 0.01
 
 learning_rate: 5e-4
 actionsMovingAverage: 1.0
