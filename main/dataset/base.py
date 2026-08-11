@@ -1,5 +1,8 @@
 from abc import ABC, abstractmethod
+import hashlib
 import os
+from pathlib import Path
+import xml.etree.ElementTree as ET
 from scipy.ndimage import gaussian_filter1d
 import numpy as np
 import torch
@@ -85,11 +88,13 @@ class ManipData(Dataset, ABC):
     def random_sampling_pc(self, mesh):
         numpy_random_state = np.random.get_state()
         torch_random_state = torch.random.get_rng_state()
-        torch_random_state_cuda = torch.cuda.get_rng_state()
+        cuda_available = torch.cuda.is_available()
+        torch_random_state_cuda = torch.cuda.get_rng_state() if cuda_available else None
         np.random.seed(0)
         torch.manual_seed(0)
-        torch.cuda.manual_seed(0)
-        torch.cuda.manual_seed_all(0)
+        if cuda_available:
+            torch.cuda.manual_seed(0)
+            torch.cuda.manual_seed_all(0)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
@@ -98,9 +103,146 @@ class ManipData(Dataset, ABC):
         # reset seed
         np.random.set_state(numpy_random_state)
         torch.random.set_rng_state(torch_random_state)
-        torch.cuda.set_rng_state(torch_random_state_cuda)
+        if cuda_available:
+            torch.cuda.set_rng_state(torch_random_state_cuda)
 
         return rs_verts_obj
+
+    @staticmethod
+    def _sha256_file(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    @classmethod
+    def _urdf_bundle_sha256(cls, urdf_path):
+        urdf_path = Path(urdf_path).resolve()
+        if not urdf_path.is_file():
+            raise FileNotFoundError(f"Object collision URDF does not exist: {urdf_path}")
+        asset_paths = [urdf_path]
+        urdf_root = ET.fromstring(urdf_path.read_text(encoding="utf-8").lstrip())
+        for mesh in urdf_root.findall(".//mesh"):
+            filename = mesh.attrib.get("filename")
+            if not filename or filename.startswith("package://"):
+                raise ValueError(f"Unsupported object URDF mesh URI {filename!r} in {urdf_path}")
+            mesh_path = Path(filename[7:] if filename.startswith("file://") else filename)
+            if not mesh_path.is_absolute():
+                mesh_path = urdf_path.parent / mesh_path
+            mesh_path = mesh_path.resolve()
+            if not mesh_path.is_file():
+                raise FileNotFoundError(f"Object collision mesh does not exist: {mesh_path}")
+            asset_paths.append(mesh_path)
+        digest = hashlib.sha256()
+        for asset_path in sorted(set(asset_paths), key=str):
+            digest.update(asset_path.name.encode("utf-8"))
+            digest.update(bytes.fromhex(cls._sha256_file(asset_path)))
+        return digest.hexdigest()
+
+    def _update_hand_object_distances(self, data):
+        """Recompute trajectory-dependent distances after a rigid hand shift."""
+
+        obj_verts_transf = (
+            data["obj_trajectory"][:, :3, :3] @ data["obj_verts"].T[None]
+        ).transpose(-1, -2) + data["obj_trajectory"][:, :3, 3][:, None]
+
+        tip_list = ["thumb_tip", "index_tip", "middle_tip", "ring_tip", "pinky_tip"]
+        tips = torch.cat([data["mano_joints"][key][:, None] for key in tip_list], dim=1)
+        tips_near, _, _, _ = self.ch_dist(tips, obj_verts_transf)
+        data["tips_distance"] = torch.sqrt(tips_near)
+
+        joints = torch.cat(
+            [data["mano_joints"][key][:, None] for key in data["mano_joints"].keys()],
+            dim=1,
+        )
+        joints_near, _, _, _ = self.ch_dist(joints, obj_verts_transf)
+        data["joints_distance"] = torch.sqrt(joints_near)
+
+    def _apply_contact_retarget_targets(self, data, metadata, retargeted_data_path):
+        """Apply the PKL's tool-local translation to every Stage-1 target.
+
+        The corrected PKL already contains a shifted ``opt_wrist_pos``.  Stage 1,
+        however, tracks the MANO wrist/joints as its reference trajectory.  This
+        method shifts those reference fields by the exact same world-space offset
+        while leaving every orientation and finger pose unchanged.
+        """
+
+        if not isinstance(metadata, dict):
+            raise TypeError(f"Invalid contact_retarget metadata in {retargeted_data_path}")
+        if not bool(metadata.get("geometry_feasible", False)):
+            raise ValueError(
+                f"Refusing infeasible contact-retarget PKL: {retargeted_data_path}"
+            )
+
+        expected_side = getattr(self.dexhand, "side", None)
+        metadata_side = metadata.get("side")
+        side_alias = {"right": "rh", "left": "lh", "rh": "rh", "lh": "lh"}
+        if expected_side is not None and side_alias.get(metadata_side) != side_alias.get(expected_side):
+            raise ValueError(
+                f"Contact-retarget side {metadata_side!r} does not match dataset hand "
+                f"{expected_side!r}: {retargeted_data_path}"
+            )
+
+        expected_mesh_hash = metadata.get("tool_mesh_sha256")
+        current_mesh_path = data.get("obj_mesh_path")
+        if not expected_mesh_hash or not current_mesh_path or not os.path.isfile(current_mesh_path):
+            raise ValueError(
+                "Contact-retarget loading requires a readable dataset obj_mesh_path and "
+                f"tool_mesh_sha256 metadata: {retargeted_data_path}"
+            )
+        current_mesh_hash = self._sha256_file(current_mesh_path)
+        if current_mesh_hash != expected_mesh_hash:
+            raise ValueError(
+                "The Stage-1 dataset mesh differs from the mesh used for geometric correction. "
+                f"dataset={current_mesh_path}, corrected={metadata.get('tool_mesh')}. "
+                "Install the same new mesh in the dataset before training."
+            )
+
+        expected_collision_hash = metadata.get("collision_bundle_sha256")
+        current_collision_path = data.get("obj_urdf_path")
+        if not expected_collision_hash or not current_collision_path:
+            raise ValueError(
+                f"Missing collision bundle metadata in {retargeted_data_path}"
+            )
+        current_collision_hash = self._urdf_bundle_sha256(current_collision_path)
+        if current_collision_hash != expected_collision_hash:
+            raise ValueError(
+                "The Stage-1 collision URDF/mesh bundle differs from the bundle checked "
+                f"during geometric correction: {current_collision_path}."
+            )
+
+        target_length = len(data["obj_trajectory"])
+        delta_tool = torch.as_tensor(
+            metadata.get("delta_tool"), dtype=data["wrist_pos"].dtype, device=self.device
+        )
+        alpha = torch.as_tensor(
+            metadata.get("alpha"), dtype=data["wrist_pos"].dtype, device=self.device
+        )
+        if delta_tool.shape != (3,) or alpha.ndim != 1 or len(alpha) < target_length:
+            raise ValueError(
+                f"Invalid correction offset shapes: delta_tool={tuple(delta_tool.shape)}, "
+                f"alpha={tuple(alpha.shape)}, target_length={target_length}"
+            )
+        alpha = alpha[:target_length]
+        delta_world = torch.matmul(
+            data["obj_trajectory"][:, :3, :3], delta_tool[:, None]
+        ).squeeze(-1) * alpha[:, None]
+
+        data["wrist_pos"] = data["wrist_pos"] + delta_world
+        for key in data["mano_joints"].keys():
+            data["mano_joints"][key] = data["mano_joints"][key] + delta_world
+
+        time_delta = 1 / (120 / self.skip)
+        data["wrist_velocity"] = self.compute_velocity(
+            data["wrist_pos"][:, None], time_delta, guassian_filter=True
+        ).squeeze(1)
+        for key in data["mano_joints"].keys():
+            data["mano_joints_velocity"][key] = self.compute_velocity(
+                data["mano_joints"][key], time_delta, guassian_filter=True
+            )
+        self._update_hand_object_distances(data)
+        data["contact_retarget_applied"] = retargeted_data_path
 
     def process_data(self, data, idx, rs_verts_obj):
         data["obj_trajectory"] = self.mujoco2gym_transf @ data["obj_trajectory"]
@@ -111,28 +253,8 @@ class ManipData(Dataset, ABC):
                 self.mujoco2gym_transf[:3, :3] @ data["mano_joints"][k].T
             ).T + self.mujoco2gym_transf[:3, 3]
 
-        # caculate distance
-        obj_verts_transf = (data["obj_trajectory"][:, :3, :3] @ rs_verts_obj.T[None]).transpose(-1, -2) + data[
-            "obj_trajectory"
-        ][:, :3, 3][:, None]
-
-        tip_list = ["thumb_tip", "index_tip", "middle_tip", "ring_tip", "pinky_tip"]
-
-        tips = torch.cat(
-            [data["mano_joints"][t_k][:, None] for t_k in (tip_list)],
-            dim=1,
-        )
-        tips_near, _, _, _ = self.ch_dist(tips, obj_verts_transf)
-        # tips_contact = tips_near <= 0.008**2  # ? 8mm, ch_dist return square distance
-        data["tips_distance"] = torch.sqrt(tips_near)
-
-        joints = torch.cat(
-            [data["mano_joints"][t_k][:, None] for t_k in data["mano_joints"].keys()],
-            dim=1,
-        )
-        joints_near, _, _, _ = self.ch_dist(joints, obj_verts_transf)
-        # tips_contact = tips_near <= 0.008**2  # ? 8mm, ch_dist return square distance
-        data["joints_distance"] = torch.sqrt(joints_near)
+        # calculate distance
+        self._update_hand_object_distances(data)
 
         data["obj_velocity"] = self.compute_velocity(
             data["obj_trajectory"][:, None, :3, 3], 1 / (120 / self.skip), guassian_filter=True
@@ -188,7 +310,8 @@ class ManipData(Dataset, ABC):
                 }
             )
         else:
-            opt_params = pickle.load(open(retargeted_data_path, "rb"))
+            with open(retargeted_data_path, "rb") as stream:
+                opt_params = pickle.load(stream)
             data.update(
                 {
                     "opt_wrist_pos": torch.tensor(opt_params["opt_wrist_pos"], device=self.device),
@@ -197,6 +320,11 @@ class ManipData(Dataset, ABC):
                     # "opt_joints_pos": torch.tensor(opt_params["opt_joints_pos"], device=self.device), # ? only used for ablation study
                 }
             )
+            contact_metadata = opt_params.get("contact_retarget")
+            if contact_metadata is not None:
+                self._apply_contact_retarget_targets(
+                    data, contact_metadata, retargeted_data_path
+                )
         data["opt_wrist_velocity"] = self.compute_velocity(
             data["opt_wrist_pos"][:, None], 1 / (120 / self.skip), guassian_filter=True
         ).squeeze(1)

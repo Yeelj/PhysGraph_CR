@@ -23,6 +23,11 @@ from .oakink2_dataset_utils import load_obj_map, as_mesh, sample_contact_region_
 from .decorators import register_manipdata
 
 
+RETARGETING_ROOT_RH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "data", "retargeting_contact")
+)
+
+
 @register_manipdata("oakink2_rh")
 class OakInk2DatasetDexHandRH(ManipData):
     def __init__(
@@ -235,10 +240,18 @@ class OakInk2DatasetDexHandRH(ManipData):
         self.process_data(data, idx, rs_verts_obj)
 
         # todo load retargeted data
-        OPT_INSPIRE_PATH = f"/home/ps/data/ylj/PhysGraph/data/retargeting/OakInk-v2/mano2{str(self.dexhand)}"
+        OPT_INSPIRE_PATH = os.path.join(
+            RETARGETING_ROOT_RH, "OakInk-v2", f"mano2{str(self.dexhand)}"
+        )
         opt_path = os.path.join(
             OPT_INSPIRE_PATH, os.path.split(self.data_pathes[idx])[-1].replace(".pkl", f"@{stage}.pkl")
         )
+
+        if not os.path.exists(opt_path):
+            raise FileNotFoundError(
+                "The right-hand Stage1 dataset requires a geometrically corrected retarget PKL. "
+                f"Generate it under {RETARGETING_ROOT_RH} before training: {opt_path}"
+            )
 
         self.load_retargeted_data(data, opt_path)
 

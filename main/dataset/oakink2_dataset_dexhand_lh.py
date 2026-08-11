@@ -23,6 +23,11 @@ from .oakink2_dataset_utils import load_obj_map, as_mesh, sample_contact_region_
 from .decorators import register_manipdata
 
 
+RETARGETING_ROOT_LH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "data", "retargeting")
+)
+
+
 @register_manipdata("oakink2_lh")
 class OakInk2DatasetDexHandLH(ManipData):
     def __init__(
@@ -235,7 +240,9 @@ class OakInk2DatasetDexHandLH(ManipData):
         self.process_data(data, idx, rs_verts_obj)
 
         # todo load retargeted data
-        OPT_INSPIRE_PATH = f"/home/ps/data/ylj/PhysGraph/data/retargeting/OakInk-v2/mano2{str(self.dexhand)}"
+        OPT_INSPIRE_PATH = os.path.join(
+            RETARGETING_ROOT_LH, "OakInk-v2", f"mano2{str(self.dexhand)}"
+        )
         opt_path = os.path.join(
             OPT_INSPIRE_PATH, os.path.split(self.data_pathes[idx])[-1].replace(".pkl", f"@{stage}.pkl")
         )

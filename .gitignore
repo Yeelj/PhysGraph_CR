@@ -184,6 +184,7 @@ select*/*
 tmp*.py
 eval*.py
 test*.py
+!tests/test_contact_trajectory_retarget.py
 annotator*.py
 make*.py
 

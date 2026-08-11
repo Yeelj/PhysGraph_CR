@@ -763,7 +763,9 @@ class DexHandManipBiHEnv(VecTask):
                         ],
                         dim=0,
                     )
-            return torch.stack(stack_data).squeeze()
+            # Always preserve the leading environment dimension. A blanket
+            # squeeze breaks valid single-environment smoke tests.
+            return torch.stack(stack_data)
 
         for k in data[0].keys():
             if k == "mano_joints" or k == "mano_joints_velocity":
@@ -805,7 +807,9 @@ class DexHandManipBiHEnv(VecTask):
                     "tool_contact_region_vertex_count",
                     "tool_noncontact_region_vertex_count",
                 ]:
-                    packed_data[k] = torch.stack(stack_data).squeeze()
+                    packed_data[k] = torch.stack(stack_data)
+                    if packed_data[k].ndim > 1 and packed_data[k].shape[-1] == 1:
+                        packed_data[k] = packed_data[k].squeeze(-1)
                 else:
                     packed_data[k] = fill_data(stack_data)
             elif type(data[0][k]) == np.ndarray:
