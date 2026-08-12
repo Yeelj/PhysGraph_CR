@@ -144,6 +144,10 @@ We follow the prerequisit of [ManipTrans](https://maniptrans.github.io/) to prep
     ```
     Regarding `data_idx` of OakInk V2, for example, `083f7@0` refers to the primitive task indexed at `0` in the sequence labeled `scene_01__A001++seq__083f7a577484ba7929a9__2023-04-27-19-25-24` (for simplification, we only use the first 5 digits of the hash code).
 
+    To reuse an old trajectory with a new colored tool mesh and rigidly move only
+    the right hand into its allowed contact region, see
+    [Geometric contact trajectory retargeting](docs/contact_trajectory_retargeting.md).
+
 2. **Training**
   Train bi-manual policies:
     ```bash

@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 from typing import Dict, Any
-import copy
 import torch.nn.functional as F
 from rl_games.algos_torch.network_builder import A2CBuilder, NetworkBuilder
 
@@ -274,62 +273,6 @@ class MLP_value(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
-
-
-class DynamicContactEncoder(nn.Module):
-    """Encode per-link dynamic contact observations before permutation-safe pooling."""
-
-    def __init__(self, num_bodies: int = 5, feature_dim: int = 21):
-        super().__init__()
-        self.num_bodies = num_bodies
-        self.feature_dim = feature_dim
-        self.body_encoder = nn.Sequential(
-            nn.Linear(feature_dim, 64),
-            nn.SiLU(),
-            nn.Linear(64, 64),
-            nn.SiLU(),
-        )
-        # A learned identity preserves which contact link (palm/finger) produced
-        # a feature while the subsequent pooling remains insensitive to order.
-        self.body_embedding = nn.Embedding(num_bodies, 64)
-
-    def forward(self, contact_dynamic: torch.Tensor) -> torch.Tensor:
-        batch_size = contact_dynamic.shape[0]
-        features = contact_dynamic.reshape(batch_size, self.num_bodies, self.feature_dim)
-        body_ids = torch.arange(self.num_bodies, device=features.device)
-        tokens = self.body_encoder(features) + self.body_embedding(body_ids)[None]
-
-        # Feature 18 is the physical-contact flag. Inactive links must not
-        # dilute or dominate the representation used to generate a correction.
-        active = features[..., 18:19]
-        active_count = active.sum(dim=1)
-        active_mean = (tokens * active).sum(dim=1) / active_count.clamp(min=1.0)
-
-        masked_tokens = tokens.masked_fill(active <= 0.5, torch.finfo(tokens.dtype).min)
-        active_max = masked_tokens.max(dim=1).values
-        active_max = torch.where(active_count > 0.0, active_max, torch.zeros_like(active_max))
-        return torch.cat([active_mean, active_max], dim=-1)
-
-
-class TranslationResidualHead(nn.Module):
-    """Predict only the three right-wrist translation action coordinates."""
-
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(64, 128),
-            nn.SiLU(),
-            nn.Linear(128, 64),
-            nn.SiLU(),
-            nn.Linear(64, 3),
-        )
-        # Stage 2 starts exactly at the Stage-1 mean; PPO introduces a
-        # correction only after observing useful contact gradients.
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.tanh(self.net(x))
 
 
 class LATENT_ENCODER(nn.Module):
@@ -660,211 +603,24 @@ class BimanualHandToolPolicy(A2CBuilder.Network):
         #super().__init__()
         NetworkBuilder.BaseNetwork.__init__(self)
         self.tau = 0.01
-        contact_refine_cfg = params.get("contact_refine", {}) if isinstance(params, dict) else {}
-        self.contact_refine_enabled = bool(contact_refine_cfg.get("enabled", False))
-        self.contact_refine_residual_scale = float(contact_refine_cfg.get("residual_scale", 0.25))
-        self.contact_num_bodies = int(contact_refine_cfg.get("num_contact_bodies", 5))
-        self.contact_dynamic_feature_dim = int(contact_refine_cfg.get("dynamic_feature_dim", 21))
-        refine_action_indices = list(contact_refine_cfg.get("action_indices", [0, 1, 2]))
-        if self.contact_refine_enabled and refine_action_indices != [0, 1, 2]:
-            raise ValueError(
-                "Stage 2 is restricted to right-wrist translation action_indices=[0, 1, 2]"
-            )
-        # Retain this legacy buffer solely so older Stage-1 checkpoints load
-        # without an unexpected key; Stage 2 composition no longer uses a
-        # 56-D mask and explicitly writes only action[:, :3].
-        action_mask = torch.zeros(56, dtype=torch.float)
-        action_mask[torch.tensor(refine_action_indices, dtype=torch.long)] = 1.0
-        self.register_buffer("contact_refine_action_mask", action_mask)
-        self.latent_encoder = None
-        self.action_miu_head = None
-        self.sigma = None
-        self.contact_refine_encoder = None
-        self.contact_dynamic_encoder = None
-        self.base_action_encoder = None
-        self.contact_refine_fuser = None
-        self.contact_residual_head = None
-        self.contact_gate_head = None
+        self.latent_encoder = LATENT_ENCODER()
+        try:
+            self.latent_encoder = torch.compile(self.latent_encoder)
+            print("Successfully compile LATENT_ENCODER with torch.compile hahaha")
+        except Exception as e:
+            print(f"Couldn't compile encoder: {e}")
+        self.action_miu_head = MLP_action()
         self.value_head = MLP_value()
         action_dim = 56
-
-        if self.contact_refine_enabled:
-            # The semantic BPS descriptor is static for an episode, whereas the
-            # new dynamic encoder describes the current link/tool interaction.
-            self.contact_refine_encoder = MLP_new(258)
-            self.contact_dynamic_encoder = DynamicContactEncoder(
-                self.contact_num_bodies, self.contact_dynamic_feature_dim
-            )
-            # Only the Stage-1 right-wrist translation mean is fed back to the
-            # residual policy; wrist rotation is never a residual target.
-            self.base_action_encoder = nn.Sequential(
-                nn.Linear(3, 64),
-                nn.SiLU(),
-                nn.Linear(64, 64),
-                nn.SiLU(),
-            )
-            self.contact_refine_fuser = nn.Sequential(
-                nn.Linear(64 + 64 + 64 + 128, 256),
-                nn.SiLU(),
-                nn.Linear(256, 128),
-                nn.SiLU(),
-                nn.Linear(128, 64),
-            )
-            self.contact_residual_head = TranslationResidualHead()
-            self.contact_gate_head = nn.Sequential(
-                nn.Linear(64, 32),
-                nn.SiLU(),
-                nn.Linear(32, 1),
-                nn.Sigmoid(),
-            )
-        else:
-            # This is the original Stage-1 architecture. Keeping it unchanged is
-            # required for strict reuse of existing Stage-1 checkpoints.
-            self.latent_encoder = LATENT_ENCODER()
-            try:
-                self.latent_encoder = torch.compile(self.latent_encoder)
-                print("Successfully compile LATENT_ENCODER with torch.compile hahaha")
-            except Exception as e:
-                print(f"Couldn't compile encoder: {e}")
-            self.action_miu_head = MLP_action()
-            self.sigma = nn.Parameter(
-                -torch.ones(action_dim, dtype=torch.float), requires_grad=True
-            )
-
-        self.base_policy = None
-        if self.contact_refine_enabled:
-            base_checkpoint = contact_refine_cfg.get("base_checkpoint", None)
-            if base_checkpoint is None:
-                raise ValueError("contact_refine.enabled=True requires contact_refine.base_checkpoint")
-            base_params = copy.deepcopy(params)
-            base_params.setdefault("contact_refine", {})
-            base_params["contact_refine"]["enabled"] = False
-            self.base_policy = BimanualHandToolPolicy(base_params, **kwargs)
-            self._load_base_policy(base_checkpoint)
-            for p in self.base_policy.parameters():
-                p.requires_grad = False
-            self.base_policy.eval()
-
-    def _load_base_policy(self, checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
-        state_dict = checkpoint.get("model", checkpoint)
-        policy_state = {}
-        for key, value in state_dict.items():
-            if key.startswith("a2c_network."):
-                policy_state[key[len("a2c_network.") :]] = value
-            elif key.startswith("module.a2c_network."):
-                policy_state[key[len("module.a2c_network.") :]] = value
-            elif key.startswith("running_mean_std") or key.startswith("value_mean_std"):
-                continue
-            else:
-                policy_state[key] = value
-        base_keys = self.base_policy.state_dict().keys()
-        base_uses_orig_mod = any(k.startswith("latent_encoder._orig_mod.") for k in base_keys)
-        state_uses_orig_mod = any(k.startswith("latent_encoder._orig_mod.") for k in policy_state.keys())
-        if base_uses_orig_mod and not state_uses_orig_mod:
-            policy_state = {
-                ("latent_encoder._orig_mod." + k[len("latent_encoder.") :])
-                if k.startswith("latent_encoder.")
-                else k: v
-                for k, v in policy_state.items()
-            }
-        elif state_uses_orig_mod and not base_uses_orig_mod:
-            policy_state = {
-                ("latent_encoder." + k[len("latent_encoder._orig_mod.") :])
-                if k.startswith("latent_encoder._orig_mod.")
-                else k: v
-                for k, v in policy_state.items()
-            }
-        missing, unexpected = self.base_policy.load_state_dict(policy_state, strict=False)
-        print(
-            f"Loaded contact-refine base policy from {checkpoint_path}; "
-            f"missing={len(missing)}, unexpected={len(unexpected)}"
+        self.sigma = nn.Parameter(
+            -torch.ones(action_dim, dtype=torch.float), requires_grad=True
         )
-
-    def train(self, mode: bool = True):
-        super().train(mode)
-        if self.base_policy is not None:
-            self.base_policy.eval()
-        return self
 
     def forward(self, obs: Dict[str, Any], pre_action=None) -> Dict[str, torch.Tensor]:
-        if not self.contact_refine_enabled:
-            z = self.latent_encoder(obs, pre_action)
-            action_miu = self.action_miu_head(z)
-            value = self.value_head(torch.cat([z, obs["privileged"]], dim=-1))
-            return action_miu, self.sigma, value, None, None, None
-
-        if "contact_refine" not in obs or "contact_dynamic" not in obs:
-            raise KeyError(
-                "Stage 2 policy requires both 'contact_refine' and 'contact_dynamic' observations"
-            )
-
-        # A single frozen Stage-1 pass supplies both its reusable state token and
-        # complete base action. There is no second trainable PhysGraph encoder.
-        with torch.no_grad():
-            z_base = self.base_policy.latent_encoder(obs, pre_action)
-            base_action = self.base_policy.action_miu_head(z_base)
-            base_logstd = self.base_policy.sigma
-
-        contact_z = self.contact_refine_encoder(obs["contact_refine"])
-        dynamic_z = self.contact_dynamic_encoder(obs["contact_dynamic"])
-        base_action_z = self.base_action_encoder(base_action[:, :3])
-        z_refine = self.contact_refine_fuser(
-            torch.cat([z_base, base_action_z, contact_z, dynamic_z], dim=-1)
-        )
-
-        raw_translation_residual = self.contact_residual_head(z_refine)
-        learned_gate = self.contact_gate_head(z_refine)
-        dynamic_features = obs["contact_dynamic"].reshape(
-            -1, self.contact_num_bodies, self.contact_dynamic_feature_dim
-        )
-        # Hard safety gate: a residual is permitted only for a real contact
-        # inside a valid black region. Red-only contact therefore leaves the
-        # Stage-1 action exactly unchanged.
-        active_contact = dynamic_features[..., 18] > 0.5
-        red_distance = dynamic_features[..., 13]
-        red_valid = dynamic_features[..., 19] > 0.5
-        black_valid = dynamic_features[..., 20] > 0.5
-        black_distance = dynamic_features[..., 17]
-        inside_black = black_distance < 1.0
-        # At a red/black threshold overlap, valid red contact has priority.
-        # Consequently, when every active contact is red-valid, the wrist is
-        # not corrected even if black vertices are also nearby.
-        good_red_contact = red_valid & (red_distance < 1.0)
-        bad_contact = (
-            active_contact & black_valid & inside_black & (~good_red_contact)
-        )
-        bad_contact_gate = bad_contact.any(
-            dim=1, keepdim=True
-        ).to(raw_translation_residual.dtype)
-        gate = bad_contact_gate * learned_gate
-        applied_translation_residual = (
-            self.contact_refine_residual_scale * gate * raw_translation_residual
-        )
-
-        # Clone before the in-place slice update so all rotation/finger/left-hand
-        # action means remain bit-for-bit equal to the frozen Stage-1 policy.
-        action_miu = base_action.clone()
-        action_miu[:, :3] = base_action[:, :3] + applied_translation_residual
-
-        # Reuse the complete frozen Stage-1 log standard deviation. This makes
-        # the entire action distribution identical whenever the gate is closed.
-        sigma = base_logstd
-        value = self.value_head(torch.cat([z_refine, obs["privileged"]], dim=-1))
-        contact_aux = {
-            "contact_residuals": applied_translation_residual,
-            "contact_residual_raw": raw_translation_residual,
-            "contact_bad_gate": bad_contact_gate,
-            "contact_gate_strength": gate,
-        }
-        return (
-            action_miu,
-            sigma,
-            value,
-            None,
-            base_action,
-            contact_aux,
-        )
+        z = self.latent_encoder(obs, pre_action)
+        action_miu = self.action_miu_head(z)
+        value = self.value_head(torch.cat([z, obs["privileged"]], dim=-1))
+        return action_miu, self.sigma, value, None, None
     
 class ResBiHDictObsBuilder(A2CBuilder):
     def build(self, name, **kwargs):

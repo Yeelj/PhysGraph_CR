@@ -190,45 +190,6 @@ class PPOAgent(MyContinuousA2CBase):
                 a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
             )
 
-            if self.contact_refine_aux_enabled:
-                previous_residual = input_dict["contact_prev_residuals"]
-                raw_residual = res_dict["contact_residual_raw"]
-                applied_residual = res_dict["contact_residuals"]
-                bad_contact_gate = res_dict["contact_bad_gate"].squeeze(-1)
-
-                def masked_mean(per_sample, extra_mask=None):
-                    weight = torch.ones_like(per_sample)
-                    if cur_mask is not None:
-                        weight = weight * cur_mask.reshape(-1).to(per_sample.dtype)
-                    if extra_mask is not None:
-                        weight = weight * extra_mask.reshape(-1).to(per_sample.dtype)
-                    return (per_sample * weight).sum() / weight.sum().clamp(min=1.0)
-
-                # 1) If no black-region violation exists, even the pre-gate
-                # residual proposal is trained toward zero.
-                zero_residual_loss = masked_mean(
-                    raw_residual.square().mean(dim=-1), 1.0 - bad_contact_gate
-                )
-                # 2) Keep the actual wrist-translation correction minimal.
-                residual_magnitude_loss = masked_mean(
-                    applied_residual.square().mean(dim=-1)
-                )
-                # 3) Discourage frame-to-frame jitter, excluding the first
-                # sample after an environment reset.
-                temporal_valid = 1.0 - input_dict["dones"].float()
-                residual_smoothness_loss = masked_mean(
-                    (applied_residual - previous_residual).square().mean(dim=-1),
-                    temporal_valid,
-                )
-
-                aux_cfg = self.contact_refine_aux_loss
-                contact_aux_loss = (
-                    float(aux_cfg.get("zero_residual_coef", 0.01)) * zero_residual_loss
-                    + float(aux_cfg.get("magnitude_coef", 0.001)) * residual_magnitude_loss
-                    + float(aux_cfg.get("smoothness_coef", 0.01)) * residual_smoothness_loss
-                )
-                loss = loss + contact_aux_loss
-
             if self.multi_gpu:
                 self.optimizer.zero_grad()
             else:

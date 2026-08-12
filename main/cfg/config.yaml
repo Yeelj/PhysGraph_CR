@@ -22,21 +22,6 @@ randomStateInit: True
 
 rolloutLen: null
 rolloutBegin: null
-contactRefine: False
-contactRefineBaseCheckpoint: null
-# Stage 2 has its own finite budget and contact-specific convergence test.
-contactRefineMaxIterations: 3000
-contactRefineEarlyStopMinEpoch: 500
-contactRefineEarlyStopPatience: 200
-contactRefineEarlyStopSlopeWindow: 64
-contactRefineEarlyStopSlopeTolerance: 0.0001
-contactRefineGoodRatioThreshold: 0.8
-contactRefineBadRatioThreshold: 0.05
-contactRefineMinActiveRatio: 0.01
-# Conservative defaults for Stage-2 translation-residual regularization.
-contactRefineZeroResidualCoef: 0.01
-contactRefineMagnitudeCoef: 0.001
-contactRefineSmoothnessCoef: 0.01
 
 learning_rate: 5e-4
 actionsMovingAverage: 1.0

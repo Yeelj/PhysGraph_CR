@@ -105,17 +105,6 @@ class DexHandManipBiHEnv(VecTask):
 
         self.rollout_len = self.cfg["env"].get("rolloutLen", None)
         self.rollout_begin = self.cfg["env"].get("rolloutBegin", None)
-        # Stage 2 settings affect only right-hand/tool semantic contact; the
-        # tool-object collision model and left-hand policy remain unchanged.
-        self.contact_refine = self.cfg["env"].get("contactRefine", False)
-        self.contact_refine_side = self.cfg["env"].get("contactRefineSide", "rh")
-        self.contact_reward_scale = self.cfg["env"].get("contactRewardScale", 1.0)
-        self.noncontact_penalty_scale = self.cfg["env"].get("nonContactPenaltyScale", 2.0)
-        self.contact_region_threshold = self.cfg["env"].get("contactRegionThreshold", 0.02)
-        self.noncontact_region_threshold = self.cfg["env"].get("nonContactRegionThreshold", 0.015)
-        # Stage 2 ignores tiny PhysX force noise when deciding whether a hand
-        # link is actually touching the tool.
-        self.contact_force_threshold = self.cfg["env"].get("contactForceThreshold", 0.1)
 
         assert len(self.dataIndices) == 1 or self.rollout_len is None, "rolloutLen only works with one data"
         assert len(self.dataIndices) == 1 or self.rollout_begin is None, "rolloutBegin only works with one data"
@@ -183,29 +172,6 @@ class DexHandManipBiHEnv(VecTask):
             high=np.inf,
             shape=(TARGET_OBS_DIM,),
         )
-        if self.contact_refine:
-            # Stage 2 gets red/black BPS descriptors through a separate key so
-            # the frozen Stage-1 policy still receives its original target.
-            contact_refine_obs_dim = 128 + 128 + 2
-            # Five right-hand contact links, each represented by 21 current
-            # contact/region features in the right-wrist coordinate frame.
-            contact_dynamic_obs_dim = len(self.dexhand_rh.contact_body_names) * 21
-            self.obs_dict["contact_refine"] = torch.zeros(
-                (self.num_envs, contact_refine_obs_dim), device=self.device
-            )
-            self.obs_dict["contact_dynamic"] = torch.zeros(
-                (self.num_envs, contact_dynamic_obs_dim), device=self.device
-            )
-            obs_space["contact_refine"] = spaces.Box(
-                low=-np.inf,
-                high=np.inf,
-                shape=(contact_refine_obs_dim,),
-            )
-            obs_space["contact_dynamic"] = spaces.Box(
-                low=-np.inf,
-                high=np.inf,
-                shape=(contact_dynamic_obs_dim,),
-            )
         self.obs_space = spaces.Dict(obs_space)
 
         default_pose = torch.ones(self.dexhand_rh.n_dofs, device=self.device) * np.pi / 12
@@ -229,31 +195,6 @@ class DexHandManipBiHEnv(VecTask):
         if obj_verts_lh.dim() == 2:
             obj_verts_lh = obj_verts_lh.unsqueeze(0)
         self.obj_bps_lh = self.bps_layer.encode(obj_verts_lh, feature_type=self.bps_feat_type)[self.bps_feat_type]
-        if "tool_contact_verts" in self.demo_data_rh:
-            contact_verts_rh = self.demo_data_rh["tool_contact_verts"]
-            if contact_verts_rh.dim() == 2:
-                contact_verts_rh = contact_verts_rh.unsqueeze(0)
-            self.obj_contact_bps_rh = self.bps_layer.encode(
-                contact_verts_rh, feature_type=self.bps_feat_type
-            )[self.bps_feat_type]
-            noncontact_verts_rh = self.demo_data_rh["tool_noncontact_verts"]
-            if noncontact_verts_rh.dim() == 2:
-                noncontact_verts_rh = noncontact_verts_rh.unsqueeze(0)
-            self.obj_noncontact_bps_rh = self.bps_layer.encode(
-                noncontact_verts_rh, feature_type=self.bps_feat_type
-            )[self.bps_feat_type]
-        else:
-            self.obj_contact_bps_rh = self.obj_bps_rh
-            self.obj_noncontact_bps_rh = torch.zeros_like(self.obj_bps_rh)
-
-        if self.contact_refine:
-            # This feature is consumed only by the trainable residual branch.
-            red_valid = self.demo_data_rh["tool_contact_region_valid"].reshape(self.num_envs, 1)
-            black_valid = self.demo_data_rh["tool_noncontact_region_valid"].reshape(self.num_envs, 1)
-            self.contact_refine_obs = torch.cat(
-                [self.obj_contact_bps_rh, self.obj_noncontact_bps_rh, red_valid, black_valid], dim=-1
-            )
-            self._contact_region_geometry_cache = None
 
         # Reset all environments
         self.reset_idx(torch.arange(self.num_envs, device=self.device))
@@ -469,33 +410,6 @@ class DexHandManipBiHEnv(VecTask):
             return data_dict[ManipDataFactory.dataset_type(idx)][idx]
 
         self.demo_data_rh = [segment_data(i, self.demo_dataset_rh_dict) for i in tqdm(range(self.num_envs))]
-        if self.contact_refine and self.contact_refine_side == "rh":
-            # Stage 2 must never silently train with zero contact rewards. Check
-            # the exact right-hand tool selected by the demonstration first.
-            checked_meshes = set()
-            invalid_meshes = []
-            for demo in self.demo_data_rh:
-                mesh_path = demo["obj_mesh_path"]
-                if mesh_path in checked_meshes:
-                    continue
-                checked_meshes.add(mesh_path)
-                red_valid = bool(demo["tool_contact_region_valid"].item())
-                black_valid = bool(demo["tool_noncontact_region_valid"].item())
-                red_count = int(demo["tool_contact_region_vertex_count"].item())
-                black_count = int(demo["tool_noncontact_region_vertex_count"].item())
-                print(
-                    "[contact-refine] "
-                    f"obj_id={demo['obj_id']} mesh={mesh_path} "
-                    f"red_vertices={red_count} black_vertices={black_count} "
-                    f"red_valid={red_valid} black_valid={black_valid}"
-                )
-                if not red_valid or not black_valid:
-                    invalid_meshes.append(mesh_path)
-            if invalid_meshes:
-                raise ValueError(
-                    "Stage 2 contact refinement requires both red and black vertex regions. "
-                    f"Invalid tool mesh(es): {invalid_meshes}"
-                )
         self.demo_data_rh = self.pack_data(self.demo_data_rh, side="rh")
         self.demo_data_lh = [segment_data(i, self.demo_dataset_lh_dict) for i in tqdm(range(self.num_envs))]
         self.demo_data_lh = self.pack_data(self.demo_data_lh, side="lh")
@@ -796,17 +710,7 @@ class DexHandManipBiHEnv(VecTask):
                 packed_data[k] = fill_data(mano_joints)
             elif type(data[0][k]) == torch.Tensor:
                 stack_data = [d[k] for d in data]
-                if k in [
-                    "obj_verts",
-                    # Stage 2 region geometry and metadata are static for the
-                    # complete episode and must not be padded as trajectories.
-                    "tool_contact_verts",
-                    "tool_noncontact_verts",
-                    "tool_contact_region_valid",
-                    "tool_noncontact_region_valid",
-                    "tool_contact_region_vertex_count",
-                    "tool_noncontact_region_vertex_count",
-                ]:
+                if k == "obj_verts":
                     packed_data[k] = torch.stack(stack_data)
                     if packed_data[k].ndim > 1 and packed_data[k].shape[-1] == 1:
                         packed_data[k] = packed_data[k].squeeze(-1)
@@ -1070,230 +974,6 @@ class DexHandManipBiHEnv(VecTask):
         # Refresh states
         self._update_states()
 
-    def _transform_tool_points(self, local_points, side_states):
-        obj_quat_wxyz = side_states["manip_obj_quat"][:, [3, 0, 1, 2]]
-        obj_rot = quat_to_rotmat(obj_quat_wxyz)
-        return torch.matmul(obj_rot[:, None], local_points.unsqueeze(-1)).squeeze(-1) + side_states[
-            "manip_obj_pos"
-        ][:, None]
-
-    def _compute_contact_region_geometry_side(self, side="rh"):
-        """Build shared current contact geometry for Stage-2 observation/reward."""
-        side_demo_data = getattr(self, f"demo_data_{side}")
-        side_states = getattr(self, f"{side}_states")
-        dexhand = self.dexhand_rh if side == "rh" else self.dexhand_lh
-        dexhand_handles = getattr(self, f"dexhand_{side}_handles")
-
-        contact_body_state = torch.stack(
-            [self._rigid_body_state[:, dexhand_handles[k], :] for k in dexhand.contact_body_names],
-            dim=1,
-        )
-        contact_body_pos = contact_body_state[..., :3]
-        contact_force = torch.stack(
-            [self.net_cf[:, dexhand_handles[k], :] for k in dexhand.contact_body_names], dim=1
-        )
-        active_contact = torch.norm(contact_force, dim=-1) > self.contact_force_threshold
-
-        red_points = self._transform_tool_points(side_demo_data["tool_contact_verts"], side_states)
-        red_pairwise_dist = torch.cdist(contact_body_pos, red_points)
-        red_dist, red_nearest_index = red_pairwise_dist.min(dim=-1)
-        nearest_red = torch.gather(
-            red_points, 1, red_nearest_index[..., None].expand(-1, -1, 3)
-        )
-
-        black_points = self._transform_tool_points(
-            side_demo_data["tool_noncontact_verts"], side_states
-        )
-        black_pairwise_dist = torch.cdist(contact_body_pos, black_points)
-        black_dist, black_nearest_index = black_pairwise_dist.min(dim=-1)
-        nearest_black = torch.gather(
-            black_points, 1, black_nearest_index[..., None].expand(-1, -1, 3)
-        )
-
-        red_region_valid = (
-            side_demo_data["tool_contact_region_valid"].reshape(self.num_envs, -1)[:, 0] > 0.5
-        )
-        black_region_valid = (
-            side_demo_data["tool_noncontact_region_valid"].reshape(self.num_envs, -1)[:, 0] > 0.5
-        )
-        return {
-            "body_state": contact_body_state,
-            "body_pos": contact_body_pos,
-            "contact_force": contact_force,
-            "active_contact": active_contact,
-            "red_dist": red_dist,
-            "black_dist": black_dist,
-            "nearest_red": nearest_red,
-            "nearest_black": nearest_black,
-            "red_region_valid": red_region_valid,
-            "black_region_valid": black_region_valid,
-        }
-
-    def _compute_dynamic_contact_observation(self, geometry, side="rh"):
-        """Return [B, 5*21] dynamic contact features in the wrist local frame."""
-        side_states = getattr(self, f"{side}_states")
-        wrist_pos = side_states["base_state"][:, :3]
-        wrist_vel = side_states["base_state"][:, 7:10]
-        wrist_quat_wxyz = side_states["base_state"][:, [6, 3, 4, 5]]
-        world_to_wrist = quat_to_rotmat(wrist_quat_wxyz).transpose(1, 2)
-
-        def to_wrist(vector):
-            return torch.matmul(
-                world_to_wrist[:, None], vector.unsqueeze(-1)
-            ).squeeze(-1)
-
-        body_pos_local = to_wrist(geometry["body_pos"] - wrist_pos[:, None]) / 0.2
-        body_vel_local = to_wrist(
-            geometry["body_state"][..., 7:10] - wrist_vel[:, None]
-        )
-        force_local = to_wrist(geometry["contact_force"])
-        # Bounded force channels avoid rare PhysX impulses overwhelming the MLP.
-        force_vector = torch.tanh(force_local / 10.0)
-        force_magnitude = torch.tanh(torch.norm(force_local, dim=-1, keepdim=True) / 10.0)
-
-        red_vector = torch.clamp(
-            to_wrist(geometry["nearest_red"] - geometry["body_pos"]) / 0.1,
-            min=-5.0,
-            max=5.0,
-        )
-        red_distance = torch.clamp(
-            geometry["red_dist"][..., None] / self.contact_region_threshold,
-            min=0.0,
-            max=5.0,
-        )
-        black_vector = torch.clamp(
-            to_wrist(geometry["nearest_black"] - geometry["body_pos"]) / 0.1,
-            min=-5.0,
-            max=5.0,
-        )
-        # A normalized black distance below one is the hard residual-gate event.
-        black_distance = torch.clamp(
-            geometry["black_dist"][..., None] / self.noncontact_region_threshold,
-            min=0.0,
-            max=5.0,
-        )
-        num_bodies = geometry["body_pos"].shape[1]
-        active = geometry["active_contact"][..., None].float()
-        red_valid = geometry["red_region_valid"][:, None, None].float().expand(
-            -1, num_bodies, -1
-        )
-        black_valid = geometry["black_region_valid"][:, None, None].float().expand(
-            -1, num_bodies, -1
-        )
-
-        # Per-body order:
-        # pos(3), relative velocity(3), force(3), |force|(1),
-        # nearest-red vector/dist(4), nearest-black vector/dist(4),
-        # active/red-valid/black-valid(3) = 21.
-        features = torch.cat(
-            [
-                body_pos_local,
-                body_vel_local,
-                force_vector,
-                force_magnitude,
-                red_vector,
-                red_distance,
-                black_vector,
-                black_distance,
-                active,
-                red_valid,
-                black_valid,
-            ],
-            dim=-1,
-        )
-        return features.reshape(self.num_envs, -1)
-
-    def _compute_contact_region_reward_side(self, side="rh"):
-        """Compute Stage-2 right-hand rewards from red/black tool regions."""
-        zero = torch.zeros(self.num_envs, device=self.device)
-        metrics = {
-            "contact_region_reward": zero,
-            "contact_nonregion_penalty": zero,
-            "contact_reward_total": zero,
-            "contact_red_dist": zero,
-            "contact_black_dist": zero,
-            "contact_good_ratio": zero,
-            "contact_bad_ratio": zero,
-            "contact_active_ratio": zero,
-            "contact_red_valid": zero,
-            "contact_black_valid": zero,
-            "contact_good_count": zero,
-            "contact_bad_count": zero,
-            "contact_active_count": zero,
-            "contact_metric_step_count": zero,
-        }
-        if not self.contact_refine or side != self.contact_refine_side:
-            return zero, metrics
-
-        side_demo_data = getattr(self, f"demo_data_{side}")
-        if "tool_contact_verts" not in side_demo_data:
-            return zero, metrics
-
-        geometry = self._contact_region_geometry_cache
-        if geometry is None:
-            geometry = self._compute_contact_region_geometry_side(side)
-        active_contact = geometry["active_contact"]
-        red_dist = geometry["red_dist"]
-        black_dist = geometry["black_dist"]
-        red_region_valid = geometry["red_region_valid"]
-        black_region_valid = geometry["black_region_valid"]
-
-        expected_contact = red_dist < (self.contact_region_threshold * 2.0)
-        contact_mask = active_contact | expected_contact
-        denom = contact_mask.float().sum(dim=-1).clamp(min=1.0)
-
-        red_reward_body = torch.exp(-50.0 * red_dist) * contact_mask.float()
-        red_reward = red_reward_body.sum(dim=-1) / denom
-        red_reward = torch.where(red_region_valid, red_reward, zero)
-
-        # A valid red region takes precedence at a red/black threshold overlap.
-        # This matches the policy gate: all-red contact must not request a wrist
-        # correction or incur a contradictory black-region penalty.
-        good_red_contact = active_contact & red_region_valid[:, None] & (
-            red_dist < self.contact_region_threshold
-        )
-        black_penalty_body = torch.clamp(
-            (self.noncontact_region_threshold - black_dist) / self.noncontact_region_threshold, 0.0, 1.0
-        )
-        black_penalty_body = (
-            black_penalty_body * active_contact.float() * (~good_red_contact).float()
-        )
-        black_penalty = black_penalty_body.sum(dim=-1) / active_contact.float().sum(dim=-1).clamp(min=1.0)
-        black_penalty = torch.where(black_region_valid, black_penalty, zero)
-
-        reward = self.contact_reward_scale * red_reward - self.noncontact_penalty_scale * black_penalty
-
-        good_contact = good_red_contact
-        bad_contact = (
-            active_contact
-            & black_region_valid[:, None]
-            & (black_dist < self.noncontact_region_threshold)
-            & (~good_red_contact)
-        )
-        active_denom = active_contact.float().sum(dim=-1).clamp(min=1.0)
-
-        metrics = {
-            "contact_region_reward": red_reward,
-            "contact_nonregion_penalty": black_penalty,
-            "contact_reward_total": reward,
-            "contact_red_dist": (red_dist * contact_mask.float()).sum(dim=-1) / denom,
-            "contact_black_dist": (black_dist * active_contact.float()).sum(dim=-1) / active_denom,
-            "contact_good_ratio": good_contact.float().sum(dim=-1) / active_denom,
-            "contact_bad_ratio": bad_contact.float().sum(dim=-1) / active_denom,
-            "contact_active_ratio": active_contact.float().mean(dim=-1),
-            "contact_red_valid": red_region_valid.float(),
-            "contact_black_valid": black_region_valid.float(),
-            # Counts are accumulated across an episode by the PPO runner and
-            # used to report contact-conditioned good/bad ratios.
-            "contact_good_count": good_contact.float().sum(dim=-1),
-            "contact_bad_count": bad_contact.float().sum(dim=-1),
-            "contact_active_count": active_contact.float().sum(dim=-1),
-            # Use an explicit Stage-2 step counter because progress_buf may
-            # start from a random demonstration frame rather than zero.
-            "contact_metric_step_count": torch.ones_like(zero),
-        }
-        return reward, metrics
-
     def compute_reward(self, actions):
         lh_rew_buf, lh_reset_buf, lh_success_buf, lh_failure_buf, lh_reward_dict, lh_error_buf, lh_diff_obj_pos, lh_diff_obj_rot, lh_diff_joints, lh_diff_ft = (
             self.compute_reward_side(actions, side="lh")
@@ -1429,9 +1109,6 @@ class DexHandManipBiHEnv(VecTask):
             scale_factor,
             (self.dexhand_rh if side == "rh" else self.dexhand_lh).weight_idx,
         )
-        contact_reward, contact_metrics = self._compute_contact_region_reward_side(side)
-        rew_buf = rew_buf + contact_reward
-        reward_dict.update(contact_metrics)
         self.total_rew_buf += rew_buf
         return rew_buf, reset_buf, success_buf, failure_buf, reward_dict, error_buf, diff_obj_pos, diff_obj_rot, diff_joints, diff_ft
 
@@ -1444,18 +1121,6 @@ class DexHandManipBiHEnv(VecTask):
         
         for k in obs_rh.keys():
             self.obs_dict[k] = torch.cat([obs_rh[k], obs_lh[k]], dim=-1)
-        if self.contact_refine:
-            # Stage 2-only semantic input is not duplicated with left-hand
-            # observations; it describes the right-hand manipulated tool.
-            self.obs_dict["contact_refine"] = self.contact_refine_obs
-            # Recompute current dynamic geometry once and share it with reward
-            # computation to keep gating and reward semantics exactly aligned.
-            self._contact_region_geometry_cache = self._compute_contact_region_geometry_side(
-                self.contact_refine_side
-            )
-            self.obs_dict["contact_dynamic"] = self._compute_dynamic_contact_observation(
-                self._contact_region_geometry_cache, self.contact_refine_side
-            )
 
     def compute_observations_side(self, side="rh"):
         # obs_keys: q, cos_q, sin_q, base_state

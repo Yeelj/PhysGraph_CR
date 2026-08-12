@@ -5,10 +5,6 @@ from lib.rl.player import MyPPOPlayerContinuous as PPOPlayer
 
 
 def _restore(agent, args, is_train_restore: bool):
-    # During Stage 2 training the network builder loads checkpoint into its
-    # frozen base branch; a normal outer restore would overwrite the residual.
-    if is_train_restore and args.get("contact_refine", False):
-        return
     if "checkpoint" in args and args["checkpoint"] is not None and args["checkpoint"] != "":
         set_epoch = args.get("from_ckpt_epoch", True)
         if is_train_restore:

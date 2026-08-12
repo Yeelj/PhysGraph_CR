@@ -38,9 +38,7 @@ class ModelA2CContinuousLogStdBiH(BaseModel):
         def forward(self, input_dict):
             is_train = input_dict.get("is_train", True)
             prev_actions = input_dict.get("prev_actions", None)
-            mu, logstd, value, states, base_action, contact_aux = self.a2c_network(
-                input_dict["obs"]
-            )
+            mu, logstd, value, states, base_action = self.a2c_network(input_dict["obs"])
             sigma = torch.exp(logstd)
             distr = torch.distributions.Normal(mu, sigma, validate_args=False)
             if is_train:
@@ -54,10 +52,6 @@ class ModelA2CContinuousLogStdBiH(BaseModel):
                     "mus": mu,
                     "sigmas": sigma,
                 }
-                # Auxiliary Stage-2 tensors remain connected to autograd during
-                # PPO updates. Stage 1 returns None and keeps its old behavior.
-                if contact_aux is not None:
-                    result.update(contact_aux)
                 return result
             else:
                 selected_action = distr.sample()
@@ -69,12 +63,8 @@ class ModelA2CContinuousLogStdBiH(BaseModel):
                     "rnn_states": states,
                     "mus": mu,
                     "sigmas": sigma,
-                    # Stage 2 runner compares this frozen mean with mus to log
-                    # the applied wrist residual without exploration noise.
                     "base_actions": base_action,
                 }
-                if contact_aux is not None:
-                    result.update(contact_aux)
                 return result
 
         def neglogp(self, x, mean, std, logstd):

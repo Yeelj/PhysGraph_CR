@@ -183,4 +183,4 @@ python main/rl/train.py \
 `data/retargeting_contact`，左手读取 `data/retargeting`，训练命令不再需要传入路径参数。
 如果右手对应的修正 PKL 不存在，Stage1 会直接报错并停止，不会退回未经修正的轨迹或零 DOF 初值继续训练。
 
-如果新 mesh 上的离线轨迹和 Stage1 已能稳定成功，通常不需要 Stage2。只有当 PhysX 接触误差、模型误差或动态扰动仍造成小幅偏差时，再把 Stage2 作为小尺度在线残差修正使用。
+该项目的完整执行流程到 Stage1 训练结束，不再包含后续残差修正阶段。

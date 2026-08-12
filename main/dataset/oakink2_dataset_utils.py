@@ -32,50 +32,6 @@ def load_obj_map(obj_prefix: str, obj_list: List[str]):
     return res
 
 
-def _fixed_sample_points(points, n_points: int):
-    points = np.asarray(points, dtype=np.float32)
-    if len(points) == 0:
-        return np.zeros((n_points, 3), dtype=np.float32)
-    if len(points) >= n_points:
-        idx = np.linspace(0, len(points) - 1, n_points).astype(np.int64)
-        return points[idx]
-    repeat = int(np.ceil(n_points / len(points)))
-    return np.tile(points, (repeat, 1))[:n_points]
-
-
-def sample_contact_region_vertices(mesh, n_points: int = 512):
-    """Sample the Stage-2 red/black tool regions from PLY vertex colors."""
-    colors = getattr(getattr(mesh, "visual", None), "vertex_colors", None)
-    vertices = np.asarray(mesh.vertices, dtype=np.float32)
-    if colors is None or len(colors) != len(vertices):
-        return (
-            _fixed_sample_points(vertices, n_points),
-            np.zeros((n_points, 3), dtype=np.float32),
-            False,
-            False,
-            0,
-            0,
-        )
-
-    colors = np.asarray(colors[:, :3], dtype=np.float32)
-    if colors.max() <= 1.0:
-        colors = colors * 255.0
-    red_mask = (colors[:, 0] > 150.0) & (colors[:, 1] < 100.0) & (colors[:, 2] < 100.0)
-    black_mask = (colors[:, 0] < 80.0) & (colors[:, 1] < 80.0) & (colors[:, 2] < 80.0)
-
-    has_region = bool(red_mask.any())
-    contact_vertices = vertices[red_mask] if has_region else vertices
-    noncontact_vertices = vertices[black_mask]
-    return (
-        _fixed_sample_points(contact_vertices, n_points),
-        _fixed_sample_points(noncontact_vertices, n_points),
-        has_region,
-        bool(black_mask.any()),
-        int(red_mask.sum()),
-        int(black_mask.sum()),
-    )
-
-
 oakink2_obj_scale = {
     "O02@0206@00001": 1.15,
     "O02@0206@00002": 0.95,

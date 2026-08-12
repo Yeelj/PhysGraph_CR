@@ -247,15 +247,6 @@ class MyA2CBase(BaseAlgorithm):
         self.max_epochs = self.config.get("max_epochs", -1)
         self.early_stop_epochs = self.config.get("early_stop_epochs", 500)
         self.max_frames = self.config.get("max_frames", -1)
-        # Stage 2 convergence is defined by contact quality, not by the total
-        # imitation reward used by the original training stage.
-        self.contact_refine_early_stop = self.config.get("contact_refine_early_stop", {})
-        # Optional Stage-2 regularizers are consumed by PPOAgent while the
-        # rollout buffer below supplies the previous applied translation.
-        self.contact_refine_aux_loss = self.config.get("contact_refine_aux_loss", {})
-        self.contact_refine_metric_history = []
-        self.contact_refine_converged_epochs = 0
-
         self.is_adaptive_lr = config["lr_schedule"] == "adaptive"
         self.linear_lr = config["lr_schedule"] == "linear"
         self.is_warmup_lr = config["lr_schedule"] == "warmup"
@@ -904,11 +895,6 @@ class MyA2CBase(BaseAlgorithm):
             if torch.any(self.dones):
                 self.obs, _ = self.vec_env.env.reset_done()
                 self.obs = self.obs_to_tensors(self.obs)
-            if self.contact_refine_aux_enabled:
-                # Do not compare the first residual of a new episode with the
-                # final residual of the preceding episode.
-                not_done = 1.0 - self.dones.float()
-                self.previous_contact_residual *= not_done.unsqueeze(-1)
             if self.use_action_masks:
                 masks = self.vec_env.get_action_masks()
                 res_dict = self.get_masked_action_values(self.obs, masks)
@@ -924,19 +910,11 @@ class MyA2CBase(BaseAlgorithm):
                     cat = cat.reshape(self.num_actors, -1)
                     obs_dict_cat.update({k: cat})
                 else:
-                    # Stage 2 adds contact_refine as a regular tensor-valued
-                    # observation; preserve it directly in the PPO buffer.
                     obs_dict_cat.update({k: v})
             self.experience_buffer.update_data("obses", n, obs_dict_cat)
-            if self.contact_refine_aux_enabled:
-                self.experience_buffer.update_data(
-                    "contact_prev_residuals", n, self.previous_contact_residual
-                )
 
             for k in update_list:
                 self.experience_buffer.update_data(k, n, res_dict[k])
-            if self.contact_refine_aux_enabled:
-                self.previous_contact_residual = res_dict["contact_residuals"].detach()
             if self.has_central_value:
                 self.experience_buffer.update_data("states", n, self.obs["states"])
 
@@ -974,28 +952,11 @@ class MyA2CBase(BaseAlgorithm):
 
             if "reward_dict" in infos:
                 reward_dict = infos["reward_dict"]
-                if res_dict.get("base_actions") is not None:
-                    # Stage 2 diagnostics measure the deterministic correction
-                    # mean, excluding action-sampling noise from the report.
-                    residual = res_dict["mus"] - res_dict["base_actions"]
-                    reward_dict["rh_contact_residual_translation_norm"] = torch.norm(
-                        residual[:, :3], dim=-1
-                    )
-                    reward_dict["rh_contact_residual_rotation_norm"] = torch.norm(
-                        residual[:, 3:6], dim=-1
-                    )
-                    reward_dict["rh_contact_residual_finger_norm"] = torch.norm(
-                        residual[:, 6:28], dim=-1
-                    )
                 for k, v in reward_dict.items():
                     if k in self.current_reward_dict:
                         self.current_reward_dict[k] += v.unsqueeze(1)
                     else:
                         self.current_reward_dict[k] = v.unsqueeze(1)
-
-            # Preserve completed episode lengths before done environments are
-            # zeroed; Stage 2 metrics are converted from sums to per-step means.
-            completed_lengths = self.current_lengths[env_done_indices].clone().clamp(min=1.0)
 
             self.game_rewards.update(self.current_rewards[env_done_indices])
             self.game_diff_obj_pos.update(self.current_diff_obj_pos[env_done_indices])
@@ -1014,35 +975,12 @@ class MyA2CBase(BaseAlgorithm):
             self.current_shaped_rewards = self.current_shaped_rewards * not_dones.unsqueeze(1)
             self.current_lengths = self.current_lengths * not_dones
 
-            completed_contact_ratios = {}
-            if "rh_contact_active_count" in self.current_reward_dict:
-                active_count = self.current_reward_dict["rh_contact_active_count"][env_done_indices].clamp(min=1.0)
-                completed_contact_ratios = {
-                    "rh_contact_good_ratio": self.current_reward_dict["rh_contact_good_count"][
-                        env_done_indices
-                    ]
-                    / active_count,
-                    "rh_contact_bad_ratio": self.current_reward_dict["rh_contact_bad_count"][
-                        env_done_indices
-                    ]
-                    / active_count,
-                }
-            contact_metric_steps = self.current_reward_dict.get("rh_contact_metric_step_count")
-            if contact_metric_steps is not None:
-                contact_metric_steps = contact_metric_steps[env_done_indices].clamp(min=1.0)
             for k, v in self.current_reward_dict.items():
-                completed_values = v[env_done_indices]
-                if k in completed_contact_ratios:
-                    completed_values = completed_contact_ratios[k]
-                elif "_contact_" in k and contact_metric_steps is not None:
-                    # Normalize Stage-2 metrics by observed rollout steps, not
-                    # the absolute demonstration frame used by random reset.
-                    completed_values = completed_values / contact_metric_steps
                 if k in self.game_reward_dict:
-                    self.game_reward_dict[k].update(completed_values)
+                    self.game_reward_dict[k].update(v[env_done_indices])
                 else:
                     self.game_reward_dict[k] = torch_ext.AverageMeter(1, self.games_to_track).to(self.ppo_device)
-                    self.game_reward_dict[k].update(completed_values)
+                    self.game_reward_dict[k].update(v[env_done_indices])
                 self.current_reward_dict[k] = self.current_reward_dict[k] * not_dones.unsqueeze(1)
 
         last_values = self.get_values(self.obs)
@@ -1192,23 +1130,6 @@ class MyContinuousA2CBase(MyA2CBase):
         self.update_list = ["actions", "neglogpacs", "values", "mus", "sigmas"]
         self.tensor_list = self.update_list + ["obses", "states", "dones"]
         self.tensor_list = self.tensor_list + ["error_masks"]
-        self.contact_refine_aux_enabled = bool(
-            self.contact_refine_aux_loss.get("enabled", False)
-        )
-        if self.contact_refine_aux_enabled:
-            # Store the previous applied 3-D translation residual for each
-            # rollout sample so temporal regularization survives minibatching.
-            self.experience_buffer.tensor_dict[
-                "contact_prev_residuals"
-            ] = self.experience_buffer._create_tensor_from_space(
-                gym.spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32),
-                self.experience_buffer.obs_base_shape,
-            )
-            self.tensor_list.append("contact_prev_residuals")
-            batch_size = self.num_agents * self.num_actors
-            self.previous_contact_residual = torch.zeros(
-                (batch_size, 3), dtype=torch.float32, device=self.ppo_device
-            )
 
     def train_epoch(self):
         super().train_epoch()
@@ -1364,9 +1285,6 @@ class MyContinuousA2CBase(MyA2CBase):
         dataset_dict["error_masks"] = error_masks
         dataset_dict["mu"] = mus
         dataset_dict["sigma"] = sigmas
-        dataset_dict["contact_prev_residuals"] = batch_dict.get(
-            "contact_prev_residuals", None
-        )
 
         self.dataset.update_values_dict(dataset_dict)
 
@@ -1523,86 +1441,6 @@ class MyContinuousA2CBase(MyA2CBase):
                     self.writer.add_scalars("reward_dict/step", game_reward_dict, frame)
                     self.writer.add_scalars("reward_dict/iter", game_reward_dict, epoch_num)
                     self.writer.add_scalars("reward_dict/time", game_reward_dict, total_time)
-                    contact_keys = [
-                        "rh_contact_red_dist",
-                        "rh_contact_black_dist",
-                        "rh_contact_good_ratio",
-                        "rh_contact_bad_ratio",
-                        "rh_contact_active_ratio",
-                        "rh_contact_region_reward",
-                        "rh_contact_nonregion_penalty",
-                        "rh_contact_reward_total",
-                        "rh_contact_red_valid",
-                        "rh_contact_black_valid",
-                        "rh_contact_residual_translation_norm",
-                        "rh_contact_residual_rotation_norm",
-                        "rh_contact_residual_finger_norm",
-                    ]
-                    if any(k in game_reward_dict for k in contact_keys):
-                        contact_stats = {
-                            k.replace("rh_contact_", ""): float(game_reward_dict[k])
-                            for k in contact_keys
-                            if k in game_reward_dict
-                        }
-                        print("contact_refine_stats:", contact_stats)
-
-                        # Stage 2 early stopping requires sustained good contact
-                        # and stable good/bad-ratio trends. The finite max_epochs
-                        # remains a hard fallback when thresholds are unreachable.
-                        stop_cfg = self.contact_refine_early_stop
-                        if stop_cfg.get("enabled", False):
-                            self.contact_refine_metric_history.append(contact_stats)
-                            slope_window = int(stop_cfg.get("slope_window", 64))
-                            slopes_stable = False
-                            if len(self.contact_refine_metric_history) >= slope_window:
-                                recent = self.contact_refine_metric_history[-slope_window:]
-                                x = np.arange(slope_window)
-                                good_slope = linregress(x, [m["good_ratio"] for m in recent]).slope
-                                bad_slope = linregress(x, [m["bad_ratio"] for m in recent]).slope
-                                slope_tolerance = float(stop_cfg.get("slope_tolerance", 1e-4))
-                                slopes_stable = (
-                                    abs(good_slope) <= slope_tolerance
-                                    and abs(bad_slope) <= slope_tolerance
-                                )
-
-                            thresholds_met = (
-                                contact_stats.get("red_valid", 0.0) >= 0.999
-                                and contact_stats.get("black_valid", 0.0) >= 0.999
-                                and contact_stats.get("good_ratio", 0.0)
-                                >= float(stop_cfg.get("good_ratio_threshold", 0.8))
-                                and contact_stats.get("bad_ratio", 1.0)
-                                <= float(stop_cfg.get("bad_ratio_threshold", 0.05))
-                                and contact_stats.get("active_ratio", 0.0)
-                                >= float(stop_cfg.get("min_active_ratio", 0.01))
-                            )
-                            if (
-                                epoch_num >= int(stop_cfg.get("min_epoch", 500))
-                                and thresholds_met
-                                and slopes_stable
-                            ):
-                                self.contact_refine_converged_epochs += 1
-                            else:
-                                self.contact_refine_converged_epochs = 0
-
-                            print(
-                                "contact_refine_convergence:",
-                                {
-                                    "stable": slopes_stable,
-                                    "thresholds_met": thresholds_met,
-                                    "converged_epochs": self.contact_refine_converged_epochs,
-                                    "patience": int(stop_cfg.get("patience", 200)),
-                                },
-                            )
-                            if self.contact_refine_converged_epochs >= int(stop_cfg.get("patience", 200)):
-                                saving_checkpoint_name = (
-                                    "last_"
-                                    + self.config["name"]
-                                    + "_contact_converged_ep_"
-                                    + str(epoch_num)
-                                )
-                                self.save(os.path.join(self.nn_dir, saving_checkpoint_name))
-                                print("CONTACT REFINE EARLY STOP!")
-                                should_exit = True
 
                     self.writer.add_scalar("episode_lengths/step", mean_lengths, frame)
                     self.writer.add_scalar("episode_lengths/iter", mean_lengths, epoch_num)
@@ -1653,9 +1491,7 @@ class MyContinuousA2CBase(MyA2CBase):
                         ckpt += f"_Eft_{mean_diff_ft}"
                         self.save(os.path.join(self.nn_dir, ckpt))
 
-                # Stage 2 uses the contact-quality criterion above; the generic
-                # reward-slope stop remains exclusively for Stage 1.
-                if epoch_num >= self.early_stop_epochs and not self.contact_refine_early_stop.get("enabled", False):
+                if epoch_num >= self.early_stop_epochs:
                     slope_early_stop = True
                     for horizon in [8, 32, 64]:  # short term, mid term, long term trend
                         slope, _, _, _, _ = linregress(
