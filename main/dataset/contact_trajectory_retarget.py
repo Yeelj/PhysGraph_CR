@@ -5,10 +5,10 @@ all finger DOFs unchanged, and solves only for a right-hand translation in the
 tool-local frame.  Corrected PKLs mirror ``data/retargeting`` below
 ``data/retargeting_contact`` and remain compatible with ``load_retargeted_data``.
 
-The implementation has no Isaac Gym dependency.  Hand collision surfaces and
-forward kinematics are reconstructed directly from the dex-hand URDF, which
-makes the geometric correction and its validation runnable as an offline data
-preprocessing step.
+The optimizer itself has no Isaac Gym dependency.  Hand collision surfaces and
+forward kinematics are reconstructed directly from the dex-hand URDF.  After
+semantic and precise geometry checks pass, an isolated subprocess loads Isaac
+Gym/PhysX only for collision-response validation and optional visualization.
 """
 
 from __future__ import annotations
@@ -20,7 +20,10 @@ import hashlib
 import json
 import os
 import pickle
+import subprocess
+import sys
 import tempfile
+import traceback
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -28,14 +31,18 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import trimesh
-from scipy.optimize import differential_evolution, minimize
+from scipy.optimize import differential_evolution, minimize, minimize_scalar
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
 DEFAULT_OAKINK_ROOT = "/home/ps/data/ylj/ManipTrans/data/OakInk-v2"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _log(message: str) -> None:
+    print(f"[contact-retarget] {message}", flush=True)
 
 
 def _as_mesh(scene_or_mesh) -> trimesh.Trimesh:
@@ -749,6 +756,165 @@ def _red_direction_seed(
     return np.clip(seed, -max_shift, max_shift)
 
 
+def estimate_semantic_axis(tool: SemanticTool, roi_distance: float = 0.03) -> Tuple[np.ndarray, Dict[str, object]]:
+    """Estimate a tool-local center axis directed from black toward red.
+
+    Only black surface samples near the red region participate when possible,
+    which prevents a large unrelated part of a tool (for example, a spoon
+    bowl) from dominating the axis.  PCA supplies a mesh-aligned center axis;
+    the red/black centroids determine its sign.
+    """
+
+    if roi_distance <= 0.0:
+        raise ValueError(f"axis ROI distance must be positive, got {roi_distance}")
+    red_points = np.asarray(tool.red_points, dtype=np.float64)
+    black_points = np.asarray(tool.black_points, dtype=np.float64)
+    if red_points.ndim != 2 or red_points.shape[1] != 3 or len(red_points) == 0:
+        raise ValueError("Semantic-axis estimation requires non-empty red 3D points")
+    if black_points.ndim != 2 or black_points.shape[1] != 3 or len(black_points) == 0:
+        raise ValueError("Semantic-axis estimation requires non-empty black 3D points")
+
+    black_to_red_distance, _ = tool.red_tree.query(black_points, workers=1)
+    local_mask = black_to_red_distance <= roi_distance
+    fallback_used = not bool(local_mask.any())
+    if fallback_used:
+        # Always retain a local semantic boundary even when the configured ROI
+        # is narrower than the red/black separation in a coarse mesh.
+        fallback_count = min(len(black_points), max(3, int(np.ceil(0.1 * len(black_points)))))
+        local_indices = np.argsort(black_to_red_distance)[:fallback_count]
+        local_black = black_points[local_indices]
+    else:
+        local_black = black_points[local_mask]
+
+    red_center = np.median(red_points, axis=0)
+    black_center = np.median(local_black, axis=0)
+    semantic_vector = red_center - black_center
+    semantic_norm = float(np.linalg.norm(semantic_vector))
+    if semantic_norm <= 1e-10:
+        raise ValueError(
+            "Cannot orient the semantic axis because the red and local-black centers coincide"
+        )
+    semantic_direction = semantic_vector / semantic_norm
+
+    # Balance the two semantic classes before PCA so vertex density or region
+    # size does not give either color a disproportionate weight.
+    red_centered = red_points - red_center
+    black_centered = local_black - black_center
+    covariance = (
+        (red_centered.T @ red_centered) / max(1, len(red_centered))
+        + (black_centered.T @ black_centered) / max(1, len(black_centered))
+        + np.outer(semantic_vector, semantic_vector)
+    )
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    alignments = np.abs(eigenvectors.T @ semantic_direction)
+    axis_index = int(np.argmax(alignments))
+    axis_direction = eigenvectors[:, axis_index]
+    if float(np.dot(axis_direction, semantic_vector)) < 0.0:
+        axis_direction = -axis_direction
+    axis_direction = axis_direction / np.linalg.norm(axis_direction)
+    axis_origin = 0.5 * (red_center + black_center)
+
+    return axis_direction.astype(np.float64), {
+        "method": "semantic_pca",
+        "direction_tool": axis_direction,
+        "origin_tool": axis_origin,
+        "red_center_tool": red_center,
+        "local_black_center_tool": black_center,
+        "semantic_center_distance": semantic_norm,
+        "pca_alignment": float(alignments[axis_index]),
+        "pca_eigenvalues": eigenvalues,
+        "roi_distance": float(roi_distance),
+        "local_black_point_count": int(len(local_black)),
+        "local_black_fallback_used": fallback_used,
+    }
+
+
+def _axis_constraint_report(delta: np.ndarray, direction: np.ndarray) -> Dict[str, object]:
+    delta = np.asarray(delta, dtype=np.float64)
+    direction = np.asarray(direction, dtype=np.float64)
+    direction_norm = float(np.linalg.norm(direction))
+    if direction.shape != (3,) or direction_norm <= 1e-10:
+        raise ValueError(f"Invalid semantic-axis direction: {direction}")
+    unit_direction = direction / direction_norm
+    signed_distance = float(np.dot(delta, unit_direction))
+    perpendicular = delta - signed_distance * unit_direction
+    perpendicular_norm = float(np.linalg.norm(perpendicular))
+    tolerance = 1e-6
+    return {
+        "signed_distance": signed_distance,
+        "perpendicular_norm": perpendicular_norm,
+        "direction_norm": direction_norm,
+        "passed": bool(signed_distance >= -tolerance and perpendicular_norm <= tolerance),
+    }
+
+
+def optimize_tool_translation_along_axis(
+    points_tool: np.ndarray,
+    point_link_ids: np.ndarray,
+    contact_link_ids: np.ndarray,
+    tool: SemanticTool,
+    settings: GeometrySettings,
+    direction: np.ndarray,
+    grid_samples: int = 201,
+    initial_delta: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    """Optimize a non-negative distance along one fixed tool-local axis."""
+
+    direction = np.asarray(direction, dtype=np.float64)
+    direction_norm = float(np.linalg.norm(direction))
+    if direction.shape != (3,) or direction_norm <= 1e-10:
+        raise ValueError(f"Invalid semantic-axis direction: {direction}")
+    if grid_samples < 3:
+        raise ValueError(f"axis grid samples must be at least 3, got {grid_samples}")
+    direction = direction / direction_norm
+
+    def objective_distance(distance: float) -> float:
+        return _optimization_objective(
+            float(distance) * direction,
+            points_tool,
+            point_link_ids,
+            contact_link_ids,
+            tool,
+            settings,
+        )
+
+    distances = np.linspace(0.0, settings.max_shift, grid_samples, dtype=np.float64)
+    scores = np.asarray([objective_distance(distance) for distance in distances])
+    candidates = [(float(distance), float(score)) for distance, score in zip(distances, scores)]
+    if initial_delta is not None:
+        initial_distance = float(
+            np.clip(np.dot(np.asarray(initial_delta, dtype=np.float64), direction), 0.0, settings.max_shift)
+        )
+        candidates.append((initial_distance, objective_distance(initial_distance)))
+
+    best_grid_index = int(np.argmin(scores))
+    lower_index = max(0, best_grid_index - 1)
+    upper_index = min(len(distances) - 1, best_grid_index + 1)
+    polished = None
+    if distances[upper_index] > distances[lower_index]:
+        polished = minimize_scalar(
+            objective_distance,
+            bounds=(float(distances[lower_index]), float(distances[upper_index])),
+            method="bounded",
+            options={"xatol": 1e-7, "maxiter": 160},
+        )
+        candidates.append((float(polished.x), float(polished.fun)))
+
+    distance, score = min(candidates, key=lambda item: item[1])
+    delta = distance * direction
+    return delta.astype(np.float64), {
+        "mode": "semantic_axis",
+        "objective": float(score),
+        "axis_direction_tool": direction,
+        "axis_distance": float(distance),
+        "axis_grid_samples": int(grid_samples),
+        "axis_grid_best_distance": float(distances[best_grid_index]),
+        "bounded_success": None if polished is None else bool(polished.success),
+        "bounded_message": None if polished is None else str(polished.message),
+        "axis_constraint": _axis_constraint_report(delta, direction),
+    }
+
+
 def optimize_tool_translation(
     points_tool: np.ndarray,
     point_link_ids: np.ndarray,
@@ -799,6 +965,7 @@ def optimize_tool_translation(
     candidates.append((np.asarray(polished.x), float(polished.fun)))
     delta, score = min(candidates, key=lambda item: item[1])
     return delta.astype(np.float64), {
+        "mode": "free3d",
         "objective": float(score),
         "global_search": bool(global_search),
         "differential_evolution_success": None if result is None else bool(result.success),
@@ -1010,6 +1177,302 @@ def _invariant_report(source: Mapping, corrected: Mapping, delta_world: np.ndarr
     return result
 
 
+def _load_urdf_collision_mesh(urdf_path: Path) -> trimesh.Trimesh:
+    """Load every URDF collision primitive into the root/tool coordinate frame."""
+
+    urdf_path = urdf_path.resolve()
+    root = ET.fromstring(urdf_path.read_text(encoding="utf-8").lstrip())
+    link_names = [element.attrib["name"] for element in root.findall("link")]
+    child_links = {
+        joint.find("child").attrib["link"]
+        for joint in root.findall("joint")
+        if joint.find("child") is not None
+    }
+    roots = [name for name in link_names if name not in child_links]
+    if len(roots) != 1:
+        raise ValueError(f"Expected one collision URDF root link, found {roots} in {urdf_path}")
+
+    children: Dict[str, List[Tuple[str, np.ndarray]]] = {}
+    for joint in root.findall("joint"):
+        parent = joint.find("parent")
+        child = joint.find("child")
+        if parent is None or child is None:
+            continue
+        joint_type = joint.attrib.get("type", "fixed")
+        if joint_type not in ("fixed", "floating"):
+            raise ValueError(
+                f"Object collision URDF must be rigid; joint {joint.attrib.get('name')} is {joint_type}"
+            )
+        children.setdefault(parent.attrib["link"], []).append(
+            (child.attrib["link"], _origin_matrix(joint.find("origin")))
+        )
+
+    link_transforms = {roots[0]: np.eye(4, dtype=np.float64)}
+    stack = [roots[0]]
+    while stack:
+        parent = stack.pop()
+        for child, joint_transform in children.get(parent, []):
+            link_transforms[child] = link_transforms[parent] @ joint_transform
+            stack.append(child)
+
+    meshes = []
+    for link in root.findall("link"):
+        link_name = link.attrib["name"]
+        if link_name not in link_transforms:
+            raise ValueError(f"Disconnected collision link {link_name!r} in {urdf_path}")
+        for collision in link.findall("collision"):
+            geometry = collision.find("geometry")
+            if geometry is None:
+                continue
+            mesh_element = geometry.find("mesh")
+            box_element = geometry.find("box")
+            sphere_element = geometry.find("sphere")
+            cylinder_element = geometry.find("cylinder")
+            if mesh_element is not None:
+                filename = mesh_element.attrib["filename"]
+                if filename.startswith("package://"):
+                    raise ValueError(f"Unsupported package mesh URI {filename!r} in {urdf_path}")
+                mesh_path = Path(filename[7:] if filename.startswith("file://") else filename)
+                if not mesh_path.is_absolute():
+                    mesh_path = urdf_path.parent / mesh_path
+                collision_mesh = _as_mesh(
+                    trimesh.load(mesh_path.resolve(), process=False, force="mesh")
+                ).copy()
+                scale = np.fromstring(mesh_element.attrib.get("scale", "1 1 1"), sep=" ")
+                if scale.size != 3:
+                    raise ValueError(f"Invalid mesh scale in {urdf_path}: {mesh_element.attrib}")
+                collision_mesh.vertices = np.asarray(collision_mesh.vertices) * scale[None]
+            elif box_element is not None:
+                collision_mesh = trimesh.creation.box(
+                    extents=np.fromstring(box_element.attrib["size"], sep=" ")
+                )
+            elif sphere_element is not None:
+                collision_mesh = trimesh.creation.icosphere(
+                    subdivisions=3, radius=float(sphere_element.attrib["radius"])
+                )
+            elif cylinder_element is not None:
+                collision_mesh = trimesh.creation.cylinder(
+                    radius=float(cylinder_element.attrib["radius"]),
+                    height=float(cylinder_element.attrib["length"]),
+                    sections=64,
+                )
+            else:
+                continue
+            collision_mesh.apply_transform(
+                link_transforms[link_name] @ _origin_matrix(collision.find("origin"))
+            )
+            meshes.append(collision_mesh)
+    if not meshes:
+        raise ValueError(f"No collision geometry found in {urdf_path}")
+    return trimesh.util.concatenate(meshes)
+
+
+def precise_geometry_validation(
+    corrected: Mapping,
+    hand: "OfflineHandSpec",
+    context: OakInkContext,
+    tool: SemanticTool,
+    contact_names: Sequence[str],
+    settings: GeometrySettings,
+    hold_frame_ids: np.ndarray,
+    delta_world: np.ndarray,
+    points_per_link: int = 64,
+    maximum_frames: int = 48,
+    max_penetration: float = 0.006,
+    max_penetration_fraction: float = 0.01,
+    max_correction_step: float = 0.005,
+    max_correction_acceleration: float = 0.005,
+) -> Dict[str, object]:
+    """Second-tier validation with dense hand geometry and the physical collision mesh."""
+
+    if points_per_link < 8:
+        raise ValueError("precise points per link must be at least 8")
+    if maximum_frames < 2:
+        raise ValueError("precise validation requires at least two frames")
+    sample_count = min(len(hold_frame_ids), maximum_frames)
+    frame_ids = np.unique(
+        np.linspace(hold_frame_ids[0], hold_frame_ids[-1], sample_count).round().astype(np.int64)
+    )
+    model = URDFCollisionKinematics(
+        Path(hand.urdf_path), hand.dof_names, points_per_link=points_per_link
+    )
+    contact_ids = _contact_link_ids(model, contact_names)
+    world_points = model.world_surface_trajectory(
+        np.asarray(corrected["opt_wrist_pos"], dtype=np.float64),
+        np.asarray(corrected["opt_wrist_rot"], dtype=np.float64),
+        np.asarray(corrected["opt_dof_pos"], dtype=np.float64),
+        frame_ids=frame_ids,
+    )
+    points_tool = world_to_tool_points(world_points, context.object_trajectory[frame_ids])
+    semantic_metrics = contact_geometry_metrics(
+        points_tool, model.point_link_ids_array, contact_ids, tool, settings
+    )
+
+    collision_mesh = _load_urdf_collision_mesh(context.collision_urdf_path)
+    flat_points = points_tool.reshape(-1, 3)
+    if collision_mesh.is_watertight:
+        # trimesh's ray test can allocate a face-by-point intermediate.  Batch
+        # it so dense validation remains bounded for long OakInk sequences.
+        inside = np.concatenate(
+            [
+                collision_mesh.contains(flat_points[start : start + 1024])
+                for start in range(0, len(flat_points), 1024)
+            ]
+        )
+        inside_points = flat_points[inside]
+        penetration_depths = (
+            trimesh.proximity.signed_distance(collision_mesh, inside_points)
+            if len(inside_points)
+            else np.zeros(0, dtype=np.float64)
+        )
+        penetration_depths = np.maximum(np.asarray(penetration_depths), 0.0)
+        penetration_method = "watertight_signed_distance"
+    else:
+        inside = np.zeros(len(flat_points), dtype=bool)
+        penetration_depths = np.zeros(0, dtype=np.float64)
+        penetration_method = "unavailable_non_watertight_mesh"
+
+    correction_velocity = np.linalg.norm(np.diff(delta_world, axis=0), axis=1)
+    correction_acceleration = np.linalg.norm(np.diff(delta_world, n=2, axis=0), axis=1)
+    penetration_fraction = float(inside.mean()) if len(inside) else 0.0
+    maximum_penetration = float(penetration_depths.max(initial=0.0))
+    maximum_step = float(correction_velocity.max(initial=0.0))
+    maximum_acceleration = float(correction_acceleration.max(initial=0.0))
+    semantic_passed = _is_feasible(semantic_metrics, settings)
+    collision_passed = bool(
+        collision_mesh.is_watertight
+        and maximum_penetration <= max_penetration
+        and penetration_fraction <= max_penetration_fraction
+    )
+    continuity_passed = bool(
+        maximum_step <= max_correction_step
+        and maximum_acceleration <= max_correction_acceleration
+    )
+    return {
+        "name": "precise_geometry",
+        "status": "passed" if semantic_passed and collision_passed and continuity_passed else "failed",
+        "passed": bool(semantic_passed and collision_passed and continuity_passed),
+        "frame_ids": frame_ids,
+        "points_per_link": int(points_per_link),
+        "hand_surface_point_count": int(len(model.local_points)),
+        "semantic": _summary_metrics(semantic_metrics),
+        "semantic_passed": semantic_passed,
+        "collision_mesh_watertight": bool(collision_mesh.is_watertight),
+        "penetration_method": penetration_method,
+        "penetration_point_count": int(inside.sum()),
+        "penetration_fraction": penetration_fraction,
+        "maximum_penetration": maximum_penetration,
+        "collision_passed": collision_passed,
+        "maximum_correction_step": maximum_step,
+        "maximum_correction_acceleration": maximum_acceleration,
+        "continuity_passed": continuity_passed,
+        "thresholds": {
+            "max_penetration": float(max_penetration),
+            "max_penetration_fraction": float(max_penetration_fraction),
+            "max_correction_step": float(max_correction_step),
+            "max_correction_acceleration": float(max_correction_acceleration),
+        },
+    }
+
+
+def run_isaac_gym_validation(
+    corrected: Mapping,
+    hand: "OfflineHandSpec",
+    context: OakInkContext,
+    contact_names: Sequence[str],
+    hold_frame_ids: np.ndarray,
+    headless: bool,
+    maximum_frames: int,
+    settle_steps: int,
+    min_contact_frame_ratio: float,
+    max_contact_force: float,
+    max_initial_overlap: float,
+    timeout: float,
+) -> Dict[str, object]:
+    """Run tier-three PhysX contact replay in an isolated Isaac Gym process."""
+
+    if not headless and not os.environ.get("DISPLAY"):
+        return {
+            "name": "isaac_gym_physics",
+            "status": "error",
+            "passed": False,
+            "error": (
+                "Viewer mode requires an X11 DISPLAY, but DISPLAY is empty. "
+                "Run from a graphical desktop/X-forwarded shell or add --headless."
+            ),
+        }
+    helper_path = Path(__file__).with_name("contact_trajectory_physics_validate.py")
+    if not helper_path.is_file():
+        raise FileNotFoundError(f"Isaac Gym validation helper is missing: {helper_path}")
+    sample_count = min(len(hold_frame_ids), maximum_frames)
+    frame_ids = np.unique(
+        np.linspace(hold_frame_ids[0], hold_frame_ids[-1], sample_count).round().astype(np.int64)
+    )
+    request = {
+        "hand_urdf": str(hand.urdf_path),
+        "hand_dof_names": tuple(hand.dof_names),
+        "contact_body_names": tuple(contact_names),
+        "collision_urdf": str(context.collision_urdf_path),
+        "frame_ids": frame_ids,
+        "wrist_pos": np.asarray(corrected["opt_wrist_pos"], dtype=np.float64)[frame_ids],
+        "wrist_rot": np.asarray(corrected["opt_wrist_rot"], dtype=np.float64)[frame_ids],
+        "dof_pos": np.asarray(corrected["opt_dof_pos"], dtype=np.float64)[frame_ids],
+        "object_trajectory": np.asarray(context.object_trajectory, dtype=np.float64)[frame_ids],
+        "headless": bool(headless),
+        "settle_steps": int(settle_steps),
+        "min_contact_frame_ratio": float(min_contact_frame_ratio),
+        "max_contact_force": float(max_contact_force),
+        "max_initial_overlap": float(max_initial_overlap),
+    }
+    if not headless:
+        request.update(
+            {
+                "replay_wrist_pos": np.asarray(corrected["opt_wrist_pos"], dtype=np.float64),
+                "replay_wrist_rot": np.asarray(corrected["opt_wrist_rot"], dtype=np.float64),
+                "replay_dof_pos": np.asarray(corrected["opt_dof_pos"], dtype=np.float64),
+                "replay_object_trajectory": np.asarray(context.object_trajectory, dtype=np.float64),
+            }
+        )
+    with tempfile.TemporaryDirectory(prefix="contact-physics-") as temporary_directory:
+        temporary_directory = Path(temporary_directory)
+        request_path = temporary_directory / "request.pkl"
+        result_path = temporary_directory / "result.json"
+        _atomic_pickle_dump(request, request_path)
+        environment = os.environ.copy()
+        python_library = str(Path(sys.prefix) / "lib")
+        current_library_path = environment.get("LD_LIBRARY_PATH", "")
+        environment["LD_LIBRARY_PATH"] = (
+            python_library if not current_library_path else python_library + os.pathsep + current_library_path
+        )
+        environment["PYTHONUNBUFFERED"] = "1"
+        process = subprocess.run(
+            [sys.executable, str(helper_path), "--request", str(request_path), "--result", str(result_path)],
+            cwd=str(PROJECT_ROOT),
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE if headless else None,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            check=False,
+        )
+        if not result_path.is_file():
+            return {
+                "name": "isaac_gym_physics",
+                "status": "error",
+                "passed": False,
+                "returncode": int(process.returncode),
+                "output": "" if process.stdout is None else process.stdout[-12000:],
+            }
+        with result_path.open("r", encoding="utf-8") as stream:
+            result = json.load(stream)
+        result["returncode"] = int(process.returncode)
+        result["output"] = "" if process.stdout is None else process.stdout[-12000:]
+        result["passed"] = bool(result.get("passed", False) and process.returncode == 0)
+        if not result["passed"] and result.get("status") == "passed":
+            result["status"] = "error"
+        return result
+
+
 def _write_preview(
     output_path: Path,
     tool: SemanticTool,
@@ -1021,6 +1484,8 @@ def _write_preview(
     before_full: Mapping[str, object],
     after_full: Mapping[str, object],
     preview_frame: int,
+    semantic_axis: Optional[Mapping[str, object]] = None,
+    delta_tool: Optional[np.ndarray] = None,
 ) -> None:
     os.environ.setdefault("MPLCONFIGDIR", "/tmp/physgraph-matplotlib")
     import matplotlib
@@ -1033,6 +1498,29 @@ def _write_preview(
     contact_mask = np.isin(point_link_ids, contact_link_ids)
     red = tool.red_points[:: max(1, len(tool.red_points) // 800)]
     black = tool.black_points[:: max(1, len(tool.black_points) // 800)]
+
+    def draw_semantic_axis(axis) -> None:
+        if semantic_axis is None:
+            return
+        origin = np.asarray(semantic_axis["origin_tool"], dtype=np.float64)
+        direction = np.asarray(semantic_axis["direction_tool"], dtype=np.float64)
+        axis_length = max(
+            0.02,
+            0.0 if delta_tool is None else float(np.linalg.norm(delta_tool)),
+        )
+        axis.quiver(
+            origin[0],
+            origin[1],
+            origin[2],
+            direction[0],
+            direction[1],
+            direction[2],
+            length=axis_length,
+            normalize=True,
+            color="magenta",
+            linewidth=2.0,
+        )
+
     for axis, hand_points, title in (
         (axes[0], points_before[preview_frame], "Before correction"),
         (axes[1], points_after[preview_frame], "After correction"),
@@ -1049,10 +1537,12 @@ def _write_preview(
         )
         axis.set_title(f"{title}, frame={preview_frame}")
         axis.set_box_aspect((1, 1, 1))
+        draw_semantic_axis(axis)
     axes[2].scatter(red[:, 0], red[:, 1], red[:, 2], c="red", s=3, alpha=0.5)
     axes[2].scatter(black[:, 0], black[:, 1], black[:, 2], c="black", s=3, alpha=0.3)
     axes[2].set_title("Tool semantic regions (tool frame)")
     axes[2].set_box_aspect((1, 1, 1))
+    draw_semantic_axis(axes[2])
 
     time_axis = figure.add_subplot(2, 1, 2)
     time_axis.plot(alpha, label="translation alpha", color="tab:gray")
@@ -1073,6 +1563,12 @@ def _write_preview(
 
 
 def run_correction(args: argparse.Namespace) -> Dict[str, object]:
+    _log(f"开始修正 data_idx={args.data_idx}, dexhand={args.dexhand}, side={args.side}")
+    if not args.headless and not os.environ.get("DISPLAY"):
+        raise RuntimeError(
+            "Isaac Gym Viewer was requested because --headless was omitted, but DISPLAY is empty. "
+            "Run from a graphical desktop/X-forwarded shell, or add --headless for non-visual execution."
+        )
     hand = _resolve_dexhand(args.dexhand, args.side)
     input_path = Path(args.input_pkl).resolve() if args.input_pkl else _resolve_source_pkl(
         args.data_idx, args.dexhand, args.side
@@ -1085,10 +1581,12 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
     )
     if output_path == input_path:
         raise ValueError("Corrected output must not overwrite the source retarget PKL")
-    if output_path.exists() and not args.overwrite:
-        raise FileExistsError(
-            f"Corrected PKL already exists: {output_path}. Pass --overwrite to replace it."
-        )
+    output_existed = output_path.exists()
+    if output_existed:
+        _log(f"检测到已有修正 PKL；本次验证通过后将原子覆盖：{output_path}")
+    else:
+        _log(f"本次将生成新的修正 PKL：{output_path}")
+    _log("读取原始 retarget、工具语义 mesh、collision URDF 和工具轨迹")
     context = load_oakink_context(
         args.data_idx,
         args.side,
@@ -1155,16 +1653,34 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
             raise ValueError(
                 f"Invalid correction interval [{start_frame}, {end_frame}] for length {length}"
             )
+    _log(f"抓握修正区间：frame {start_frame}–{end_frame}，轨迹总长度={length}")
+    _log(f"[1/3] 开始语义几何优化（translation_mode={args.translation_mode}）")
     optimization_frames = _select_optimization_frames(start_frame, end_frame, args.max_optimization_frames)
-    delta_tool, optimizer_report = optimize_tool_translation(
-        points_before[optimization_frames],
-        kinematics.point_link_ids_array,
-        contact_ids,
-        tool,
-        settings,
-        seed=args.seed,
-        max_iterations=args.optimizer_iterations,
-    )
+    semantic_axis_report = None
+    semantic_axis_direction = None
+    if args.translation_mode == "semantic-axis":
+        semantic_axis_direction, semantic_axis_report = estimate_semantic_axis(
+            tool, roi_distance=args.axis_roi_distance
+        )
+        delta_tool, optimizer_report = optimize_tool_translation_along_axis(
+            points_before[optimization_frames],
+            kinematics.point_link_ids_array,
+            contact_ids,
+            tool,
+            settings,
+            semantic_axis_direction,
+            grid_samples=args.axis_grid_samples,
+        )
+    else:
+        delta_tool, optimizer_report = optimize_tool_translation(
+            points_before[optimization_frames],
+            kinematics.point_link_ids_array,
+            contact_ids,
+            tool,
+            settings,
+            seed=args.seed,
+            max_iterations=args.optimizer_iterations,
+        )
     optimizer_history = [optimizer_report]
 
     # A sparse set keeps the global search tractable, but final acceptance is
@@ -1189,17 +1705,29 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
             break
         failed_frames = hold_frame_ids[failed_local]
         optimization_frames = np.unique(np.concatenate([optimization_frames, failed_frames]))
-        delta_tool, refinement_report = optimize_tool_translation(
-            points_before[optimization_frames],
-            kinematics.point_link_ids_array,
-            contact_ids,
-            tool,
-            settings,
-            seed=args.seed + refinement_round + 1,
-            max_iterations=args.optimizer_iterations,
-            initial_delta=delta_tool,
-            global_search=False,
-        )
+        if semantic_axis_direction is not None:
+            delta_tool, refinement_report = optimize_tool_translation_along_axis(
+                points_before[optimization_frames],
+                kinematics.point_link_ids_array,
+                contact_ids,
+                tool,
+                settings,
+                semantic_axis_direction,
+                grid_samples=args.axis_grid_samples,
+                initial_delta=delta_tool,
+            )
+        else:
+            delta_tool, refinement_report = optimize_tool_translation(
+                points_before[optimization_frames],
+                kinematics.point_link_ids_array,
+                contact_ids,
+                tool,
+                settings,
+                seed=args.seed + refinement_round + 1,
+                max_iterations=args.optimizer_iterations,
+                initial_delta=delta_tool,
+                global_search=False,
+            )
         refinement_report["round"] = refinement_round + 1
         refinement_report["added_failure_frames"] = failed_frames
         optimizer_history.append(refinement_report)
@@ -1254,8 +1782,146 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         settings,
     )
     invariant_report = _invariant_report(source, corrected, delta_world)
+    final_axis_constraint = (
+        _axis_constraint_report(delta_tool, semantic_axis_direction)
+        if semantic_axis_direction is not None
+        else None
+    )
     geometry_feasible = _is_feasible(after_hold, settings)
-    overall_passed = bool(geometry_feasible and invariant_report["passed"])
+    semantic_geometry_passed = bool(
+        geometry_feasible
+        and invariant_report["passed"]
+        and (final_axis_constraint is None or final_axis_constraint["passed"])
+    )
+    semantic_geometry_tier = {
+        "name": "semantic_geometry_optimization",
+        "status": "passed" if semantic_geometry_passed else "failed",
+        "passed": semantic_geometry_passed,
+        "geometry_feasible": geometry_feasible,
+        "invariants_passed": bool(invariant_report["passed"]),
+        "axis_constraint_passed": bool(
+            final_axis_constraint is None or final_axis_constraint["passed"]
+        ),
+    }
+    _log(
+        "[1/3] 语义几何优化{}：红区合格帧={:.2%}，黑区违规比例={:.6%}，平移={:.2f} mm".format(
+            "通过" if semantic_geometry_passed else "失败",
+            float(after_hold["red_frame_pass_ratio"]),
+            float(after_hold["black_violation_fraction"]),
+            float(np.linalg.norm(delta_tool)) * 1000.0,
+        )
+    )
+    if semantic_geometry_passed:
+        _log("[2/3] 开始高密度精确几何验证（碰撞网格穿透 + 轨迹连续性）")
+        try:
+            precise_geometry_tier = precise_geometry_validation(
+                corrected,
+                hand,
+                context,
+                tool,
+                contact_names,
+                settings,
+                hold_frame_ids,
+                delta_world,
+                points_per_link=args.precise_points_per_link,
+                maximum_frames=args.precise_max_frames,
+                max_penetration=args.max_penetration,
+                max_penetration_fraction=args.max_penetration_fraction,
+                max_correction_step=args.max_correction_step,
+                max_correction_acceleration=args.max_correction_acceleration,
+            )
+        except Exception as error:
+            precise_geometry_tier = {
+                "name": "precise_geometry",
+                "status": "error",
+                "passed": False,
+                "error": f"{type(error).__name__}: {error}",
+                "traceback": traceback.format_exc(),
+            }
+    else:
+        precise_geometry_tier = {
+            "name": "precise_geometry",
+            "status": "skipped",
+            "passed": False,
+            "reason": "semantic geometry optimization did not pass",
+        }
+
+    if precise_geometry_tier["status"] == "passed":
+        _log(
+            "[2/3] 精确几何验证通过：穿透点比例={:.4%}，最大穿透={:.2f} mm，最大单帧步长={:.2f} mm".format(
+                float(precise_geometry_tier["penetration_fraction"]),
+                float(precise_geometry_tier["maximum_penetration"]) * 1000.0,
+                float(precise_geometry_tier["maximum_correction_step"]) * 1000.0,
+            )
+        )
+    elif precise_geometry_tier["status"] == "failed":
+        _log("[2/3] 精确几何验证失败；不进入 PhysX 验证")
+    elif precise_geometry_tier["status"] == "error":
+        _log(f"[2/3] 精确几何验证出错：{precise_geometry_tier.get('error')}")
+
+    if not precise_geometry_tier["passed"]:
+        physics_tier = {
+            "name": "isaac_gym_physics",
+            "status": "skipped",
+            "passed": False,
+            "reason": "precise geometry validation did not pass",
+        }
+    elif args.skip_physics_validation:
+        physics_tier = {
+            "name": "isaac_gym_physics",
+            "status": "skipped_by_user",
+            "passed": False,
+            "required": False,
+            "reason": "--skip-physics-validation was explicitly requested",
+        }
+    else:
+        if args.headless:
+            _log("[3/3] 开始 Isaac Gym/PhysX 无窗口接触验证")
+        else:
+            _log("[3/3] 开始 Isaac Gym/PhysX 接触验证；随后打开修正轨迹 Viewer")
+            _log("Viewer：唯一工具 + 修正绿手；关闭窗口后继续保存")
+        try:
+            physics_tier = run_isaac_gym_validation(
+                corrected,
+                hand,
+                context,
+                contact_names,
+                hold_frame_ids,
+                headless=args.headless,
+                maximum_frames=args.physics_max_frames,
+                settle_steps=args.physics_settle_steps,
+                min_contact_frame_ratio=args.physics_min_contact_frame_ratio,
+                max_contact_force=args.physics_max_contact_force,
+                max_initial_overlap=args.physics_max_initial_overlap,
+                timeout=args.physics_timeout,
+            )
+        except Exception as error:
+            physics_tier = {
+                "name": "isaac_gym_physics",
+                "status": "error",
+                "passed": False,
+                "error": f"{type(error).__name__}: {error}",
+            }
+    if physics_tier["status"] == "passed":
+        _log(
+            "[3/3] PhysX 验证通过：工具接触帧={:.2%}，指定末端接触帧={:.2%}，最大接触包络={:.2f} mm".format(
+                float(physics_tier["object_contact_frame_ratio"]),
+                float(physics_tier["intended_link_contact_frame_ratio"]),
+                float(physics_tier["maximum_initial_overlap"]) * 1000.0,
+            )
+        )
+    elif physics_tier["status"] not in ("skipped", "skipped_by_user"):
+        _log(f"[3/3] PhysX 验证未通过：{physics_tier.get('error', physics_tier['status'])}")
+    validation_tiers = {
+        "semantic_geometry": semantic_geometry_tier,
+        "precise_geometry": precise_geometry_tier,
+        "isaac_gym_physics": physics_tier,
+    }
+    overall_passed = bool(
+        semantic_geometry_tier["passed"]
+        and precise_geometry_tier["passed"]
+        and physics_tier["passed"]
+    )
     report = {
         "schema_version": SCHEMA_VERSION,
         "passed": overall_passed,
@@ -1279,6 +1945,9 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         "contact_links": contact_names,
         "grasp_interval": [start_frame, end_frame],
         "optimization_frames": optimization_frames,
+        "translation_mode": args.translation_mode,
+        "semantic_axis": semantic_axis_report,
+        "axis_constraint": final_axis_constraint,
         "delta_tool": delta_tool,
         "delta_norm": float(np.linalg.norm(delta_tool)),
         "settings": asdict(settings),
@@ -1289,10 +1958,11 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         "before_full": _summary_metrics(before_full),
         "after_full": _summary_metrics(after_full),
         "invariants": invariant_report,
-        "physics_validation_required": True,
+        "validation_tiers": validation_tiers,
+        "physics_validation_required": not args.skip_physics_validation,
         "physics_validation_note": (
-            "This offline pass validates kinematics and semantic surface clearance. "
-            "Replay the saved PKL with the matching new collision URDF before Stage 1 training."
+            "Tier three uses fixed-pose PhysX contact replay as a collision-response gate. "
+            "Whole-task dynamic grasp stability is still validated by the Stage-1 simulator."
         ),
     }
     corrected["contact_retarget"] = {
@@ -1305,10 +1975,14 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         "tool_mesh_sha256": report["tool_mesh_sha256"],
         "collision_urdf": str(context.collision_urdf_path),
         "collision_bundle_sha256": report["collision_bundle_sha256"],
+        "translation_mode": args.translation_mode,
+        "semantic_axis": semantic_axis_report,
+        "axis_constraint": final_axis_constraint,
         "delta_tool": delta_tool.astype(np.float32),
         "alpha": alpha.astype(np.float32),
         "grasp_interval": np.asarray([start_frame, end_frame], dtype=np.int64),
         "geometry_feasible": geometry_feasible,
+        "validation_tiers": validation_tiers,
         "settings": asdict(settings),
         "validation_summary": {
             "before_hold": report["before_hold"],
@@ -1327,6 +2001,7 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         else sequence_artifact_path(output_path, ".contact_preview.png")
     )
     _atomic_json_dump(report, report_path)
+    _log(f"检查报告已写入：{report_path}")
     preview_frame = int((start_frame + end_frame) // 2)
     _write_preview(
         preview_path,
@@ -1339,13 +2014,18 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         before_full,
         after_full,
         preview_frame,
+        semantic_axis_report,
+        delta_tool,
     )
     if overall_passed or args.allow_infeasible:
         _atomic_pickle_dump(corrected, output_path)
+        _log(f"修正 PKL 已原子{'覆盖' if output_existed else '写入'}：{output_path}")
+        _log(f"预览图已写入：{preview_path}")
+        _log("几何轨迹修正完成，三级验证全部通过" if overall_passed else "已写入诊断 PKL（未通过全部验证）")
     else:
         raise RuntimeError(
-            "Geometric correction did not satisfy the configured feasibility thresholds. "
-            f"The PKL was not written. Inspect {report_path} and {preview_path}, adjust the interval/constraints, "
+            "Contact trajectory correction did not pass all configured validation tiers. "
+            f"The corrected PKL was not replaced. Inspect {report_path} and {preview_path}, adjust the interval/constraints, "
             "or pass --allow-infeasible only for diagnostic output."
         )
     return report
@@ -1353,6 +2033,7 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
 
 def run_verification(args: argparse.Namespace) -> Dict[str, object]:
     corrected_path = Path(args.input_pkl).resolve()
+    _log(f"开始独立复验：{corrected_path}")
     corrected = _load_retarget_pkl(corrected_path)
     metadata = corrected.get("contact_retarget")
     if not isinstance(metadata, Mapping):
@@ -1407,25 +2088,60 @@ def run_verification(args: argparse.Namespace) -> Dict[str, object]:
     alpha = np.asarray(metadata["alpha"], dtype=np.float64)
     delta_world = tool_to_world_offsets(delta_tool, context.object_trajectory) * alpha[:, None]
     invariants = _invariant_report(source, corrected, delta_world)
+    translation_mode = metadata.get("translation_mode", "free3d")
+    axis_constraint = None
+    if translation_mode == "semantic-axis":
+        stored_axis = metadata.get("semantic_axis")
+        if not isinstance(stored_axis, Mapping) or "direction_tool" not in stored_axis:
+            raise ValueError("semantic-axis correction metadata is missing direction_tool")
+        axis_constraint = _axis_constraint_report(
+            delta_tool, np.asarray(stored_axis["direction_tool"], dtype=np.float64)
+        )
     collision_bundle_matches = bool(
         _urdf_bundle_sha256(collision_urdf_path)
         == metadata.get("collision_bundle_sha256")
+    )
+    mesh_matches = bool(_sha256(mesh_path) == metadata.get("tool_mesh_sha256"))
+    stored_validation_tiers = metadata.get("validation_tiers")
+    stored_tiers_passed = bool(
+        int(metadata.get("schema_version", 0)) < 3
+        or (
+            isinstance(stored_validation_tiers, Mapping)
+            and all(
+                isinstance(stored_validation_tiers.get(name), Mapping)
+                and bool(stored_validation_tiers[name].get("passed", False))
+                for name in (
+                    "semantic_geometry",
+                    "precise_geometry",
+                    "isaac_gym_physics",
+                )
+            )
+        )
     )
     report = {
         "schema_version": SCHEMA_VERSION,
         "passed": bool(
             _is_feasible(metrics, settings)
             and invariants["passed"]
+            and mesh_matches
             and collision_bundle_matches
+            and stored_tiers_passed
+            and (axis_constraint is None or axis_constraint["passed"])
         ),
         "corrected_pkl": corrected_path,
         "source_pkl": source_path,
         "tool_mesh": mesh_path,
         "collision_urdf": collision_urdf_path,
+        "tool_mesh_matches": mesh_matches,
         "collision_bundle_matches": collision_bundle_matches,
+        "stored_validation_tiers": stored_validation_tiers,
+        "stored_validation_tiers_passed": stored_tiers_passed,
+        "translation_mode": translation_mode,
+        "semantic_axis": metadata.get("semantic_axis"),
+        "axis_constraint": axis_constraint,
         "geometry": _summary_metrics(metrics),
         "invariants": invariants,
-        "physics_validation_required": True,
+        "physics_validation_required": int(metadata.get("schema_version", 0)) >= 3,
     }
     report_path = (
         Path(args.report)
@@ -1433,6 +2149,7 @@ def run_verification(args: argparse.Namespace) -> Dict[str, object]:
         else sequence_artifact_path(corrected_path, ".verify_report.json")
     )
     _atomic_json_dump(report, report_path)
+    _log(f"独立复验{'通过' if report['passed'] else '失败'}；报告已写入：{report_path}")
     return report
 
 
@@ -1462,7 +2179,11 @@ def build_parser() -> argparse.ArgumentParser:
     correct.add_argument("--input-pkl")
     correct.add_argument("--output-root", default=str(PROJECT_ROOT / "data" / "retargeting_contact"))
     correct.add_argument("--output-pkl")
-    correct.add_argument("--overwrite", action="store_true")
+    correct.add_argument(
+        "--overwrite",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     correct.add_argument("--mesh", help="colored new tool mesh; defaults to the dataset-selected tool")
     correct.add_argument(
         "--collision-urdf",
@@ -1477,9 +2198,60 @@ def build_parser() -> argparse.ArgumentParser:
     correct.add_argument("--min-grasp-frames", type=int, default=8)
     correct.add_argument("--grasp-distance", type=float, default=0.025)
     correct.add_argument("--max-shift", type=float, default=0.05)
+    correct.add_argument(
+        "--translation-mode",
+        choices=("free3d", "semantic-axis"),
+        default="free3d",
+        help=(
+            "free3d searches an unconstrained XYZ offset; semantic-axis estimates a "
+            "black-to-red tool-local center axis and searches only a non-negative distance along it"
+        ),
+    )
+    correct.add_argument(
+        "--axis-roi-distance",
+        type=float,
+        default=0.03,
+        help="tool-local radius used to select black surface points near the red region",
+    )
+    correct.add_argument(
+        "--axis-grid-samples",
+        type=int,
+        default=201,
+        help="number of coarse distance samples for semantic-axis one-dimensional optimization",
+    )
     correct.add_argument("--optimizer-iterations", type=int, default=30)
     correct.add_argument("--max-refinement-rounds", type=int, default=4)
     correct.add_argument("--seed", type=int, default=42)
+    correct.add_argument(
+        "--headless",
+        action="store_true",
+        help="run Isaac Gym physics validation without opening a viewer",
+    )
+    correct.add_argument("--precise-points-per-link", type=int, default=64)
+    correct.add_argument("--precise-max-frames", type=int, default=24)
+    correct.add_argument("--max-penetration", type=float, default=0.006)
+    correct.add_argument("--max-penetration-fraction", type=float, default=0.01)
+    correct.add_argument("--max-correction-step", type=float, default=0.005)
+    correct.add_argument("--max-correction-acceleration", type=float, default=0.005)
+    correct.add_argument("--physics-max-frames", type=int, default=24)
+    correct.add_argument("--physics-settle-steps", type=int, default=8)
+    correct.add_argument("--physics-min-contact-frame-ratio", type=float, default=0.5)
+    correct.add_argument(
+        "--physics-max-contact-force",
+        type=float,
+        default=50000.0,
+        help=(
+            "fixed-pose PhysX solver-force sanity ceiling; precise penetration is gated "
+            "separately by --max-penetration"
+        ),
+    )
+    correct.add_argument("--physics-max-initial-overlap", type=float, default=0.01)
+    correct.add_argument("--physics-timeout", type=float, default=180.0)
+    correct.add_argument(
+        "--skip-physics-validation",
+        action="store_true",
+        help="diagnostic only: skip tier-three Isaac Gym validation",
+    )
     correct.add_argument("--preview")
     correct.add_argument(
         "--allow-infeasible",
@@ -1506,7 +2278,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         report = run_correction(args)
     else:
         report = run_verification(args)
-    print(json.dumps(_jsonable(report), indent=2, ensure_ascii=False, allow_nan=False))
     return 0 if report["passed"] else 2
 
 

@@ -1,5 +1,6 @@
 import runpy
 import hashlib
+import os
 import sys
 import tempfile
 import types
@@ -123,6 +124,88 @@ class ContactTrajectoryRetargetTest(unittest.TestCase):
         self.assertGreater(delta[0], 0.03)
         self.assertTrue(MODULE["_is_feasible"](metrics, settings))
 
+    def test_semantic_axis_points_from_local_black_toward_red(self):
+        red = np.array(
+            [[0.02, y, z] for y in (-0.005, 0.0, 0.005) for z in (-0.005, 0.0, 0.005)]
+        )
+        black = np.array(
+            [[-0.02, y, z] for y in (-0.005, 0.0, 0.005) for z in (-0.005, 0.0, 0.005)]
+            + [[-0.20, y, z] for y in (-0.08, 0.08) for z in (-0.08, 0.08)]
+        )
+        semantic_tool = MODULE["SemanticTool"](
+            mesh=trimesh.creation.box(),
+            red_points=red,
+            black_points=black,
+            red_tree=cKDTree(red),
+            black_tree=cKDTree(black),
+            red_vertex_count=len(red),
+            black_vertex_count=len(black),
+        )
+        direction, report = MODULE["estimate_semantic_axis"](
+            semantic_tool, roi_distance=0.05
+        )
+        self.assertGreater(direction[0], 0.99)
+        self.assertLess(np.linalg.norm(direction[1:]), 1e-6)
+        self.assertEqual(report["local_black_point_count"], 9)
+        self.assertFalse(report["local_black_fallback_used"])
+
+    def test_semantic_axis_optimizer_uses_only_nonnegative_axis_distance(self):
+        red = np.array(
+            [[0.02, y, z] for y in (-0.005, 0.0, 0.005) for z in (-0.005, 0.0, 0.005)]
+        )
+        black = np.array(
+            [[-0.02, y, z] for y in (-0.005, 0.0, 0.005) for z in (-0.005, 0.0, 0.005)]
+        )
+        semantic_tool = MODULE["SemanticTool"](
+            mesh=trimesh.creation.box(),
+            red_points=red,
+            black_points=black,
+            red_tree=cKDTree(red),
+            black_tree=cKDTree(black),
+            red_vertex_count=len(red),
+            black_vertex_count=len(black),
+        )
+        one_frame = np.array(
+            [[-0.019, y, z] for y in (-0.002, 0.0, 0.002) for z in (-0.002, 0.0, 0.002)]
+            + [[0.0, 0.04, 0.0]]
+        )
+        points = np.repeat(one_frame[None], 8, axis=0)
+        point_link_ids = np.array([0] * 9 + [1])
+        contact_link_ids = np.array([0])
+        settings = MODULE["GeometrySettings"](
+            contact_distance=0.004,
+            black_clearance=0.004,
+            influence_distance=0.01,
+            min_red_link_ratio=1.0,
+            min_red_frame_ratio=0.8,
+            max_shift=0.05,
+        )
+        direction, _ = MODULE["estimate_semantic_axis"](
+            semantic_tool, roi_distance=0.05
+        )
+        delta, optimizer_report = MODULE["optimize_tool_translation_along_axis"](
+            points,
+            point_link_ids,
+            contact_link_ids,
+            semantic_tool,
+            settings,
+            direction,
+            grid_samples=101,
+        )
+        metrics = MODULE["contact_geometry_metrics"](
+            points + delta[None, None],
+            point_link_ids,
+            contact_link_ids,
+            semantic_tool,
+            settings,
+        )
+        self.assertGreater(delta[0], 0.03)
+        self.assertLessEqual(np.linalg.norm(delta), settings.max_shift + 1e-9)
+        self.assertLess(np.linalg.norm(delta[1:]), 1e-8)
+        self.assertGreaterEqual(optimizer_report["axis_distance"], 0.0)
+        self.assertTrue(optimizer_report["axis_constraint"]["passed"])
+        self.assertTrue(MODULE["_is_feasible"](metrics, settings))
+
     def test_artimano_urdf_samples_all_collision_links(self):
         hand = MODULE["_resolve_dexhand"]("artimano", "right")
         model = MODULE["URDFCollisionKinematics"](
@@ -133,6 +216,69 @@ class ContactTrajectoryRetargetTest(unittest.TestCase):
         self.assertEqual(points.shape[1], 3)
         self.assertGreaterEqual(len(model.link_points), len(hand.contact_body_names))
         self.assertTrue(np.isfinite(points).all())
+
+    def test_collision_mesh_loader_accepts_leading_urdf_whitespace(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_dir = Path(temp_dir)
+            mesh_path = temp_dir / "collision.ply"
+            trimesh.creation.box(extents=[0.1, 0.2, 0.3]).export(mesh_path)
+            urdf_path = temp_dir / "tool.urdf"
+            urdf_path.write_text(
+                "\n<?xml version=\"1.0\"?>\n"
+                "<robot name=\"tool\"><link name=\"base\"><collision>"
+                "<geometry><mesh filename=\"collision.ply\"/></geometry>"
+                "</collision></link></robot>"
+            )
+            collision_mesh = MODULE["_load_urdf_collision_mesh"](urdf_path)
+            self.assertTrue(collision_mesh.is_watertight)
+            self.assertTrue(np.allclose(collision_mesh.extents, [0.1, 0.2, 0.3]))
+
+    def test_correct_command_recomputes_without_overwrite_flag(self):
+        args = MODULE["build_parser"]().parse_args(
+            ["correct", "--data-idx", "9fc3e@0", "--dexhand", "artimano", "--headless"]
+        )
+        self.assertFalse(args.overwrite)
+        self.assertEqual(args.precise_max_frames, 24)
+        self.assertEqual(args.physics_max_contact_force, 50000.0)
+        self.assertFalse(hasattr(args, "show_original_hand"))
+
+    def test_removed_show_original_hand_option_is_rejected(self):
+        with self.assertRaises(SystemExit):
+            MODULE["build_parser"]().parse_args(
+                [
+                    "correct",
+                    "--data-idx",
+                    "9fc3e@0",
+                    "--dexhand",
+                    "artimano",
+                    "--show-original-hand",
+                    "true",
+                ]
+            )
+
+    def test_viewer_mode_reports_missing_display_explicitly(self):
+        previous = os.environ.pop("DISPLAY", None)
+        try:
+            report = MODULE["run_isaac_gym_validation"](
+                corrected={},
+                hand=None,
+                context=None,
+                contact_names=(),
+                hold_frame_ids=np.array([0]),
+                headless=False,
+                maximum_frames=1,
+                settle_steps=1,
+                min_contact_frame_ratio=0.5,
+                max_contact_force=1.0,
+                max_initial_overlap=0.01,
+                timeout=1.0,
+            )
+        finally:
+            if previous is not None:
+                os.environ["DISPLAY"] = previous
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["status"], "error")
+        self.assertIn("DISPLAY", report["error"])
 
     def test_invariants_require_only_rigid_translation(self):
         source = {
@@ -201,6 +347,7 @@ class ContactTrajectoryRetargetTest(unittest.TestCase):
             data["obj_urdf_path"] = str(collision_urdf)
             mesh_hash = hashlib.sha256(mesh_file.read_bytes()).hexdigest()
             metadata = {
+                "schema_version": 3,
                 "geometry_feasible": True,
                 "side": "right",
                 "tool_mesh": str(mesh_file),
@@ -208,6 +355,14 @@ class ContactTrajectoryRetargetTest(unittest.TestCase):
                 "collision_bundle_sha256": dataset._urdf_bundle_sha256(collision_urdf),
                 "delta_tool": np.array([0.01, 0.0, 0.0], dtype=np.float32),
                 "alpha": np.array([0.0, 0.5, 1.0, 0.0], dtype=np.float32),
+                "validation_tiers": {
+                    name: {"passed": True}
+                    for name in (
+                        "semantic_geometry",
+                        "precise_geometry",
+                        "isaac_gym_physics",
+                    )
+                },
             }
             dataset._apply_contact_retarget_targets(data, metadata, "corrected.pkl")
 

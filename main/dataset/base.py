@@ -174,6 +174,22 @@ class ManipData(Dataset, ABC):
             raise ValueError(
                 f"Refusing infeasible contact-retarget PKL: {retargeted_data_path}"
             )
+        if int(metadata.get("schema_version", 0)) >= 3:
+            validation_tiers = metadata.get("validation_tiers")
+            required_tiers = (
+                "semantic_geometry",
+                "precise_geometry",
+                "isaac_gym_physics",
+            )
+            if not isinstance(validation_tiers, dict) or not all(
+                isinstance(validation_tiers.get(name), dict)
+                and bool(validation_tiers[name].get("passed", False))
+                for name in required_tiers
+            ):
+                raise ValueError(
+                    "Stage-1 requires a schema-v3 contact trajectory that passed semantic, "
+                    f"precise-geometry, and Isaac Gym validation: {retargeted_data_path}"
+                )
 
         expected_side = getattr(self.dexhand, "side", None)
         metadata_side = metadata.get("side")
