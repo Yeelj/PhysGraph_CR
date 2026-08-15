@@ -479,6 +479,7 @@ if __name__ == "__main__":
             mujoco2gym_transf=torch.eye(4, device="cuda:0"),
             dexhand=dexhand,
             verbose=False,
+            load_retargeted=False,
         )
 
         demo_data = pack_data([demo_d[idx]], dexhand)

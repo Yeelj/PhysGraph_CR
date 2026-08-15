@@ -32,11 +32,14 @@
 import warnings
 warnings.filterwarnings('ignore')
 
+import sys
+
 import hydra
 
 from omegaconf import DictConfig, OmegaConf
 #OmegaConf.register_new_resolver("find_rl_train_config", lambda task_name: f"{task_name}")
 import lib
+from main.new_object_paths import normalize_new_obj_cli_args
 
 
 def preprocess_train_config(cfg, config_dict):
@@ -240,4 +243,5 @@ def launch_rlg_hydra(cfg: DictConfig):
 
 
 if __name__ == "__main__":
+    sys.argv[1:] = normalize_new_obj_cli_args(sys.argv[1:])
     launch_rlg_hydra()

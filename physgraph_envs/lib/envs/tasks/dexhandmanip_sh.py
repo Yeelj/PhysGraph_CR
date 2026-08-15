@@ -92,6 +92,7 @@ class DexHandManipRHEnv(VecTask):
         self.actions = None  # Current actions to be deployed
 
         self.dataIndices = self.cfg["env"]["dataIndices"]
+        self.new_obj = self.cfg["env"].get("newObj", None)
         self.obs_future_length = self.cfg["env"]["obsFutureLength"]
         self.rollout_state_init = self.cfg["env"]["rolloutStateInit"]
         self.random_state_init = self.cfg["env"]["randomStateInit"]
@@ -253,6 +254,7 @@ class DexHandManipRHEnv(VecTask):
                 max_seq_len=self.max_episode_length,
                 dexhand=self.dexhand,
                 embodiment=self.cfg["env"]["dexhand"],
+                new_obj=self.new_obj,
             )
 
         dexhand_asset_file = self.dexhand.urdf_path

@@ -125,7 +125,9 @@ params:
     ppo: True
     mixed_precision: False
     normalize_input: True
-    normalize_input_excluded_keys: []
+    # Bounded semantic strengths and curriculum progress must not be distorted
+    # by running normalization; legacy observations retain their existing path.
+    normalize_input_excluded_keys: [semantic_contact]
     normalize_value: True
     use_pid_control: ${....usePIDControl}
     value_bootstrap: True

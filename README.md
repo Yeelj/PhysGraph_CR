@@ -148,6 +148,10 @@ We follow the prerequisit of [ManipTrans](https://maniptrans.github.io/) to prep
     the right hand into its allowed contact region, see
     [Geometric contact trajectory retargeting](docs/contact_trajectory_retargeting.md).
 
+    For the Stage-1 red/black semantic reward, imitation-dominant 30% curriculum,
+    and additive multi-relation attention bias, see
+    [Stage-1 semantic contact reward and bias](docs/stage1_semantic_contact_reward_bias.md).
+
 2. **Training**
   Train bi-manual policies:
     ```bash

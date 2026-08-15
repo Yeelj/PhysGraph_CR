@@ -57,6 +57,62 @@ class SquaredChamfer:
 
 
 class ContactTrajectoryRetargetTest(unittest.TestCase):
+    def test_semantic_mesh_precheck_requires_complete_red_black_coloring(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            mesh_path = Path(temp_dir) / "semantic.ply"
+            mesh = trimesh.creation.box()
+            colors = np.zeros((len(mesh.vertices), 4), dtype=np.uint8)
+            colors[:, 3] = 255
+            colors[np.asarray(mesh.vertices)[:, 0] >= 0, 0] = 255
+            mesh.visual.vertex_colors = colors
+            mesh.export(mesh_path)
+            report = MODULE["validate_semantic_mesh"](mesh_path, label="test")
+            self.assertTrue(report["passed"])
+            self.assertEqual(report["unclassified_vertex_count"], 0)
+
+            colors[0, :3] = 128
+            mesh.visual.vertex_colors = colors
+            mesh.export(mesh_path)
+            with self.assertRaisesRegex(ValueError, "unclassified=1"):
+                MODULE["validate_semantic_mesh"](mesh_path, label="test")
+
+    def test_contact_acceptance_uses_all_configured_contact_links(self):
+        red = np.array([[0.0, 0.0, 0.0], [0.0, 0.02, 0.0]])
+        black = np.array([[0.1, 0.0, 0.0]])
+        tool = MODULE["SemanticTool"](
+            mesh=trimesh.creation.box(),
+            red_points=red,
+            black_points=black,
+            red_tree=cKDTree(red),
+            black_tree=cKDTree(black),
+            red_vertex_count=len(red),
+            black_vertex_count=len(black),
+        )
+        frames = 10
+        points = np.repeat(
+            np.array(
+                [[[0.0, 0.0, 0.001], [0.0, 0.02, 0.001],
+                  [0.0, 0.05, 0.02], [0.0, 0.07, 0.02], [0.0, 0.09, 0.02]]]
+            ),
+            frames,
+            axis=0,
+        )
+        settings = MODULE["GeometrySettings"](
+            contact_distance=0.006,
+            min_red_link_ratio=0.6,
+            min_red_frame_ratio=0.8,
+        )
+        metrics = MODULE["contact_geometry_metrics"](
+            points,
+            np.arange(5),
+            np.arange(5),
+            tool,
+            settings,
+        )
+        self.assertAlmostEqual(metrics["red_link_ratio_mean"], 0.4)
+        self.assertEqual(metrics["red_frame_pass_ratio"], 0.0)
+        self.assertFalse(MODULE["_is_feasible"](metrics, settings))
+
     def test_non_pkl_artifacts_use_sequence_directory(self):
         pkl_path = Path("data/retargeting_contact/OakInk-v2/mano2artimano_rh/demo@0.pkl")
         report_path = MODULE["sequence_artifact_path"](pkl_path, ".contact_report.json")
@@ -217,30 +273,64 @@ class ContactTrajectoryRetargetTest(unittest.TestCase):
         self.assertGreaterEqual(len(model.link_points), len(hand.contact_body_names))
         self.assertTrue(np.isfinite(points).all())
 
-    def test_collision_mesh_loader_accepts_leading_urdf_whitespace(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_dir = Path(temp_dir)
-            mesh_path = temp_dir / "collision.ply"
-            trimesh.creation.box(extents=[0.1, 0.2, 0.3]).export(mesh_path)
-            urdf_path = temp_dir / "tool.urdf"
-            urdf_path.write_text(
-                "\n<?xml version=\"1.0\"?>\n"
-                "<robot name=\"tool\"><link name=\"base\"><collision>"
-                "<geometry><mesh filename=\"collision.ply\"/></geometry>"
-                "</collision></link></robot>"
-            )
-            collision_mesh = MODULE["_load_urdf_collision_mesh"](urdf_path)
-            self.assertTrue(collision_mesh.is_watertight)
-            self.assertTrue(np.allclose(collision_mesh.extents, [0.1, 0.2, 0.3]))
-
     def test_correct_command_recomputes_without_overwrite_flag(self):
         args = MODULE["build_parser"]().parse_args(
-            ["correct", "--data-idx", "9fc3e@0", "--dexhand", "artimano", "--headless"]
+            [
+                "correct",
+                "--data-idx",
+                "9fc3e@0",
+                "--dexhand",
+                "artimano",
+                "--new-obj",
+                "spoon_01",
+                "--headless",
+            ]
         )
         self.assertFalse(args.overwrite)
-        self.assertEqual(args.precise_max_frames, 24)
+        self.assertEqual(args.new_obj, "spoon_01")
+        self.assertFalse(hasattr(args, "precise_max_frames"))
         self.assertEqual(args.physics_max_contact_force, 50000.0)
+        self.assertFalse(args.physx)
         self.assertFalse(hasattr(args, "show_original_hand"))
+
+        physx_args = MODULE["build_parser"]().parse_args(
+            ["correct", "--data-idx", "9fc3e@0", "--physx", "--headless"]
+        )
+        self.assertTrue(physx_args.physx)
+
+    def test_optional_physx_is_not_part_of_configured_acceptance_gate(self):
+        tiers = {
+            "semantic_geometry": {"passed": True},
+            "isaac_gym_physics": {
+                "status": "not_requested",
+                "passed": False,
+                "required": False,
+            },
+        }
+        optional = {
+            "schema_version": 5,
+            "physics_validation_required": False,
+            "validation_tiers": tiers,
+        }
+        required = {
+            "schema_version": 5,
+            "physics_validation_required": True,
+            "validation_tiers": tiers,
+        }
+        legacy = {
+            "schema_version": 4,
+            "physics_validation_required": False,
+            "validation_tiers": tiers,
+        }
+        self.assertTrue(MODULE["_stored_validation_tiers_passed"](optional))
+        self.assertFalse(MODULE["_stored_validation_tiers_passed"](required))
+        self.assertTrue(MODULE["_stored_validation_tiers_passed"](legacy))
+
+        base_module = load_base_module_without_training_dependencies()
+        stage1_gate = base_module["_contact_retarget_validation_tiers_passed"]
+        self.assertTrue(stage1_gate(optional))
+        self.assertFalse(stage1_gate(required))
+        self.assertTrue(stage1_gate(legacy))
 
     def test_removed_show_original_hand_option_is_rejected(self):
         with self.assertRaises(SystemExit):
@@ -347,9 +437,11 @@ class ContactTrajectoryRetargetTest(unittest.TestCase):
             data["obj_urdf_path"] = str(collision_urdf)
             mesh_hash = hashlib.sha256(mesh_file.read_bytes()).hexdigest()
             metadata = {
-                "schema_version": 3,
+                "schema_version": 5,
                 "geometry_feasible": True,
                 "side": "right",
+                "semantic_precheck": {"passed": True},
+                "physics_validation_required": True,
                 "tool_mesh": str(mesh_file),
                 "tool_mesh_sha256": mesh_hash,
                 "collision_bundle_sha256": dataset._urdf_bundle_sha256(collision_urdf),
@@ -357,11 +449,7 @@ class ContactTrajectoryRetargetTest(unittest.TestCase):
                 "alpha": np.array([0.0, 0.5, 1.0, 0.0], dtype=np.float32),
                 "validation_tiers": {
                     name: {"passed": True}
-                    for name in (
-                        "semantic_geometry",
-                        "precise_geometry",
-                        "isaac_gym_physics",
-                    )
+                    for name in ("semantic_geometry", "isaac_gym_physics")
                 },
             }
             dataset._apply_contact_retarget_targets(data, metadata, "corrected.pkl")

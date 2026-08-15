@@ -23,6 +23,19 @@ from main.dataset.factory import ManipDataFactory
 from main.dataset.oakink2_dataset_dexhand_lh import OakInk2DatasetDexHandLH
 from main.dataset.oakink2_dataset_dexhand_rh import OakInk2DatasetDexHandRH
 from main.dataset.oakink2_dataset_utils import oakink2_obj_scale, oakink2_obj_mass
+from main.dataset.semantic_contact import (
+    ACTUAL_CONTACT,
+    BLACK_PROXIMITY,
+    BLACK_VIOLATION,
+    CURRICULUM_WEIGHT,
+    EXPECTED_CONTACT,
+    FORCE_NORMALIZED,
+    RED_CONTACT,
+    RED_PROXIMITY,
+    SEMANTIC_FEATURE_DIM,
+    semantic_curriculum_weight,
+    semantic_reward_terms,
+)
 from main.dataset.transform import aa_to_quat, aa_to_rotmat, quat_to_rotmat, rotmat_to_aa, rotmat_to_quat, rot6d_to_aa
 from torch import Tensor
 from tqdm import tqdm
@@ -95,6 +108,7 @@ class DexHandManipBiHEnv(VecTask):
         self.actions = None  # Current actions to be deployed
 
         self.dataIndices = self.cfg["env"]["dataIndices"]
+        self.new_obj = self.cfg["env"].get("newObj", None)
         self.obs_future_length = self.cfg["env"]["obsFutureLength"]
         self.rollout_state_init = self.cfg["env"]["rolloutStateInit"]
         self.random_state_init = self.cfg["env"]["randomStateInit"]
@@ -105,6 +119,20 @@ class DexHandManipBiHEnv(VecTask):
 
         self.rollout_len = self.cfg["env"].get("rolloutLen", None)
         self.rollout_begin = self.cfg["env"].get("rolloutBegin", None)
+
+        semantic_cfg = self.cfg["env"].get("semanticContact", {})
+        self.semantic_contact_enabled = bool(semantic_cfg.get("enabled", True))
+        self.semantic_curriculum_steps = int(semantic_cfg.get("curriculumSteps", 320000))
+        self.semantic_force_center = float(semantic_cfg.get("forceCenter", 1.0))
+        self.semantic_force_smooth = float(semantic_cfg.get("forceSmooth", 0.25))
+        self.semantic_force_normalizer = float(semantic_cfg.get("forceNormalizer", 10.0))
+        self.semantic_force_safe = float(semantic_cfg.get("forceSafe", 12.0))
+        self.semantic_expected_distance = float(semantic_cfg.get("expectedDistance", 0.03))
+        self.semantic_expected_smooth = float(semantic_cfg.get("expectedSmooth", 0.003))
+        self.semantic_red_distance = float(semantic_cfg.get("redDistance", 0.01))
+        self.semantic_black_distance = float(semantic_cfg.get("blackDistance", 0.01))
+        self.semantic_black_smooth = float(semantic_cfg.get("blackSmooth", 0.002))
+        self._semantic_contact_cache = None
 
         assert len(self.dataIndices) == 1 or self.rollout_len is None, "rolloutLen only works with one data"
         assert len(self.dataIndices) == 1 or self.rollout_begin is None, "rolloutBegin only works with one data"
@@ -172,6 +200,15 @@ class DexHandManipBiHEnv(VecTask):
             high=np.inf,
             shape=(TARGET_OBS_DIM,),
         )
+        if self.semantic_contact_enabled:
+            self.obs_dict["semantic_contact"] = torch.zeros(
+                (self.num_envs, 5, SEMANTIC_FEATURE_DIM), device=self.device
+            )
+            obs_space["semantic_contact"] = spaces.Box(
+                low=0.0,
+                high=np.inf,
+                shape=(5, SEMANTIC_FEATURE_DIM),
+            )
         self.obs_space = spaces.Dict(obs_space)
 
         default_pose = torch.ones(self.dexhand_rh.n_dofs, device=self.device) * np.pi / 12
@@ -267,6 +304,7 @@ class DexHandManipBiHEnv(VecTask):
                 max_seq_len=self.max_episode_length,
                 dexhand=self.dexhand_lh,
                 embodiment=self.cfg["env"]["dexhand"],
+                new_obj=self.new_obj,
             )
             self.demo_dataset_rh_dict[dataset_type] = ManipDataFactory.create_data(
                 manipdata_type=dataset_type,
@@ -276,6 +314,7 @@ class DexHandManipBiHEnv(VecTask):
                 max_seq_len=self.max_episode_length,
                 dexhand=self.dexhand_rh,
                 embodiment=self.cfg["env"]["dexhand"],
+                new_obj=self.new_obj,
             )
 
         
@@ -710,7 +749,14 @@ class DexHandManipBiHEnv(VecTask):
                 packed_data[k] = fill_data(mano_joints)
             elif type(data[0][k]) == torch.Tensor:
                 stack_data = [d[k] for d in data]
-                if k == "obj_verts":
+                if k in {
+                    "obj_verts",
+                    "tool_red_points",
+                    "tool_black_points",
+                    "tool_red_vertex_count",
+                    "tool_black_vertex_count",
+                    "tool_semantic_scale",
+                }:
                     packed_data[k] = torch.stack(stack_data)
                     if packed_data[k].ndim > 1 and packed_data[k].shape[-1] == 1:
                         packed_data[k] = packed_data[k].squeeze(-1)
@@ -1109,6 +1155,40 @@ class DexHandManipBiHEnv(VecTask):
             scale_factor,
             (self.dexhand_rh if side == "rh" else self.dexhand_lh).weight_idx,
         )
+        if side == "rh" and self.semantic_contact_enabled:
+            if self._semantic_contact_cache is None:
+                self._semantic_contact_cache = self._compute_semantic_contact()
+            semantic = self._semantic_contact_cache
+            red_reward, black_penalty, missing_penalty, force_penalty, semantic_raw = semantic_reward_terms(
+                semantic[:, :, ACTUAL_CONTACT],
+                semantic[:, :, EXPECTED_CONTACT],
+                semantic[:, :, RED_PROXIMITY],
+                semantic[:, :, BLACK_VIOLATION],
+                semantic[:, :, FORCE_NORMALIZED] * self.semantic_force_normalizer,
+                self.semantic_force_safe,
+            )
+            curriculum = semantic[:, 0, CURRICULUM_WEIGHT]
+            semantic_weighted = curriculum * semantic_raw
+            rew_buf = rew_buf + semantic_weighted
+            reward_dict.update(
+                {
+                    "semantic_red_reward": red_reward,
+                    "semantic_black_penalty": black_penalty,
+                    "semantic_missing_penalty": missing_penalty,
+                    "semantic_force_penalty": force_penalty,
+                    "semantic_reward_raw": semantic_raw,
+                    "semantic_reward_weighted": semantic_weighted,
+                    "semantic_curriculum_weight": curriculum,
+                    "semantic_expected_contact_ratio": semantic[:, :, EXPECTED_CONTACT].mean(-1),
+                    "semantic_physical_contact_ratio": semantic[:, :, ACTUAL_CONTACT].mean(-1),
+                    "semantic_red_contact_ratio": semantic[:, :, RED_CONTACT].mean(-1),
+                    "semantic_black_contact_ratio": semantic[:, :, BLACK_VIOLATION].mean(-1),
+                    "semantic_red_distance_quality": semantic[:, :, RED_PROXIMITY].mean(-1),
+                    "semantic_black_proximity": semantic[:, :, BLACK_PROXIMITY].mean(-1),
+                    "semantic_contact_force_mean": semantic[:, :, FORCE_NORMALIZED].mean(-1)
+                    * self.semantic_force_normalizer,
+                }
+            )
         self.total_rew_buf += rew_buf
         return rew_buf, reset_buf, success_buf, failure_buf, reward_dict, error_buf, diff_obj_pos, diff_obj_rot, diff_joints, diff_ft
 
@@ -1121,6 +1201,89 @@ class DexHandManipBiHEnv(VecTask):
         
         for k in obs_rh.keys():
             self.obs_dict[k] = torch.cat([obs_rh[k], obs_lh[k]], dim=-1)
+        if self.semantic_contact_enabled:
+            self._semantic_contact_cache = self._compute_semantic_contact()
+            self.obs_dict["semantic_contact"] = self._semantic_contact_cache
+
+    def _semantic_curriculum(self):
+        if not self.training:
+            return torch.tensor(1.0, device=self.device)
+        control_step = float(self.total_train_env_frames) / float(max(self.num_envs, 1))
+        return semantic_curriculum_weight(control_step, self.semantic_curriculum_steps).to(self.device)
+
+    def _compute_semantic_contact(self):
+        """Build five per-contact-link features from live physics and corrected demo data."""
+        if len(self.dexhand_rh.contact_body_names) != 5:
+            raise RuntimeError(
+                "Red/black semantic contact currently requires exactly five ordered contact bodies, got "
+                f"{self.dexhand_rh.contact_body_names}"
+            )
+
+        contact_positions = torch.stack(
+            [
+                self._rigid_body_state[:, self.dexhand_rh_handles[name], :3]
+                for name in self.dexhand_rh.contact_body_names
+            ],
+            dim=1,
+        )
+        force_magnitude = torch.stack(
+            [
+                torch.linalg.vector_norm(self.net_cf[:, self.dexhand_rh_handles[name], :], dim=-1)
+                for name in self.dexhand_rh.contact_body_names
+            ],
+            dim=1,
+        )
+        actual_contact = torch.sigmoid(
+            (force_magnitude - self.semantic_force_center) / self.semantic_force_smooth
+        )
+
+        red_local = self.demo_data_rh["tool_red_points"] * self.demo_data_rh[
+            "tool_semantic_scale"
+        ].reshape(self.num_envs, 1, 1)
+        black_local = self.demo_data_rh["tool_black_points"] * self.demo_data_rh[
+            "tool_semantic_scale"
+        ].reshape(self.num_envs, 1, 1)
+        obj_rotation = quat_to_rotmat(self.rh_states["manip_obj_quat"][:, [3, 0, 1, 2]])
+        obj_position = self.rh_states["manip_obj_pos"]
+        red_world = torch.einsum("bij,bpj->bpi", obj_rotation, red_local) + obj_position[:, None]
+        black_world = torch.einsum("bij,bpj->bpi", obj_rotation, black_local) + obj_position[:, None]
+        red_distance = torch.cdist(contact_positions, red_world).amin(dim=-1)
+        black_distance = torch.cdist(contact_positions, black_world).amin(dim=-1)
+
+        red_quality = torch.exp(-torch.square(red_distance / self.semantic_red_distance))
+        black_proximity = torch.sigmoid(
+            (self.semantic_black_distance - black_distance) / self.semantic_black_smooth
+        )
+        red_valid = red_distance <= self.semantic_red_distance
+        red_contact = actual_contact * red_quality * red_valid.float()
+        # Red contact has explicit precedence: a pair that is validly red-contacting
+        # is never counted as a black violation, even near a color boundary.
+        black_violation = actual_contact * black_proximity * (~red_valid).float()
+
+        cur_idx = torch.minimum(
+            self.progress_buf,
+            self.demo_data_rh["seq_len"] - 1,
+        )
+        demo_distance = self.demo_data_rh["tips_distance"][torch.arange(self.num_envs), cur_idx]
+        expected_contact = torch.sigmoid(
+            (self.semantic_expected_distance - demo_distance) / self.semantic_expected_smooth
+        )
+        force_normalized = force_magnitude / self.semantic_force_normalizer
+        curriculum = self._semantic_curriculum().expand_as(actual_contact)
+
+        return torch.stack(
+            [
+                actual_contact,
+                expected_contact,
+                red_quality,
+                red_contact,
+                black_proximity,
+                black_violation,
+                force_normalized,
+                curriculum,
+            ],
+            dim=-1,
+        )
 
     def compute_observations_side(self, side="rh"):
         # obs_keys: q, cos_q, sin_q, base_state

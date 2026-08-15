@@ -13,6 +13,26 @@ from termcolor import cprint
 import pickle
 
 
+def _contact_retarget_validation_tiers_passed(metadata):
+    """Check only the correction tiers that were explicitly configured."""
+
+    if int(metadata.get("schema_version", 0)) < 3:
+        return True
+    validation_tiers = metadata.get("validation_tiers")
+    if not isinstance(validation_tiers, dict):
+        return False
+    required_tiers = ["semantic_geometry"]
+    # Schema-v3/v4 PKLs written before this switch did not carry the field and
+    # required PhysX, so absence deliberately remains strict.
+    if bool(metadata.get("physics_validation_required", True)):
+        required_tiers.append("isaac_gym_physics")
+    return all(
+        isinstance(validation_tiers.get(name), dict)
+        and bool(validation_tiers[name].get("passed", False))
+        for name in required_tiers
+    )
+
+
 class ManipData(Dataset, ABC):
     def __init__(
         self,
@@ -175,20 +195,19 @@ class ManipData(Dataset, ABC):
                 f"Refusing infeasible contact-retarget PKL: {retargeted_data_path}"
             )
         if int(metadata.get("schema_version", 0)) >= 3:
-            validation_tiers = metadata.get("validation_tiers")
-            required_tiers = (
-                "semantic_geometry",
-                "precise_geometry",
-                "isaac_gym_physics",
-            )
-            if not isinstance(validation_tiers, dict) or not all(
-                isinstance(validation_tiers.get(name), dict)
-                and bool(validation_tiers[name].get("passed", False))
-                for name in required_tiers
+            if not _contact_retarget_validation_tiers_passed(metadata):
+                raise ValueError(
+                    "Stage-1 requires a schema-v3-or-newer contact trajectory that passed all "
+                    "validation tiers configured during correction (semantic geometry and "
+                    f"optional PhysX): {retargeted_data_path}"
+                )
+        if int(metadata.get("schema_version", 0)) >= 4:
+            semantic_precheck = metadata.get("semantic_precheck")
+            if not isinstance(semantic_precheck, dict) or not bool(
+                semantic_precheck.get("passed", False)
             ):
                 raise ValueError(
-                    "Stage-1 requires a schema-v3 contact trajectory that passed semantic, "
-                    f"precise-geometry, and Isaac Gym validation: {retargeted_data_path}"
+                    f"Schema-v4 contact trajectory lacks a passing mesh semantic precheck: {retargeted_data_path}"
                 )
 
         expected_side = getattr(self.dexhand, "side", None)

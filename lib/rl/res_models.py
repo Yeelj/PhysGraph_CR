@@ -31,9 +31,14 @@ class ModelA2CContinuousLogStdBiH(BaseModel):
                     module.train(mode)
             return self
 
-        def load_state_dict(self, state_dict):
-            return super().load_state_dict(state_dict) # origin
-            # return super().load_state_dict(state_dict, strict=False)
+        def load_state_dict(self, state_dict, strict=True):
+            # Old Stage-1 checkpoints predate semantic relations. Inject only
+            # the new near-zero scale; every legacy key remains strict.
+            state_dict = dict(state_dict)
+            for name, value in self.state_dict().items():
+                if name.endswith("bias_gen.semantic_relation_scale") and name not in state_dict:
+                    state_dict[name] = value
+            return super().load_state_dict(state_dict, strict=strict)
 
         def forward(self, input_dict):
             is_train = input_dict.get("is_train", True)

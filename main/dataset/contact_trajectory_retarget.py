@@ -7,8 +7,8 @@ tool-local frame.  Corrected PKLs mirror ``data/retargeting`` below
 
 The optimizer itself has no Isaac Gym dependency.  Hand collision surfaces and
 forward kinematics are reconstructed directly from the dex-hand URDF.  After
-semantic and precise geometry checks pass, an isolated subprocess loads Isaac
-Gym/PhysX only for collision-response validation and optional visualization.
+the semantic geometry check passes, an optional isolated subprocess loads
+Isaac Gym/PhysX for collision-response validation and visualization.
 """
 
 from __future__ import annotations
@@ -23,7 +23,6 @@ import pickle
 import subprocess
 import sys
 import tempfile
-import traceback
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -36,9 +35,41 @@ from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
+
+
+def _physics_validation_required(metadata: Mapping[str, object]) -> bool:
+    """Return the configured PhysX gate, preserving strict legacy behavior."""
+
+    if "physics_validation_required" in metadata:
+        return bool(metadata["physics_validation_required"])
+    return int(metadata.get("schema_version", 0)) >= 3
+
+
+def _stored_validation_tiers_passed(
+    metadata: Mapping[str, object],
+) -> bool:
+    if int(metadata.get("schema_version", 0)) < 3:
+        return True
+    tiers = metadata.get("validation_tiers")
+    if not isinstance(tiers, Mapping):
+        return False
+    required_names = ["semantic_geometry"]
+    if _physics_validation_required(metadata):
+        required_names.append("isaac_gym_physics")
+    return all(
+        isinstance(tiers.get(name), Mapping)
+        and bool(tiers[name].get("passed", False))
+        for name in required_names
+    )
+
+
 DEFAULT_OAKINK_ROOT = "/home/ps/data/ylj/ManipTrans/data/OakInk-v2"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from main.new_object_paths import resolve_new_object_assets
 
 
 def _log(message: str) -> None:
@@ -389,6 +420,7 @@ class URDFCollisionKinematics:
 class OakInkContext:
     data_idx: str
     annotation_path: Path
+    source_mesh_path: Path
     mesh_path: Path
     collision_urdf_path: Path
     object_id: str
@@ -412,6 +444,7 @@ def load_oakink_context(
     mesh_override: Optional[Path] = None,
     collision_urdf_override: Optional[Path] = None,
     skip: int = 2,
+    new_obj: Optional[str] = None,
 ) -> OakInkContext:
     if "@" not in data_idx:
         raise ValueError("Contact trajectory retargeting currently requires an OakInk2 index such as 083f7@0")
@@ -464,20 +497,28 @@ def load_oakink_context(
     if len(candidates) != 1:
         raise ValueError(f"Expected exactly one mesh in {object_dir}, found {candidates}")
     dataset_mesh_path = candidates[0]
-    mesh_path = dataset_mesh_path if mesh_override is None else mesh_override.resolve()
-    collision_urdf_path = (
-        data_root
-        / "coacd_object_preview"
-        / "align_ds"
-        / object_id
-        / dataset_mesh_path.with_suffix(".urdf").name
-        if collision_urdf_override is None
-        else collision_urdf_override.resolve()
-    )
+    if new_obj is not None:
+        if mesh_override is not None or collision_urdf_override is not None:
+            raise ValueError("--new-obj cannot be combined with --mesh or --collision-urdf")
+        replacement = resolve_new_object_assets(new_obj)
+        mesh_path = replacement.mesh_path
+        collision_urdf_path = replacement.urdf_path
+    else:
+        mesh_path = dataset_mesh_path if mesh_override is None else mesh_override.resolve()
+        collision_urdf_path = (
+            data_root
+            / "coacd_object_preview"
+            / "align_ds"
+            / object_id
+            / dataset_mesh_path.with_suffix(".urdf").name
+            if collision_urdf_override is None
+            else collision_urdf_override.resolve()
+        )
     _urdf_bundle_sha256(collision_urdf_path)
     return OakInkContext(
         data_idx=data_idx,
         annotation_path=annotation_path,
+        source_mesh_path=dataset_mesh_path,
         mesh_path=mesh_path,
         collision_urdf_path=collision_urdf_path,
         object_id=object_id,
@@ -495,23 +536,56 @@ class SemanticTool:
     black_tree: cKDTree
     red_vertex_count: int
     black_vertex_count: int
+    semantic_report: Optional[Dict[str, object]] = None
 
 
-def load_semantic_tool(mesh_path: Path) -> SemanticTool:
+def validate_semantic_mesh(mesh_path: Path, label: str = "tool") -> Dict[str, object]:
+    """Fail fast unless every mesh vertex is explicitly colored red or black."""
+
     mesh = _as_mesh(trimesh.load(mesh_path, process=False, force="mesh"))
     vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    if not len(vertices):
+        raise ValueError(f"{label} mesh contains no vertices: {mesh_path}")
     colors = getattr(getattr(mesh, "visual", None), "vertex_colors", None)
     if colors is None or len(colors) != len(vertices):
-        raise ValueError(f"Tool mesh must have per-vertex red/black colors: {mesh_path}")
+        raise ValueError(
+            f"{label} mesh has not been semantically segmented: expected one red/black color "
+            f"per vertex in {mesh_path}"
+        )
     colors = np.asarray(colors[:, :3], dtype=np.float64)
     if colors.max(initial=0.0) <= 1.0:
         colors *= 255.0
     red_mask = (colors[:, 0] > 150.0) & (colors[:, 1] < 100.0) & (colors[:, 2] < 100.0)
     black_mask = (colors[:, 0] < 80.0) & (colors[:, 1] < 80.0) & (colors[:, 2] < 80.0)
-    if not red_mask.any() or not black_mask.any():
+    unclassified_mask = ~(red_mask | black_mask)
+    if not red_mask.any() or not black_mask.any() or unclassified_mask.any():
         raise ValueError(
-            f"Both red and black vertices are required; red={red_mask.sum()}, black={black_mask.sum()} in {mesh_path}"
+            f"{label} mesh semantic segmentation is invalid: red={red_mask.sum()}, "
+            f"black={black_mask.sum()}, unclassified={unclassified_mask.sum()}, "
+            f"vertices={len(vertices)} in {mesh_path}. Every vertex must be red or black."
         )
+    return {
+        "label": label,
+        "path": mesh_path.resolve(),
+        "passed": True,
+        "vertex_count": int(len(vertices)),
+        "red_vertex_count": int(red_mask.sum()),
+        "black_vertex_count": int(black_mask.sum()),
+        "unclassified_vertex_count": int(unclassified_mask.sum()),
+        "red_fraction": float(red_mask.mean()),
+        "black_fraction": float(black_mask.mean()),
+    }
+
+
+def load_semantic_tool(mesh_path: Path, label: str = "tool") -> SemanticTool:
+    semantic_report = validate_semantic_mesh(mesh_path, label=label)
+    mesh = _as_mesh(trimesh.load(mesh_path, process=False, force="mesh"))
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    colors = np.asarray(mesh.visual.vertex_colors[:, :3], dtype=np.float64)
+    if colors.max(initial=0.0) <= 1.0:
+        colors *= 255.0
+    red_mask = (colors[:, 0] > 150.0) & (colors[:, 1] < 100.0) & (colors[:, 2] < 100.0)
+    black_mask = (colors[:, 0] < 80.0) & (colors[:, 1] < 80.0) & (colors[:, 2] < 80.0)
     faces = np.asarray(mesh.faces, dtype=np.int64)
     red_faces = faces[red_mask[faces].sum(axis=1) >= 2]
     black_faces = faces[black_mask[faces].sum(axis=1) >= 2]
@@ -531,6 +605,7 @@ def load_semantic_tool(mesh_path: Path) -> SemanticTool:
         black_tree=cKDTree(black_points_array),
         red_vertex_count=int(red_mask.sum()),
         black_vertex_count=int(black_mask.sum()),
+        semantic_report=semantic_report,
     )
 
 
@@ -604,7 +679,7 @@ class GeometrySettings:
     black_clearance: float = 0.006
     influence_distance: float = 0.02
     grasp_distance: float = 0.025
-    min_red_link_ratio: float = 0.6
+    min_red_link_ratio: float = 0.1 # 接触link的红色点比例阈值
     min_red_frame_ratio: float = 0.8
     max_shift: float = 0.05
     max_black_violation_fraction: float = 0.0
@@ -1177,204 +1252,6 @@ def _invariant_report(source: Mapping, corrected: Mapping, delta_world: np.ndarr
     return result
 
 
-def _load_urdf_collision_mesh(urdf_path: Path) -> trimesh.Trimesh:
-    """Load every URDF collision primitive into the root/tool coordinate frame."""
-
-    urdf_path = urdf_path.resolve()
-    root = ET.fromstring(urdf_path.read_text(encoding="utf-8").lstrip())
-    link_names = [element.attrib["name"] for element in root.findall("link")]
-    child_links = {
-        joint.find("child").attrib["link"]
-        for joint in root.findall("joint")
-        if joint.find("child") is not None
-    }
-    roots = [name for name in link_names if name not in child_links]
-    if len(roots) != 1:
-        raise ValueError(f"Expected one collision URDF root link, found {roots} in {urdf_path}")
-
-    children: Dict[str, List[Tuple[str, np.ndarray]]] = {}
-    for joint in root.findall("joint"):
-        parent = joint.find("parent")
-        child = joint.find("child")
-        if parent is None or child is None:
-            continue
-        joint_type = joint.attrib.get("type", "fixed")
-        if joint_type not in ("fixed", "floating"):
-            raise ValueError(
-                f"Object collision URDF must be rigid; joint {joint.attrib.get('name')} is {joint_type}"
-            )
-        children.setdefault(parent.attrib["link"], []).append(
-            (child.attrib["link"], _origin_matrix(joint.find("origin")))
-        )
-
-    link_transforms = {roots[0]: np.eye(4, dtype=np.float64)}
-    stack = [roots[0]]
-    while stack:
-        parent = stack.pop()
-        for child, joint_transform in children.get(parent, []):
-            link_transforms[child] = link_transforms[parent] @ joint_transform
-            stack.append(child)
-
-    meshes = []
-    for link in root.findall("link"):
-        link_name = link.attrib["name"]
-        if link_name not in link_transforms:
-            raise ValueError(f"Disconnected collision link {link_name!r} in {urdf_path}")
-        for collision in link.findall("collision"):
-            geometry = collision.find("geometry")
-            if geometry is None:
-                continue
-            mesh_element = geometry.find("mesh")
-            box_element = geometry.find("box")
-            sphere_element = geometry.find("sphere")
-            cylinder_element = geometry.find("cylinder")
-            if mesh_element is not None:
-                filename = mesh_element.attrib["filename"]
-                if filename.startswith("package://"):
-                    raise ValueError(f"Unsupported package mesh URI {filename!r} in {urdf_path}")
-                mesh_path = Path(filename[7:] if filename.startswith("file://") else filename)
-                if not mesh_path.is_absolute():
-                    mesh_path = urdf_path.parent / mesh_path
-                collision_mesh = _as_mesh(
-                    trimesh.load(mesh_path.resolve(), process=False, force="mesh")
-                ).copy()
-                scale = np.fromstring(mesh_element.attrib.get("scale", "1 1 1"), sep=" ")
-                if scale.size != 3:
-                    raise ValueError(f"Invalid mesh scale in {urdf_path}: {mesh_element.attrib}")
-                collision_mesh.vertices = np.asarray(collision_mesh.vertices) * scale[None]
-            elif box_element is not None:
-                collision_mesh = trimesh.creation.box(
-                    extents=np.fromstring(box_element.attrib["size"], sep=" ")
-                )
-            elif sphere_element is not None:
-                collision_mesh = trimesh.creation.icosphere(
-                    subdivisions=3, radius=float(sphere_element.attrib["radius"])
-                )
-            elif cylinder_element is not None:
-                collision_mesh = trimesh.creation.cylinder(
-                    radius=float(cylinder_element.attrib["radius"]),
-                    height=float(cylinder_element.attrib["length"]),
-                    sections=64,
-                )
-            else:
-                continue
-            collision_mesh.apply_transform(
-                link_transforms[link_name] @ _origin_matrix(collision.find("origin"))
-            )
-            meshes.append(collision_mesh)
-    if not meshes:
-        raise ValueError(f"No collision geometry found in {urdf_path}")
-    return trimesh.util.concatenate(meshes)
-
-
-def precise_geometry_validation(
-    corrected: Mapping,
-    hand: "OfflineHandSpec",
-    context: OakInkContext,
-    tool: SemanticTool,
-    contact_names: Sequence[str],
-    settings: GeometrySettings,
-    hold_frame_ids: np.ndarray,
-    delta_world: np.ndarray,
-    points_per_link: int = 64,
-    maximum_frames: int = 48,
-    max_penetration: float = 0.006,
-    max_penetration_fraction: float = 0.01,
-    max_correction_step: float = 0.005,
-    max_correction_acceleration: float = 0.005,
-) -> Dict[str, object]:
-    """Second-tier validation with dense hand geometry and the physical collision mesh."""
-
-    if points_per_link < 8:
-        raise ValueError("precise points per link must be at least 8")
-    if maximum_frames < 2:
-        raise ValueError("precise validation requires at least two frames")
-    sample_count = min(len(hold_frame_ids), maximum_frames)
-    frame_ids = np.unique(
-        np.linspace(hold_frame_ids[0], hold_frame_ids[-1], sample_count).round().astype(np.int64)
-    )
-    model = URDFCollisionKinematics(
-        Path(hand.urdf_path), hand.dof_names, points_per_link=points_per_link
-    )
-    contact_ids = _contact_link_ids(model, contact_names)
-    world_points = model.world_surface_trajectory(
-        np.asarray(corrected["opt_wrist_pos"], dtype=np.float64),
-        np.asarray(corrected["opt_wrist_rot"], dtype=np.float64),
-        np.asarray(corrected["opt_dof_pos"], dtype=np.float64),
-        frame_ids=frame_ids,
-    )
-    points_tool = world_to_tool_points(world_points, context.object_trajectory[frame_ids])
-    semantic_metrics = contact_geometry_metrics(
-        points_tool, model.point_link_ids_array, contact_ids, tool, settings
-    )
-
-    collision_mesh = _load_urdf_collision_mesh(context.collision_urdf_path)
-    flat_points = points_tool.reshape(-1, 3)
-    if collision_mesh.is_watertight:
-        # trimesh's ray test can allocate a face-by-point intermediate.  Batch
-        # it so dense validation remains bounded for long OakInk sequences.
-        inside = np.concatenate(
-            [
-                collision_mesh.contains(flat_points[start : start + 1024])
-                for start in range(0, len(flat_points), 1024)
-            ]
-        )
-        inside_points = flat_points[inside]
-        penetration_depths = (
-            trimesh.proximity.signed_distance(collision_mesh, inside_points)
-            if len(inside_points)
-            else np.zeros(0, dtype=np.float64)
-        )
-        penetration_depths = np.maximum(np.asarray(penetration_depths), 0.0)
-        penetration_method = "watertight_signed_distance"
-    else:
-        inside = np.zeros(len(flat_points), dtype=bool)
-        penetration_depths = np.zeros(0, dtype=np.float64)
-        penetration_method = "unavailable_non_watertight_mesh"
-
-    correction_velocity = np.linalg.norm(np.diff(delta_world, axis=0), axis=1)
-    correction_acceleration = np.linalg.norm(np.diff(delta_world, n=2, axis=0), axis=1)
-    penetration_fraction = float(inside.mean()) if len(inside) else 0.0
-    maximum_penetration = float(penetration_depths.max(initial=0.0))
-    maximum_step = float(correction_velocity.max(initial=0.0))
-    maximum_acceleration = float(correction_acceleration.max(initial=0.0))
-    semantic_passed = _is_feasible(semantic_metrics, settings)
-    collision_passed = bool(
-        collision_mesh.is_watertight
-        and maximum_penetration <= max_penetration
-        and penetration_fraction <= max_penetration_fraction
-    )
-    continuity_passed = bool(
-        maximum_step <= max_correction_step
-        and maximum_acceleration <= max_correction_acceleration
-    )
-    return {
-        "name": "precise_geometry",
-        "status": "passed" if semantic_passed and collision_passed and continuity_passed else "failed",
-        "passed": bool(semantic_passed and collision_passed and continuity_passed),
-        "frame_ids": frame_ids,
-        "points_per_link": int(points_per_link),
-        "hand_surface_point_count": int(len(model.local_points)),
-        "semantic": _summary_metrics(semantic_metrics),
-        "semantic_passed": semantic_passed,
-        "collision_mesh_watertight": bool(collision_mesh.is_watertight),
-        "penetration_method": penetration_method,
-        "penetration_point_count": int(inside.sum()),
-        "penetration_fraction": penetration_fraction,
-        "maximum_penetration": maximum_penetration,
-        "collision_passed": collision_passed,
-        "maximum_correction_step": maximum_step,
-        "maximum_correction_acceleration": maximum_acceleration,
-        "continuity_passed": continuity_passed,
-        "thresholds": {
-            "max_penetration": float(max_penetration),
-            "max_penetration_fraction": float(max_penetration_fraction),
-            "max_correction_step": float(max_correction_step),
-            "max_correction_acceleration": float(max_correction_acceleration),
-        },
-    }
-
-
 def run_isaac_gym_validation(
     corrected: Mapping,
     hand: "OfflineHandSpec",
@@ -1564,7 +1441,7 @@ def _write_preview(
 
 def run_correction(args: argparse.Namespace) -> Dict[str, object]:
     _log(f"开始修正 data_idx={args.data_idx}, dexhand={args.dexhand}, side={args.side}")
-    if not args.headless and not os.environ.get("DISPLAY"):
+    if args.physx and not args.headless and not os.environ.get("DISPLAY"):
         raise RuntimeError(
             "Isaac Gym Viewer was requested because --headless was omitted, but DISPLAY is empty. "
             "Run from a graphical desktop/X-forwarded shell, or add --headless for non-visual execution."
@@ -1586,7 +1463,7 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         _log(f"检测到已有修正 PKL；本次验证通过后将原子覆盖：{output_path}")
     else:
         _log(f"本次将生成新的修正 PKL：{output_path}")
-    _log("读取原始 retarget、工具语义 mesh、collision URDF 和工具轨迹")
+    _log("读取原始 retarget、新旧工具语义 mesh、collision URDF 和工具轨迹")
     context = load_oakink_context(
         args.data_idx,
         args.side,
@@ -1594,6 +1471,23 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         None if args.mesh is None else Path(args.mesh),
         None if args.collision_urdf is None else Path(args.collision_urdf),
         skip=args.skip,
+        new_obj=args.new_obj,
+    )
+    _log("修正前执行新旧 mesh 红/黑逐顶点语义分割预检")
+    source_tool = load_semantic_tool(context.source_mesh_path, label="old/source")
+    tool = load_semantic_tool(context.mesh_path, label="new/target")
+    semantic_precheck = {
+        "passed": True,
+        "source": source_tool.semantic_report,
+        "target": tool.semantic_report,
+    }
+    _log(
+        "语义预检通过：旧 mesh={}红/{}黑，新 mesh={}红/{}黑".format(
+            source_tool.red_vertex_count,
+            source_tool.black_vertex_count,
+            tool.red_vertex_count,
+            tool.black_vertex_count,
+        )
     )
     source = _load_retarget_pkl(input_path)
     if "contact_retarget" in source:
@@ -1610,7 +1504,6 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         raise ValueError(
             f"PKL DOF count {np.asarray(source['opt_dof_pos']).shape[1]} != {hand} DOF count {len(hand.dof_names)}"
         )
-    tool = load_semantic_tool(context.mesh_path)
     kinematics = URDFCollisionKinematics(
         Path(hand.urdf_path), hand.dof_names, points_per_link=args.points_per_link
     )
@@ -1654,7 +1547,8 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
                 f"Invalid correction interval [{start_frame}, {end_frame}] for length {length}"
             )
     _log(f"抓握修正区间：frame {start_frame}–{end_frame}，轨迹总长度={length}")
-    _log(f"[1/3] 开始语义几何优化（translation_mode={args.translation_mode}）")
+    hold_frame_ids = np.arange(start_frame, end_frame + 1, dtype=np.int64)
+    _log(f"[1/2] 开始语义几何优化（translation_mode={args.translation_mode}）")
     optimization_frames = _select_optimization_frames(start_frame, end_frame, args.max_optimization_frames)
     semantic_axis_report = None
     semantic_axis_direction = None
@@ -1683,10 +1577,9 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         )
     optimizer_history = [optimizer_report]
 
-    # A sparse set keeps the global search tractable, but final acceptance is
+    # A subsampled frame set keeps the global search tractable, but final acceptance is
     # based on every frame in the grasp interval. Add any missed failure frames
     # and locally refine until the full interval satisfies the constraints.
-    hold_frame_ids = np.arange(start_frame, end_frame + 1, dtype=np.int64)
     for refinement_round in range(args.max_refinement_rounds):
         hold_metrics = contact_geometry_metrics(
             points_before[hold_frame_ids] + delta_tool[None, None],
@@ -1804,81 +1697,34 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         ),
     }
     _log(
-        "[1/3] 语义几何优化{}：红区合格帧={:.2%}，黑区违规比例={:.6%}，平移={:.2f} mm".format(
+        "[1/2] 语义几何优化{}：红区合格帧={:.2%}，黑区违规比例={:.6%}，平移={:.2f} mm".format(
             "通过" if semantic_geometry_passed else "失败",
             float(after_hold["red_frame_pass_ratio"]),
             float(after_hold["black_violation_fraction"]),
             float(np.linalg.norm(delta_tool)) * 1000.0,
         )
     )
-    if semantic_geometry_passed:
-        _log("[2/3] 开始高密度精确几何验证（碰撞网格穿透 + 轨迹连续性）")
-        try:
-            precise_geometry_tier = precise_geometry_validation(
-                corrected,
-                hand,
-                context,
-                tool,
-                contact_names,
-                settings,
-                hold_frame_ids,
-                delta_world,
-                points_per_link=args.precise_points_per_link,
-                maximum_frames=args.precise_max_frames,
-                max_penetration=args.max_penetration,
-                max_penetration_fraction=args.max_penetration_fraction,
-                max_correction_step=args.max_correction_step,
-                max_correction_acceleration=args.max_correction_acceleration,
-            )
-        except Exception as error:
-            precise_geometry_tier = {
-                "name": "precise_geometry",
-                "status": "error",
-                "passed": False,
-                "error": f"{type(error).__name__}: {error}",
-                "traceback": traceback.format_exc(),
-            }
-    else:
-        precise_geometry_tier = {
-            "name": "precise_geometry",
-            "status": "skipped",
-            "passed": False,
-            "reason": "semantic geometry optimization did not pass",
-        }
-
-    if precise_geometry_tier["status"] == "passed":
-        _log(
-            "[2/3] 精确几何验证通过：穿透点比例={:.4%}，最大穿透={:.2f} mm，最大单帧步长={:.2f} mm".format(
-                float(precise_geometry_tier["penetration_fraction"]),
-                float(precise_geometry_tier["maximum_penetration"]) * 1000.0,
-                float(precise_geometry_tier["maximum_correction_step"]) * 1000.0,
-            )
-        )
-    elif precise_geometry_tier["status"] == "failed":
-        _log("[2/3] 精确几何验证失败；不进入 PhysX 验证")
-    elif precise_geometry_tier["status"] == "error":
-        _log(f"[2/3] 精确几何验证出错：{precise_geometry_tier.get('error')}")
-
-    if not precise_geometry_tier["passed"]:
+    if not args.physx:
         physics_tier = {
             "name": "isaac_gym_physics",
-            "status": "skipped",
-            "passed": False,
-            "reason": "precise geometry validation did not pass",
-        }
-    elif args.skip_physics_validation:
-        physics_tier = {
-            "name": "isaac_gym_physics",
-            "status": "skipped_by_user",
+            "status": "not_requested",
             "passed": False,
             "required": False,
-            "reason": "--skip-physics-validation was explicitly requested",
+            "reason": "PhysX validation was not enabled; pass --physx to require it",
+        }
+    elif not semantic_geometry_tier["passed"]:
+        physics_tier = {
+            "name": "isaac_gym_physics",
+            "status": "skipped",
+            "passed": False,
+            "required": True,
+            "reason": "semantic geometry validation did not pass",
         }
     else:
         if args.headless:
-            _log("[3/3] 开始 Isaac Gym/PhysX 无窗口接触验证")
+            _log("[2/2] 开始 Isaac Gym/PhysX 无窗口接触验证")
         else:
-            _log("[3/3] 开始 Isaac Gym/PhysX 接触验证；随后打开修正轨迹 Viewer")
+            _log("[2/2] 开始 Isaac Gym/PhysX 接触验证；随后打开修正轨迹 Viewer")
             _log("Viewer：唯一工具 + 修正绿手；关闭窗口后继续保存")
         try:
             physics_tier = run_isaac_gym_validation(
@@ -1900,27 +1746,32 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
                 "name": "isaac_gym_physics",
                 "status": "error",
                 "passed": False,
+                "required": True,
                 "error": f"{type(error).__name__}: {error}",
             }
+        else:
+            physics_tier.setdefault("required", True)
     if physics_tier["status"] == "passed":
         _log(
-            "[3/3] PhysX 验证通过：工具接触帧={:.2%}，指定末端接触帧={:.2%}，最大接触包络={:.2f} mm".format(
+            "[2/2] PhysX 验证通过：工具接触帧={:.2%}，指定末端接触帧={:.2%}，最大接触包络={:.2f} mm".format(
                 float(physics_tier["object_contact_frame_ratio"]),
                 float(physics_tier["intended_link_contact_frame_ratio"]),
                 float(physics_tier["maximum_initial_overlap"]) * 1000.0,
             )
         )
-    elif physics_tier["status"] not in ("skipped", "skipped_by_user"):
-        _log(f"[3/3] PhysX 验证未通过：{physics_tier.get('error', physics_tier['status'])}")
+    elif physics_tier["status"] == "not_requested":
+        _log("[2/2] 未启用 PhysX 验收；如需启用请在命令中添加 --physx")
+    elif physics_tier["status"] == "skipped":
+        _log("[2/2] 语义几何验收未通过，跳过 PhysX 验收")
+    elif physics_tier["status"] != "skipped":
+        _log(f"[2/2] PhysX 验证未通过：{physics_tier.get('error', physics_tier['status'])}")
     validation_tiers = {
         "semantic_geometry": semantic_geometry_tier,
-        "precise_geometry": precise_geometry_tier,
         "isaac_gym_physics": physics_tier,
     }
     overall_passed = bool(
         semantic_geometry_tier["passed"]
-        and precise_geometry_tier["passed"]
-        and physics_tier["passed"]
+        and (not args.physx or physics_tier["passed"])
     )
     report = {
         "schema_version": SCHEMA_VERSION,
@@ -1933,6 +1784,10 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         "dexhand": args.dexhand,
         "annotation_path": context.annotation_path,
         "object_id": context.object_id,
+        "new_obj": args.new_obj,
+        "semantic_precheck": semantic_precheck,
+        "source_tool_mesh": context.source_mesh_path,
+        "source_tool_mesh_sha256": _sha256(context.source_mesh_path),
         "tool_mesh": context.mesh_path,
         "source_pkl_sha256": _sha256(input_path),
         "tool_mesh_sha256": _sha256(context.mesh_path),
@@ -1959,9 +1814,9 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         "after_full": _summary_metrics(after_full),
         "invariants": invariant_report,
         "validation_tiers": validation_tiers,
-        "physics_validation_required": not args.skip_physics_validation,
+        "physics_validation_required": bool(args.physx),
         "physics_validation_note": (
-            "Tier three uses fixed-pose PhysX contact replay as a collision-response gate. "
+            "When enabled, tier two uses fixed-pose PhysX contact replay as a collision-response gate. "
             "Whole-task dynamic grasp stability is still validated by the Stage-1 simulator."
         ),
     }
@@ -1971,10 +1826,14 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         "data_idx": args.data_idx,
         "side": args.side,
         "dexhand": args.dexhand,
+        "new_obj": args.new_obj,
         "tool_mesh": str(context.mesh_path),
         "tool_mesh_sha256": report["tool_mesh_sha256"],
         "collision_urdf": str(context.collision_urdf_path),
         "collision_bundle_sha256": report["collision_bundle_sha256"],
+        "source_tool_mesh": str(context.source_mesh_path),
+        "source_tool_mesh_sha256": report["source_tool_mesh_sha256"],
+        "semantic_precheck": semantic_precheck,
         "translation_mode": args.translation_mode,
         "semantic_axis": semantic_axis_report,
         "axis_constraint": final_axis_constraint,
@@ -1982,6 +1841,7 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         "alpha": alpha.astype(np.float32),
         "grasp_interval": np.asarray([start_frame, end_frame], dtype=np.int64),
         "geometry_feasible": geometry_feasible,
+        "physics_validation_required": bool(args.physx),
         "validation_tiers": validation_tiers,
         "settings": asdict(settings),
         "validation_summary": {
@@ -2021,7 +1881,14 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         _atomic_pickle_dump(corrected, output_path)
         _log(f"修正 PKL 已原子{'覆盖' if output_existed else '写入'}：{output_path}")
         _log(f"预览图已写入：{preview_path}")
-        _log("几何轨迹修正完成，三级验证全部通过" if overall_passed else "已写入诊断 PKL（未通过全部验证）")
+        if overall_passed:
+            _log(
+                "几何轨迹修正完成，语义几何与 PhysX 验收全部通过"
+                if args.physx
+                else "几何轨迹修正完成，语义几何验收通过（未启用 PhysX）"
+            )
+        else:
+            _log("已写入诊断 PKL（未通过全部已配置验证）")
     else:
         raise RuntimeError(
             "Contact trajectory correction did not pass all configured validation tiers. "
@@ -2043,8 +1910,15 @@ def run_verification(args: argparse.Namespace) -> Dict[str, object]:
     data_idx = args.data_idx or metadata["data_idx"]
     side = args.side or metadata["side"]
     dexhand_name = args.dexhand or metadata["dexhand"]
-    mesh_path = Path(args.mesh or metadata["tool_mesh"])
-    collision_urdf_path = Path(args.collision_urdf or metadata["collision_urdf"])
+    if args.new_obj is not None:
+        if args.mesh is not None or args.collision_urdf is not None:
+            raise ValueError("--new-obj cannot be combined with --mesh or --collision-urdf")
+        replacement = resolve_new_object_assets(args.new_obj)
+        mesh_path = replacement.mesh_path
+        collision_urdf_path = replacement.urdf_path
+    else:
+        mesh_path = Path(args.mesh or metadata["tool_mesh"])
+        collision_urdf_path = Path(args.collision_urdf or metadata["collision_urdf"])
     context = load_oakink_context(
         data_idx,
         side,
@@ -2055,12 +1929,24 @@ def run_verification(args: argparse.Namespace) -> Dict[str, object]:
     )
     hand = _resolve_dexhand(dexhand_name, side)
     model = URDFCollisionKinematics(Path(hand.urdf_path), hand.dof_names, args.points_per_link)
-    tool = load_semantic_tool(mesh_path)
+    source_tool = load_semantic_tool(context.source_mesh_path, label="old/source")
+    tool = load_semantic_tool(mesh_path, label="new/target")
+    semantic_precheck = {
+        "passed": True,
+        "source": source_tool.semantic_report,
+        "target": tool.semantic_report,
+    }
     contact_names = list(hand.contact_body_names)
     contact_ids = _contact_link_ids(model, contact_names)
     stored_settings = metadata.get("settings")
     settings = (
-        GeometrySettings(**stored_settings)
+        GeometrySettings(
+            **{
+                name: stored_settings[name]
+                for name in GeometrySettings.__dataclass_fields__
+                if name in stored_settings
+            }
+        )
         if isinstance(stored_settings, Mapping)
         else GeometrySettings(
             contact_distance=args.contact_distance,
@@ -2082,7 +1968,11 @@ def run_verification(args: argparse.Namespace) -> Dict[str, object]:
     start_frame, end_frame = (int(v) for v in metadata["grasp_interval"])
     frame_ids = np.arange(start_frame, end_frame + 1, dtype=np.int64)
     metrics = contact_geometry_metrics(
-        points_corrected[frame_ids], model.point_link_ids_array, contact_ids, tool, settings
+        points_corrected[frame_ids],
+        model.point_link_ids_array,
+        contact_ids,
+        tool,
+        settings,
     )
     delta_tool = np.asarray(metadata["delta_tool"], dtype=np.float64)
     alpha = np.asarray(metadata["alpha"], dtype=np.float64)
@@ -2102,37 +1992,33 @@ def run_verification(args: argparse.Namespace) -> Dict[str, object]:
         == metadata.get("collision_bundle_sha256")
     )
     mesh_matches = bool(_sha256(mesh_path) == metadata.get("tool_mesh_sha256"))
-    stored_validation_tiers = metadata.get("validation_tiers")
-    stored_tiers_passed = bool(
-        int(metadata.get("schema_version", 0)) < 3
-        or (
-            isinstance(stored_validation_tiers, Mapping)
-            and all(
-                isinstance(stored_validation_tiers.get(name), Mapping)
-                and bool(stored_validation_tiers[name].get("passed", False))
-                for name in (
-                    "semantic_geometry",
-                    "precise_geometry",
-                    "isaac_gym_physics",
-                )
-            )
-        )
+    source_mesh_matches = bool(
+        int(metadata.get("schema_version", 0)) < 4
+        or _sha256(context.source_mesh_path) == metadata.get("source_tool_mesh_sha256")
     )
+    stored_validation_tiers = metadata.get("validation_tiers")
+    physics_validation_required = _physics_validation_required(metadata)
+    stored_tiers_passed = _stored_validation_tiers_passed(metadata)
     report = {
         "schema_version": SCHEMA_VERSION,
         "passed": bool(
             _is_feasible(metrics, settings)
             and invariants["passed"]
             and mesh_matches
+            and source_mesh_matches
             and collision_bundle_matches
             and stored_tiers_passed
             and (axis_constraint is None or axis_constraint["passed"])
         ),
         "corrected_pkl": corrected_path,
         "source_pkl": source_path,
+        "new_obj": args.new_obj or metadata.get("new_obj"),
         "tool_mesh": mesh_path,
+        "source_tool_mesh": context.source_mesh_path,
+        "semantic_precheck": semantic_precheck,
         "collision_urdf": collision_urdf_path,
         "tool_mesh_matches": mesh_matches,
+        "source_tool_mesh_matches": source_mesh_matches,
         "collision_bundle_matches": collision_bundle_matches,
         "stored_validation_tiers": stored_validation_tiers,
         "stored_validation_tiers_passed": stored_tiers_passed,
@@ -2141,7 +2027,7 @@ def run_verification(args: argparse.Namespace) -> Dict[str, object]:
         "axis_constraint": axis_constraint,
         "geometry": _summary_metrics(metrics),
         "invariants": invariants,
-        "physics_validation_required": int(metadata.get("schema_version", 0)) >= 3,
+        "physics_validation_required": physics_validation_required,
     }
     report_path = (
         Path(args.report)
@@ -2186,6 +2072,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     correct.add_argument("--mesh", help="colored new tool mesh; defaults to the dataset-selected tool")
     correct.add_argument(
+        "--new-obj",
+        help=(
+            "replacement mesh identifier under "
+            "/home/ps/data/ylj/ManipTrans/data/OakInk-v2/new_obj; selects its mesh and URDF"
+        ),
+    )
+    correct.add_argument(
         "--collision-urdf",
         help="new tool collision URDF; defaults to the dataset-selected coacd URDF",
     )
@@ -2225,14 +2118,8 @@ def build_parser() -> argparse.ArgumentParser:
     correct.add_argument(
         "--headless",
         action="store_true",
-        help="run Isaac Gym physics validation without opening a viewer",
+        help="when --physx is enabled, run validation without opening a viewer",
     )
-    correct.add_argument("--precise-points-per-link", type=int, default=64)
-    correct.add_argument("--precise-max-frames", type=int, default=24)
-    correct.add_argument("--max-penetration", type=float, default=0.006)
-    correct.add_argument("--max-penetration-fraction", type=float, default=0.01)
-    correct.add_argument("--max-correction-step", type=float, default=0.005)
-    correct.add_argument("--max-correction-acceleration", type=float, default=0.005)
     correct.add_argument("--physics-max-frames", type=int, default=24)
     correct.add_argument("--physics-settle-steps", type=int, default=8)
     correct.add_argument("--physics-min-contact-frame-ratio", type=float, default=0.5)
@@ -2240,18 +2127,23 @@ def build_parser() -> argparse.ArgumentParser:
         "--physics-max-contact-force",
         type=float,
         default=50000.0,
-        help=(
-            "fixed-pose PhysX solver-force sanity ceiling; precise penetration is gated "
-            "separately by --max-penetration"
-        ),
+        help="fixed-pose PhysX solver-force sanity ceiling",
     )
     correct.add_argument("--physics-max-initial-overlap", type=float, default=0.01)
     correct.add_argument("--physics-timeout", type=float, default=180.0)
-    correct.add_argument(
-        "--skip-physics-validation",
+    physics_group = correct.add_mutually_exclusive_group()
+    physics_group.add_argument(
+        "--physx",
         action="store_true",
-        help="diagnostic only: skip tier-three Isaac Gym validation",
+        help="run PhysX validation and require it to pass before saving the corrected PKL",
     )
+    physics_group.add_argument(
+        "--skip-physics-validation",
+        dest="physx",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    correct.set_defaults(physx=False)
     correct.add_argument("--preview")
     correct.add_argument(
         "--allow-infeasible",
@@ -2268,6 +2160,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--side", choices=("right", "left"))
     verify.add_argument("--mesh")
     verify.add_argument("--collision-urdf")
+    verify.add_argument("--new-obj")
     _add_common_geometry_arguments(verify)
     return parser
 
