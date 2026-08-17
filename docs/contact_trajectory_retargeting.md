@@ -1,16 +1,16 @@
 # 几何轨迹修正与新 mesh Stage1 流程
 
-该流程属于 **retarget 后处理阶段**，位于原始 `mano2dexhand.py` retarget 与 Stage1 之间。它只求解右手相对工具的平移，支持原有三维自由平移和语义中轴单自由度平移：
+该流程属于 **retarget 后处理阶段**，位于原始 `mano2dexhand.py` retarget 与 Stage1 之间。默认以“新红区鲁棒中心减旧红区鲁棒中心”得到工具局部平移初值，并只优化小范围三维平移残差；原有三维自由平移和语义中轴单自由度平移仍作为兼容模式保留：
 
 - 保持 `opt_wrist_rot` 完全不变；
 - 保持全部 `opt_dof_pos` 完全不变；
-- 将右腕、右手全部关节以及 Stage1 的 MANO 跟踪目标施加同一个刚体位移；
-- 位移在工具局部坐标系中求解，所以工具运动和旋转时，手与工具的相对关系保持一致；
+- 将右腕、右手全部关节以及 Stage1 的 MANO 跟踪目标施加同一个逐帧刚体平移；
+- 平移在工具局部坐标系中求解，所以工具运动和旋转时，目标抓握与接触区域的相对关系保持一致；
 - 通过五次 smoothstep 在抓握区间前后渐入、渐出，避免轨迹速度突变。
 
 正式输出采用一层必选几何门槛和一层可选物理门槛：
 
-1. **语义几何优化**：红区接触、黑区避让、刚体平移和姿态不变量；
+1. **语义几何优化**：固定 contact-link ratio、黑区避让、工具局部刚体平移和腕姿/手指 DOF 不变量；
 2. **Isaac Gym/PhysX 验证（命令添加 `--physx` 时启用）**：在隔离进程中加载真实手/工具碰撞资产，对代表帧执行固定姿态接触回放，检查指定末端接触覆盖、接触包络、求解器力和有限性。
 
 所有已启用的门槛都通过后才会替换正式 PKL。默认不运行 PhysX，此时语义几何通过即可保存；添加 `--physx` 后，PhysX 也成为必须通过的保存与 Stage1 读取门槛。PhysX 固定姿态回放验证碰撞响应是否合理；双手、动态工具、重力和任务控制共同作用下的抓握稳定性仍需由 Stage1 冒烟测试验证。
@@ -56,15 +56,15 @@ python main/dataset/contact_trajectory_retarget.py correct \
   --dexhand artimano \
   --side right \
   --new-obj spoon_01 \
-  --translation-mode semantic-axis
+  --translation-mode contact-translation
 ```
 
 工具会自动完成以下步骤：
 
 1. 按 OakInk 数据集的相同帧范围和 `skip=2` 重建工具轨迹；
 2. 读取 dex hand URDF 的碰撞表面并进行离线前向运动学；
-3. 自动检测主要抓握区间；
-4. 在工具局部坐标系中估计由邻近黑区指向红区的 mesh 语义中轴，并只优化沿该轴的非负平移距离，使指定接触 link 落入红区，同时要求包括未接触关节在内的整手避开黑区；
+3. 使用旧 mesh 自动检测主要抓握区间，并记录配置 contact link 在旧红区附近的接触摘要；
+4. 计算 `delta_initial = median(new_red) - median(old_red)`，再在该初值附近优化有界三维平移残差，使指定 contact link 落入新红区，同时要求整手避开黑区；
 5. 若命令包含 `--physx`，在独立 Isaac Gym 进程中进行 PhysX 接触回放；
 6. 写出报告、预览图，并仅在全部已配置门槛通过时原子保存 PKL。
 
@@ -76,7 +76,7 @@ python main/dataset/contact_trajectory_retarget.py correct \
   --dexhand artimano \
   --side right \
   --new-obj spoon_01 \
-  --translation-mode semantic-axis \
+  --translation-mode contact-translation \
   --physx \
   --headless
 ```
@@ -95,21 +95,30 @@ echo $DISPLAY
 
 终端不再在完成时打印整份 JSON，而是在执行过程中输出 `[1/2]`、`[2/2]`、产物保存位置和最终状态。完整数值仍保存在 `contact_report.json`，供程序化复验和 Stage1 门槛检查使用。
 
-`semantic-axis` 首先选取红区附近（默认 3 cm）的局部黑色表面点，对红区和局部黑区进行平衡 PCA，并使用“局部黑区中心 → 红区中心”确定轴的正方向。最终位移满足
+默认 `contact-translation` 分别计算旧、新红区采样点的中位数中心，使用二者差值作为工具局部平移初值。随后只在该初值附近优化三个平移残差分量，不优化 wrist rotation。即使旧红区在上、新红区在下，也会直接产生向下的初始平移，而不是从零位移寻找少量指尖接触解。
+
+每轮 optimization/refinement 使用的帧数始终不超过 `max_optimization_frames`；即使完整抓握区间的全部帧都失败，也只对均匀采样的代表帧优化，最终验收仍在完整抓握区间上执行。几何目标中的红/黑最近邻只查询一次，避免此前 SE(3) 方案中重复 KD-tree 查询和失败帧无限扩张造成的长时间运行。
+
+相关参数：
+
+- `--max-residual-shift 0.01`：围绕红区中心差值的每个平移残差分量上限；
+- `--max-optimization-frames 48`：初始优化与每轮 refinement 的硬帧数上限；
+- `--contact-distance 0.006`：接触 link 的采样点到红区的最大距离；
+- `--min-red-link-ratio 0.6`：单帧必须接触红区的固定配置 link 比例；
+- `--min-red-frame-ratio 0.8`：抓握区间内必须合格的帧比例；
+- `--black-clearance 0.006`：整手到黑区的最小安全距离；
+- `--max-black-violation-fraction 0.0`：允许的黑区违规采样点比例。
+
+兼容模式 `semantic-axis` 首先选取红区附近（默认 3 cm）的局部黑色表面点，对红区和局部黑区进行平衡 PCA，并使用“局部黑区中心 → 红区中心”确定轴的正方向。最终位移满足
 `delta_tool = distance * direction_tool`，其中 `0 <= distance <= max_shift`。因此
 `max_shift` 在该模式下是实际欧氏位移上限，而不是三个坐标分量各自的上限。
 
-相关参数：
+兼容模式参数：
 
 - `--axis-roi-distance 0.03`：选择红区附近局部黑点的半径；
 - `--axis-grid-samples 201`：轴向距离粗搜索采样数；
 - `--max-shift 0.05`：沿中轴的最大平移距离；
 - `--translation-mode free3d`：需要复现实验时退回原三维自由搜索。
-- `--contact-distance 0.006`：接触 link 的采样点到红区的最大距离；
-- `--min-red-link-ratio 0.6`：单帧必须接触红区的配置 link 比例；
-- `--min-red-frame-ratio 0.8`：抓握区间内必须合格的帧比例；
-- `--black-clearance 0.006`：整手到黑区的最小安全距离；
-- `--max-black-violation-fraction 0.0`：允许的黑区违规采样点比例。
 
 若已经知道稳定抓握区间，可显式指定：
 
@@ -118,7 +127,7 @@ python main/dataset/contact_trajectory_retarget.py correct \
   --data-idx 083f7@0 \
   --dexhand artimano \
   --side right \
-  --translation-mode semantic-axis \
+  --translation-mode contact-translation \
   --start-frame 180 \
   --end-frame 520
 ```
@@ -146,7 +155,7 @@ data/retargeting_contact/.../<sequence>@0/<sequence>@0.verify_report.json
 python -m unittest tests/test_contact_trajectory_retarget.py -v
 ```
 
-测试覆盖平滑位移曲线、黑区到红区的优化方向、Artimano URDF 碰撞链、腕姿/手指姿势不变量，以及相同位移是否同步进入 Stage1 的 MANO 目标。
+测试覆盖平滑位移轨迹、上下红区中心平移、refinement 帧数硬上限、兼容平移优化、Artimano URDF 碰撞链、腕姿/手指 DOF 不变量，以及相同位移是否同步进入 Stage1 的 MANO 目标。旧 schema-v6 SE(3) PKL 的读取兼容也保留测试。
 
 ### 3.2 报告和预览检查
 
@@ -154,8 +163,9 @@ python -m unittest tests/test_contact_trajectory_retarget.py -v
 
 - `passed: true`；
 - `geometry_feasible: true`；
-- `translation_mode: semantic-axis`；
-- `axis_constraint.passed: true`，且 `perpendicular_norm` 接近零；
+- `translation_mode: contact-translation`；
+- `contact_transfer.method: red_center_translation`，并检查旧/新红区中心与初始位移；
+- `delta_tool` 和 `optimizer.final_delta_tool` 有限且一致；
 - `semantic_precheck.passed: true`，且新旧 mesh 未分类顶点数均为零；
 - `after_hold.red_frame_pass_ratio >= settings.min_red_frame_ratio`；
 - `after_hold.red_link_ratio_mean` 用于观察全部配置接触 link 的平均红区接触比例；
@@ -164,11 +174,11 @@ python -m unittest tests/test_contact_trajectory_retarget.py -v
 - `validation_tiers.semantic_geometry.passed: true`；
 - `physics_validation_required` 与本次命令配置一致：仅添加 `--physx` 时为 `true`；
 - 若 `physics_validation_required: true`，则 `validation_tiers.isaac_gym_physics.passed: true`；否则该层应为 `status: not_requested`、`required: false`；
-- `rotation_max_abs_error` 和 `dof_max_abs_error` 为零。
+- `rotation_max_abs_error` 和 `dof_max_abs_error` 为零，`wrist_translation_max_abs_error` 接近零。
 
 添加 `--physx` 后还要求：工具发生接触的代表帧比例不低于 50%、至少一个配置 contact link 与工具发生接触的代表帧比例不低于 50%、最大初始接触包络不超过 10 mm、最大接触力不超过 50000，且所有接触数值有限。PhysX 层把每个 shape 的 contact offset 显式设为 3 mm，避免 Isaac Gym 默认每侧 20 mm 的接触包络被误判为约 40 mm 穿透。
 
-打开 `contact_preview.png`，逐项检查紫色箭头由黑区指向红区、绿色接触 link 位于红区，手掌、手指及无实际接触的关节没有落在黑区，渐入/渐出曲线连续。
+打开 `contact_preview.png`，逐项检查紫色箭头由旧红区中心指向新红区中心、绿色接触 link 位于红区，手掌和手指没有落在黑区，渐入/渐出曲线连续。兼容 `semantic-axis` 模式下紫色箭头仍表示黑区到红区的语义轴。
 
 ### 3.3 独立复验
 
@@ -209,9 +219,9 @@ python main/rl/train.py \
   experiment=083f7_contact_artimano
 ```
 
-加载修正 PKL 时，数据集会自动把同一个工具局部平移同步到：
+加载修正 PKL 时，数据集会自动把同一个逐帧工具局部平移同步到：
 
-- `opt_wrist_pos`（PKL 中已修正）；
+- `opt_wrist_pos`（PKL 中已修正，`opt_wrist_rot` 保持不变）；
 - Stage1 的 `wrist_pos`；
 - Stage1 的全部 `mano_joints`；
 - 相应线速度、关节速度、`tips_distance` 和 `joints_distance`。

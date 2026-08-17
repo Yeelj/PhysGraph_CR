@@ -1169,7 +1169,7 @@ class DexHandManipBiHEnv(VecTask):
             )
             curriculum = semantic[:, 0, CURRICULUM_WEIGHT]
             semantic_weighted = curriculum * semantic_raw
-            rew_buf = rew_buf + semantic_weighted
+            # rew_buf = rew_buf + semantic_weighted # total reward中不加接触区域reward
             reward_dict.update(
                 {
                     "semantic_red_reward": red_reward,

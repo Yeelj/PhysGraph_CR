@@ -180,12 +180,12 @@ class ManipData(Dataset, ABC):
         data["joints_distance"] = torch.sqrt(joints_near)
 
     def _apply_contact_retarget_targets(self, data, metadata, retargeted_data_path):
-        """Apply the PKL's tool-local translation to every Stage-1 target.
+        """Apply the PKL's tool-local rigid correction to every Stage-1 target.
 
-        The corrected PKL already contains a shifted ``opt_wrist_pos``.  Stage 1,
-        however, tracks the MANO wrist/joints as its reference trajectory.  This
-        method shifts those reference fields by the exact same world-space offset
-        while leaving every orientation and finger pose unchanged.
+        The corrected PKL already contains transformed dex-hand targets. Stage 1,
+        however, also tracks MANO wrist/joints. Schema-v6 trajectories therefore
+        store the exact per-frame tool-local SE(3) schedule and apply it here.
+        Older trajectories retain their translation-only compatibility path.
         """
 
         if not isinstance(metadata, dict):
@@ -248,25 +248,78 @@ class ManipData(Dataset, ABC):
             )
 
         target_length = len(data["obj_trajectory"])
-        delta_tool = torch.as_tensor(
-            metadata.get("delta_tool"), dtype=data["wrist_pos"].dtype, device=self.device
-        )
         alpha = torch.as_tensor(
             metadata.get("alpha"), dtype=data["wrist_pos"].dtype, device=self.device
         )
-        if delta_tool.shape != (3,) or alpha.ndim != 1 or len(alpha) < target_length:
-            raise ValueError(
-                f"Invalid correction offset shapes: delta_tool={tuple(delta_tool.shape)}, "
-                f"alpha={tuple(alpha.shape)}, target_length={target_length}"
+        transform_schedule_value = metadata.get("transform_schedule_tool")
+        if transform_schedule_value is not None:
+            transform_schedule = torch.as_tensor(
+                transform_schedule_value,
+                dtype=data["wrist_pos"].dtype,
+                device=self.device,
             )
-        alpha = alpha[:target_length]
-        delta_world = torch.matmul(
-            data["obj_trajectory"][:, :3, :3], delta_tool[:, None]
-        ).squeeze(-1) * alpha[:, None]
+            if transform_schedule.ndim != 3 or transform_schedule.shape[1:] != (4, 4):
+                raise ValueError(
+                    "Invalid contact SE(3) schedule shape: "
+                    f"{tuple(transform_schedule.shape)} in {retargeted_data_path}"
+                )
+            if len(transform_schedule) < target_length or alpha.ndim != 1 or len(alpha) < target_length:
+                raise ValueError(
+                    "Contact SE(3) schedule is shorter than the Stage-1 target: "
+                    f"transforms={len(transform_schedule)}, alpha={len(alpha)}, target={target_length}"
+                )
+            transform_schedule = transform_schedule[:target_length]
+            object_rotation = data["obj_trajectory"][:, :3, :3]
+            object_translation = data["obj_trajectory"][:, :3, 3]
+            correction_rotation = transform_schedule[:, :3, :3]
+            correction_translation = transform_schedule[:, :3, 3]
 
-        data["wrist_pos"] = data["wrist_pos"] + delta_world
-        for key in data["mano_joints"].keys():
-            data["mano_joints"][key] = data["mano_joints"][key] + delta_world
+            def transform_world_points(points):
+                points_tool = torch.einsum(
+                    "fji,fj->fi", object_rotation, points - object_translation
+                )
+                corrected_tool = (
+                    torch.einsum("fij,fj->fi", correction_rotation, points_tool)
+                    + correction_translation
+                )
+                return (
+                    torch.einsum("fij,fj->fi", object_rotation, corrected_tool)
+                    + object_translation
+                )
+
+            data["wrist_pos"] = transform_world_points(data["wrist_pos"])
+            for key in data["mano_joints"].keys():
+                data["mano_joints"][key] = transform_world_points(data["mano_joints"][key])
+
+            wrist_rotation = aa_to_rotmat(data["wrist_rot"])
+            correction_world_rotation = (
+                object_rotation
+                @ correction_rotation
+                @ object_rotation.transpose(-1, -2)
+            )
+            data["wrist_rot"] = rotmat_to_aa(correction_world_rotation @ wrist_rotation)
+        else:
+            delta_tool = torch.as_tensor(
+                metadata.get("delta_tool"), dtype=data["wrist_pos"].dtype, device=self.device
+            )
+            if delta_tool.shape != (3,) or alpha.ndim != 1 or len(alpha) < target_length:
+                raise ValueError(
+                    f"Invalid correction offset shapes: delta_tool={tuple(delta_tool.shape)}, "
+                    f"alpha={tuple(alpha.shape)}, target_length={target_length}"
+                )
+            alpha = alpha[:target_length]
+            delta_world = torch.matmul(
+                data["obj_trajectory"][:, :3, :3], delta_tool[:, None]
+            ).squeeze(-1) * alpha[:, None]
+
+            data["wrist_pos"] = data["wrist_pos"] + delta_world
+            for key in data["mano_joints"].keys():
+                data["mano_joints"][key] = data["mano_joints"][key] + delta_world
+
+        if alpha.ndim != 1 or len(alpha) < target_length:
+            raise ValueError(
+                f"Invalid correction alpha shape: {tuple(alpha.shape)}, target_length={target_length}"
+            )
 
         time_delta = 1 / (120 / self.skip)
         data["wrist_velocity"] = self.compute_velocity(
@@ -276,6 +329,12 @@ class ManipData(Dataset, ABC):
             data["mano_joints_velocity"][key] = self.compute_velocity(
                 data["mano_joints"][key], time_delta, guassian_filter=True
             )
+        if "wrist_rot" in data:
+            data["wrist_angular_velocity"] = self.compute_angular_velocity(
+                aa_to_rotmat(data["wrist_rot"][:, None]),
+                time_delta,
+                guassian_filter=True,
+            ).squeeze(1)
         self._update_hand_object_distances(data)
         data["contact_retarget_applied"] = retargeted_data_path
 

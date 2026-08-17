@@ -11,6 +11,7 @@ import numpy as np
 import trimesh
 import torch
 from scipy.spatial import cKDTree
+from scipy.spatial.transform import Rotation
 
 
 MODULE = runpy.run_path(
@@ -23,8 +24,22 @@ def load_base_module_without_training_dependencies():
     """Load base.py with tiny stubs for optional rendering dependencies."""
 
     transform = types.ModuleType("main.dataset.transform")
-    transform.aa_to_rotmat = lambda value: value
-    transform.rotmat_to_aa = lambda value: value
+    def aa_to_rotmat(value):
+        shape = tuple(value.shape[:-1])
+        matrices = Rotation.from_rotvec(
+            value.detach().cpu().numpy().reshape(-1, 3)
+        ).as_matrix().reshape(*shape, 3, 3)
+        return torch.as_tensor(matrices, dtype=value.dtype, device=value.device)
+
+    def rotmat_to_aa(value):
+        shape = tuple(value.shape[:-2])
+        vectors = Rotation.from_matrix(
+            value.detach().cpu().numpy().reshape(-1, 3, 3)
+        ).as_rotvec().reshape(*shape, 3)
+        return torch.as_tensor(vectors, dtype=value.dtype, device=value.device)
+
+    transform.aa_to_rotmat = aa_to_rotmat
+    transform.rotmat_to_aa = rotmat_to_aa
     transform.caculate_align_mat = lambda value: value
     pytorch3d_ops = types.ModuleType("pytorch3d.ops")
     pytorch3d_ops.sample_points_from_meshes = lambda *args, **kwargs: None
@@ -130,6 +145,12 @@ class ContactTrajectoryRetargetTest(unittest.TestCase):
         self.assertTrue(np.all(alpha[25:] == 0.0))
         self.assertTrue(np.all(np.diff(alpha[5:11]) >= 0.0))
         self.assertTrue(np.all(np.diff(alpha[19:25]) <= 0.0))
+
+    def test_refinement_frame_sampling_has_a_hard_cost_bound(self):
+        sampled = MODULE["_bounded_frame_sample"](np.arange(1300), 48)
+        self.assertEqual(len(sampled), 48)
+        self.assertEqual(sampled[0], 0)
+        self.assertEqual(sampled[-1], 1299)
 
     def test_optimizer_moves_contact_from_black_to_red(self):
         red = np.array(
@@ -262,6 +283,101 @@ class ContactTrajectoryRetargetTest(unittest.TestCase):
         self.assertTrue(optimizer_report["axis_constraint"]["passed"])
         self.assertTrue(MODULE["_is_feasible"](metrics, settings))
 
+    def test_contact_translation_moves_old_red_center_to_new_red_center(self):
+        old_red = np.array(
+            [[x, y, 0.02] for x in (-0.02, 0.0, 0.02) for y in (-0.006, 0.006)]
+        )
+        new_red = np.array(
+            [[x, y, -0.03] for x in (-0.02, 0.0, 0.02) for y in (-0.006, 0.006)]
+        )
+        black = np.array([[0.2, 0.0, 0.0]])
+
+        def semantic_tool(red):
+            return MODULE["SemanticTool"](
+                mesh=trimesh.creation.box(extents=(0.08, 0.04, 0.04)),
+                red_points=red,
+                black_points=black,
+                red_tree=cKDTree(red),
+                black_tree=cKDTree(black),
+                red_vertex_count=len(red),
+                black_vertex_count=len(black),
+            )
+
+        delta, report = MODULE["contact_translation_transfer"](
+            semantic_tool(old_red), semantic_tool(new_red)
+        )
+        self.assertTrue(np.allclose(delta, [0.0, 0.0, -0.05], atol=1e-8))
+        self.assertEqual(report["method"], "red_center_translation")
+        self.assertEqual(report["rotation_degrees"], 0.0)
+        old_hand_point = np.array([0.0, 0.0, 0.021])
+        self.assertTrue(np.allclose(old_hand_point + delta, [0.0, 0.0, -0.029]))
+
+    def test_se3_schedule_transforms_wrist_and_joints_but_not_articulation(self):
+        transform = np.eye(4)
+        transform[:3, :3] = Rotation.from_euler("x", 180, degrees=True).as_matrix()
+        transform[:3, 3] = np.array([0.0, 0.0, -0.01])
+        alpha = np.array([0.0, 1.0])
+        schedule = MODULE["build_transform_schedule"](transform, alpha)
+        object_trajectory = np.repeat(np.eye(4)[None], 2, axis=0)
+        wrist_pos = np.array([[0.0, 0.0, 0.02], [0.0, 0.0, 0.02]])
+        wrist_rot = np.zeros((2, 3))
+        joints = np.array(
+            [[[0.0, 0.0, 0.03]], [[0.0, 0.0, 0.03]]], dtype=np.float64
+        )
+        corrected_pos, corrected_rot, corrected_joints = MODULE[
+            "transform_hand_trajectory"
+        ](wrist_pos, wrist_rot, object_trajectory, schedule, joints)
+        self.assertTrue(np.allclose(corrected_pos[0], wrist_pos[0]))
+        self.assertTrue(np.allclose(corrected_pos[1], [0.0, 0.0, -0.03]))
+        self.assertAlmostEqual(np.linalg.norm(corrected_rot[1]), np.pi, places=7)
+        self.assertTrue(np.allclose(corrected_joints[1, 0], [0.0, 0.0, -0.04]))
+
+    def test_contact_translation_optimizer_preserves_fixed_contact_link_acceptance(self):
+        old_red = np.array(
+            [[x, y, 0.02] for x in (-0.02, 0.0, 0.02) for y in (-0.006, 0.006)]
+        )
+        new_red = np.array(
+            [[x, y, -0.03] for x in (-0.02, 0.0, 0.02) for y in (-0.006, 0.006)]
+        )
+        black = np.array([[0.2, 0.0, 0.0]])
+
+        def semantic_tool(red):
+            return MODULE["SemanticTool"](
+                mesh=trimesh.creation.box(extents=(0.08, 0.04, 0.04)),
+                red_points=red,
+                black_points=black,
+                red_tree=cKDTree(red),
+                black_tree=cKDTree(black),
+                red_vertex_count=len(red),
+                black_vertex_count=len(black),
+            )
+
+        source_tool = semantic_tool(old_red)
+        target_tool = semantic_tool(new_red)
+        initial, _ = MODULE["contact_translation_transfer"](source_tool, target_tool)
+        source_points = np.repeat(old_red[:5][None], 4, axis=0)
+        settings = MODULE["GeometrySettings"](
+            contact_distance=0.002,
+            black_clearance=0.002,
+            min_red_link_ratio=0.6,
+            min_red_frame_ratio=0.8,
+        )
+        delta, _ = MODULE["optimize_contact_translation"](
+            source_points,
+            np.arange(5),
+            np.arange(5),
+            target_tool,
+            settings,
+            initial,
+            max_iterations=4,
+        )
+        transformed = source_points + delta[None, None]
+        metrics = MODULE["contact_geometry_metrics"](
+            transformed, np.arange(5), np.arange(5), target_tool, settings
+        )
+        self.assertEqual(metrics["red_link_ratio_mean"], 1.0)
+        self.assertTrue(MODULE["_is_feasible"](metrics, settings))
+
     def test_artimano_urdf_samples_all_collision_links(self):
         hand = MODULE["_resolve_dexhand"]("artimano", "right")
         model = MODULE["URDFCollisionKinematics"](
@@ -288,6 +404,8 @@ class ContactTrajectoryRetargetTest(unittest.TestCase):
         )
         self.assertFalse(args.overwrite)
         self.assertEqual(args.new_obj, "spoon_01")
+        self.assertEqual(args.translation_mode, "contact-translation")
+        self.assertFalse(hasattr(args, "max_residual_rotation_deg"))
         self.assertFalse(hasattr(args, "precise_max_frames"))
         self.assertEqual(args.physics_max_contact_force, 50000.0)
         self.assertFalse(args.physx)
@@ -461,6 +579,75 @@ class ContactTrajectoryRetargetTest(unittest.TestCase):
         for name in joint_names:
             self.assertTrue(torch.allclose(data["mano_joints"][name], expected))
         self.assertEqual(data["tips_distance"].shape, (length, 5))
+
+    def test_stage1_targets_receive_contact_se3_schedule(self):
+        base_module = load_base_module_without_training_dependencies()
+
+        class TestManipData(base_module["ManipData"]):
+            def __getitem__(self, index):
+                raise NotImplementedError
+
+        dataset = object.__new__(TestManipData)
+        dataset.dexhand = types.SimpleNamespace(side="rh")
+        dataset.device = "cpu"
+        dataset.skip = 2
+        dataset.ch_dist = SquaredChamfer()
+        length = 3
+        trajectory = torch.eye(4).repeat(length, 1, 1)
+        wrist = torch.tensor([[0.0, 0.0, 0.02]]).repeat(length, 1)
+        joint_names = [
+            "thumb_tip", "index_tip", "middle_tip", "ring_tip", "pinky_tip"
+        ]
+        data = {
+            "obj_trajectory": trajectory,
+            "obj_verts": torch.tensor([[0.0, 0.0, -0.03], [0.01, 0.0, -0.03]]),
+            "wrist_pos": wrist.clone(),
+            "wrist_rot": torch.zeros(length, 3),
+            "wrist_velocity": torch.zeros_like(wrist),
+            "mano_joints": {name: wrist.clone() for name in joint_names},
+            "mano_joints_velocity": {name: torch.zeros_like(wrist) for name in joint_names},
+        }
+        final_transform = np.eye(4)
+        final_transform[:3, :3] = Rotation.from_euler("x", 180, degrees=True).as_matrix()
+        final_transform[:3, 3] = np.array([0.0, 0.0, -0.01])
+        schedule = MODULE["build_transform_schedule"](
+            final_transform, np.array([0.0, 0.5, 1.0])
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_dir = Path(temp_dir)
+            mesh_file = temp_dir / "tool.ply"
+            mesh_file.write_bytes(b"same mesh used by correction and stage1")
+            collision_mesh = temp_dir / "collision.ply"
+            collision_mesh.write_bytes(b"matching physical collision mesh")
+            collision_urdf = temp_dir / "collision.urdf"
+            collision_urdf.write_text(
+                '<robot name="tool"><link name="base"><collision><geometry>'
+                '<mesh filename="collision.ply"/></geometry></collision></link></robot>'
+            )
+            data["obj_mesh_path"] = str(mesh_file)
+            data["obj_urdf_path"] = str(collision_urdf)
+            metadata = {
+                "schema_version": 6,
+                "geometry_feasible": True,
+                "side": "right",
+                "semantic_precheck": {"passed": True},
+                "physics_validation_required": False,
+                "tool_mesh": str(mesh_file),
+                "tool_mesh_sha256": hashlib.sha256(mesh_file.read_bytes()).hexdigest(),
+                "collision_bundle_sha256": dataset._urdf_bundle_sha256(collision_urdf),
+                "alpha": np.array([0.0, 0.5, 1.0], dtype=np.float32),
+                "transform_schedule_tool": schedule.astype(np.float32),
+                "validation_tiers": {"semantic_geometry": {"passed": True}},
+            }
+            dataset._apply_contact_retarget_targets(data, metadata, "corrected.pkl")
+
+        self.assertTrue(torch.allclose(data["wrist_pos"][0], wrist[0]))
+        self.assertTrue(
+            torch.allclose(data["wrist_pos"][-1], torch.tensor([0.0, 0.0, -0.03]), atol=1e-6)
+        )
+        self.assertAlmostEqual(float(torch.linalg.norm(data["wrist_rot"][-1])), np.pi, places=5)
+        for name in joint_names:
+            self.assertTrue(torch.allclose(data["mano_joints"][name], data["wrist_pos"]))
 
 
 if __name__ == "__main__":

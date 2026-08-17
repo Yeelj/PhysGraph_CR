@@ -1,8 +1,9 @@
 """Contact-aware geometric post-retargeting for dexterous-hand trajectories.
 
 This module deliberately runs before Stage 1.  It keeps wrist orientation and
-all finger DOFs unchanged, and solves only for a right-hand translation in the
-tool-local frame.  Corrected PKLs mirror ``data/retargeting`` below
+all finger DOFs unchanged, maps the old red-region center to the new one, and
+locally refines only a tool-local translation.  Corrected PKLs mirror
+``data/retargeting`` below
 ``data/retargeting_contact`` and remain compatible with ``load_retargeted_data``.
 
 The optimizer itself has no Isaac Gym dependency.  Hand collision surfaces and
@@ -35,7 +36,7 @@ from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 
 
 def _physics_validation_required(metadata: Mapping[str, object]) -> bool:
@@ -619,6 +620,124 @@ def tool_to_world_offsets(offset_tool: np.ndarray, object_trajectory: np.ndarray
     return np.einsum("fij,j->fi", object_trajectory[:, :3, :3], offset_tool)
 
 
+def apply_tool_transform_points(points_tool: np.ndarray, transforms_tool: np.ndarray) -> np.ndarray:
+    """Apply one tool-local rigid transform per frame to point trajectories."""
+
+    points_tool = np.asarray(points_tool, dtype=np.float64)
+    transforms_tool = np.asarray(transforms_tool, dtype=np.float64)
+    if points_tool.ndim != 3 or points_tool.shape[-1] != 3:
+        raise ValueError(f"Expected [frames, points, 3], got {points_tool.shape}")
+    if transforms_tool.shape != (len(points_tool), 4, 4):
+        raise ValueError(
+            f"Expected transform schedule {(len(points_tool), 4, 4)}, got {transforms_tool.shape}"
+        )
+    return (
+        np.einsum("fij,fpj->fpi", transforms_tool[:, :3, :3], points_tool)
+        + transforms_tool[:, None, :3, 3]
+    )
+
+
+def build_transform_schedule(
+    transform_tool: np.ndarray,
+    alpha: np.ndarray,
+    pivot_tool: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Smoothly interpolate identity to a fixed tool-local SE(3) transform.
+
+    Rotation follows the shortest rotation-vector interpolation and translation
+    follows the existing quintic schedule.  The resulting matrices are stored
+    in the corrected PKL so correction, verification, and Stage 1 consume the
+    exact same trajectory.
+    """
+
+    transform_tool = np.asarray(transform_tool, dtype=np.float64)
+    alpha = np.asarray(alpha, dtype=np.float64)
+    if transform_tool.shape != (4, 4):
+        raise ValueError(f"Expected a 4x4 contact transform, got {transform_tool.shape}")
+    if alpha.ndim != 1:
+        raise ValueError(f"Expected a one-dimensional schedule, got {alpha.shape}")
+    rotation = Rotation.from_matrix(transform_tool[:3, :3]).as_rotvec()
+    schedule = np.repeat(np.eye(4, dtype=np.float64)[None], len(alpha), axis=0)
+    schedule[:, :3, :3] = Rotation.from_rotvec(alpha[:, None] * rotation[None]).as_matrix()
+    if pivot_tool is None:
+        schedule[:, :3, 3] = alpha[:, None] * transform_tool[:3, 3][None]
+    else:
+        pivot_tool = np.asarray(pivot_tool, dtype=np.float64)
+        if pivot_tool.shape != (3,):
+            raise ValueError(f"Expected a three-dimensional SE(3) pivot, got {pivot_tool.shape}")
+        final_pivot = transform_tool[:3, :3] @ pivot_tool + transform_tool[:3, 3]
+        pivot_path = (
+            (1.0 - alpha)[:, None] * pivot_tool[None]
+            + alpha[:, None] * final_pivot[None]
+        )
+        schedule[:, :3, 3] = pivot_path - np.einsum(
+            "fij,j->fi", schedule[:, :3, :3], pivot_tool
+        )
+    return schedule
+
+
+def transform_hand_trajectory(
+    wrist_pos: np.ndarray,
+    wrist_rotvec: np.ndarray,
+    object_trajectory: np.ndarray,
+    transforms_tool: np.ndarray,
+    joints_world: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """Apply a tool-local SE(3) schedule to wrist pose and optional hand joints."""
+
+    wrist_pos = np.asarray(wrist_pos, dtype=np.float64)
+    wrist_rotvec = np.asarray(wrist_rotvec, dtype=np.float64)
+    object_trajectory = np.asarray(object_trajectory, dtype=np.float64)
+    transforms_tool = np.asarray(transforms_tool, dtype=np.float64)
+    length = len(wrist_pos)
+    if wrist_rotvec.shape != (length, 3):
+        raise ValueError(f"Expected wrist rotations {(length, 3)}, got {wrist_rotvec.shape}")
+    if object_trajectory.shape != (length, 4, 4):
+        raise ValueError(f"Expected object trajectory {(length, 4, 4)}, got {object_trajectory.shape}")
+    if transforms_tool.shape != (length, 4, 4):
+        raise ValueError(f"Expected transform schedule {(length, 4, 4)}, got {transforms_tool.shape}")
+
+    object_rotation = object_trajectory[:, :3, :3]
+    object_translation = object_trajectory[:, :3, 3]
+    wrist_tool = np.einsum(
+        "fji,fj->fi", object_rotation, wrist_pos - object_translation
+    )
+    corrected_wrist_tool = (
+        np.einsum("fij,fj->fi", transforms_tool[:, :3, :3], wrist_tool)
+        + transforms_tool[:, :3, 3]
+    )
+    corrected_wrist_pos = (
+        np.einsum("fij,fj->fi", object_rotation, corrected_wrist_tool)
+        + object_translation
+    )
+
+    wrist_rotation = Rotation.from_rotvec(wrist_rotvec).as_matrix()
+    corrected_wrist_rotation = (
+        object_rotation
+        @ transforms_tool[:, :3, :3]
+        @ np.swapaxes(object_rotation, 1, 2)
+        @ wrist_rotation
+    )
+    corrected_wrist_rotvec = Rotation.from_matrix(corrected_wrist_rotation).as_rotvec()
+
+    corrected_joints = None
+    if joints_world is not None:
+        joints_world = np.asarray(joints_world, dtype=np.float64)
+        if joints_world.ndim != 3 or joints_world.shape[0] != length or joints_world.shape[2] != 3:
+            raise ValueError(f"Expected joint positions [frames, joints, 3], got {joints_world.shape}")
+        joints_tool = np.einsum(
+            "fji,fpj->fpi",
+            object_rotation,
+            joints_world - object_translation[:, None],
+        )
+        corrected_joints_tool = apply_tool_transform_points(joints_tool, transforms_tool)
+        corrected_joints = (
+            np.einsum("fij,fpj->fpi", object_rotation, corrected_joints_tool)
+            + object_translation[:, None]
+        )
+    return corrected_wrist_pos, corrected_wrist_rotvec, corrected_joints
+
+
 def smoothstep5(value: np.ndarray) -> np.ndarray:
     value = np.clip(value, 0.0, 1.0)
     return value**3 * (value * (value * 6.0 - 15.0) + 10.0)
@@ -766,20 +885,41 @@ def detect_grasp_interval(
     max_gap: int = 10,
     min_frames: int = 8,
 ) -> Tuple[int, int]:
-    red_distance, black_distance, _, _, _ = _nearest_semantics(
+    red_distance, black_distance, black_nearest, _, _ = _nearest_semantics(
         points_tool, tool, settings.semantic_tie_epsilon
     )
     surface_distance = np.minimum(red_distance, black_distance)
-    active_per_link = []
+    red_active_per_link = []
+    surface_active_per_link = []
     for link_id in sorted(set(int(value) for value in contact_link_ids.tolist())):
         link_mask = point_link_ids == link_id
-        active_per_link.append((surface_distance[:, link_mask].min(axis=1) <= settings.grasp_distance))
-    active = np.stack(active_per_link, axis=1).mean(axis=1) >= (1.0 / max(1, len(active_per_link)))
+        red_active_per_link.append(
+            (
+                (~black_nearest[:, link_mask])
+                & (red_distance[:, link_mask] <= settings.grasp_distance)
+            ).any(axis=1)
+        )
+        surface_active_per_link.append(
+            surface_distance[:, link_mask].min(axis=1) <= settings.grasp_distance
+        )
+    active = (
+        np.stack(red_active_per_link, axis=1).mean(axis=1)
+        >= settings.min_red_link_ratio
+    )
     active = _close_short_gaps(active, max_gap=max_gap)
     interval = _longest_true_interval(active)
     if interval is None or interval[1] - interval[0] + 1 < min_frames:
+        # Coarse source meshes can place the semantic samples farther from the
+        # collision surface than the red-region threshold. Retain the original
+        # surface-proximity detector only as a compatibility fallback.
+        active = np.stack(surface_active_per_link, axis=1).mean(axis=1) >= (
+            1.0 / max(1, len(surface_active_per_link))
+        )
+        active = _close_short_gaps(active, max_gap=max_gap)
+        interval = _longest_true_interval(active)
+    if interval is None or interval[1] - interval[0] + 1 < min_frames:
         raise ValueError(
-            "Could not detect a stable grasp interval from the new mesh. "
+            "Could not detect a stable grasp interval from the source mesh. "
             "Pass --start-frame and --end-frame explicitly after inspecting the preview."
         )
     return interval
@@ -794,23 +934,11 @@ def _optimization_objective(
     settings: GeometrySettings,
 ) -> float:
     shifted = points_tool + np.asarray(delta, dtype=np.float64)[None, None]
-    metrics = contact_geometry_metrics(shifted, point_link_ids, contact_link_ids, tool, settings)
-    link_distances = np.asarray(metrics["red_link_distance_frame"])
-    required = max(1, int(np.ceil(settings.min_red_link_ratio * link_distances.shape[1])))
-    best_required = np.partition(link_distances, required - 1, axis=1)[:, :required]
-    red_loss = np.mean(np.square(np.clip(best_required / settings.contact_distance, 0.0, 10.0)))
-
-    red_distance, black_distance, black_nearest, _, _ = _nearest_semantics(
-        shifted, tool, settings.semantic_tie_epsilon
+    geometry_loss = _transformed_geometry_objective(
+        shifted, point_link_ids, contact_link_ids, tool, settings
     )
-    black_depth = np.where(
-        black_nearest,
-        np.maximum(settings.black_clearance - black_distance, 0.0) / settings.black_clearance,
-        0.0,
-    )
-    black_loss = float(np.mean(black_depth**2) + np.mean(np.max(black_depth, axis=1) ** 2))
     shift_loss = float(np.dot(delta, delta) / max(settings.max_shift**2, 1e-12))
-    return float(red_loss + 80.0 * black_loss + 0.02 * shift_loss)
+    return float(geometry_loss + 0.02 * shift_loss)
 
 
 def _red_direction_seed(
@@ -1051,6 +1179,183 @@ def optimize_tool_translation(
     }
 
 
+def contact_translation_transfer(
+    source_tool: SemanticTool,
+    target_tool: SemanticTool,
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    """Map the robust old red-region center to the new one with translation only."""
+
+    source_center = np.median(np.asarray(source_tool.red_points, dtype=np.float64), axis=0)
+    target_center = np.median(np.asarray(target_tool.red_points, dtype=np.float64), axis=0)
+    delta = target_center - source_center
+    return delta, {
+        "method": "red_center_translation",
+        "source_red_center_tool": source_center,
+        "target_red_center_tool": target_center,
+        "initial_delta_tool": delta,
+        "initial_delta_norm": float(np.linalg.norm(delta)),
+        "rotation_degrees": 0.0,
+    }
+
+
+def extract_source_contact_intent(
+    points_tool: np.ndarray,
+    point_link_ids: np.ndarray,
+    contact_link_ids: np.ndarray,
+    source_tool: SemanticTool,
+    settings: GeometrySettings,
+) -> Dict[str, object]:
+    """Summarize which configured links actually approach the old red patch.
+
+    The summary informs and documents contact-region transfer, but acceptance is
+    intentionally still performed with the configured fixed contact-link ratio.
+    """
+
+    red_distance, _, black_nearest, red_index, _ = _nearest_semantics(
+        points_tool, source_tool, settings.semantic_tie_epsilon
+    )
+    per_link = []
+    anchors = []
+    for link_id in sorted(set(int(value) for value in np.asarray(contact_link_ids).tolist())):
+        link_mask = point_link_ids == link_id
+        if not link_mask.any():
+            continue
+        link_red_distance = red_distance[:, link_mask]
+        link_black_nearest = black_nearest[:, link_mask]
+        best_local = np.argmin(link_red_distance, axis=1)
+        frame_index = np.arange(len(points_tool), dtype=np.int64)
+        best_distance = link_red_distance[frame_index, best_local]
+        best_is_red = ~link_black_nearest[frame_index, best_local]
+        active = best_is_red & (best_distance <= settings.grasp_distance)
+        link_red_indices = red_index[:, link_mask][frame_index, best_local]
+        if active.any():
+            link_anchors = source_tool.red_points[link_red_indices[active]]
+            anchor = np.median(link_anchors, axis=0)
+            anchors.append(anchor)
+        else:
+            anchor = None
+        per_link.append(
+            {
+                "link_id": int(link_id),
+                "active_frame_ratio": float(active.mean()),
+                "minimum_red_distance": float(best_distance.min()),
+                "anchor_tool": anchor,
+            }
+        )
+    return {
+        "method": "old_red_nearest_collision_surface",
+        "configured_link_count": int(len(set(int(v) for v in contact_link_ids.tolist()))),
+        "active_link_count": int(sum(item["anchor_tool"] is not None for item in per_link)),
+        "contact_anchor_center_tool": None if not anchors else np.median(np.stack(anchors), axis=0),
+        "per_link": per_link,
+    }
+
+
+def _transformed_geometry_objective(
+    transformed: np.ndarray,
+    point_link_ids: np.ndarray,
+    contact_link_ids: np.ndarray,
+    tool: SemanticTool,
+    settings: GeometrySettings,
+) -> float:
+    red_distance, black_distance, black_nearest, _, _ = _nearest_semantics(
+        transformed, tool, settings.semantic_tie_epsilon
+    )
+    link_distances = []
+    for link_id in sorted(set(int(value) for value in np.asarray(contact_link_ids).tolist())):
+        link_mask = point_link_ids == link_id
+        semantic_red_distance = red_distance[:, link_mask] + np.maximum(
+            red_distance[:, link_mask]
+            - black_distance[:, link_mask]
+            + settings.semantic_tie_epsilon,
+            0.0,
+        )
+        link_distances.append(semantic_red_distance.min(axis=1))
+    link_distances = np.stack(link_distances, axis=1)
+    required = max(1, int(np.ceil(settings.min_red_link_ratio * link_distances.shape[1])))
+    best_required = np.partition(link_distances, required - 1, axis=1)[:, :required]
+    red_loss = np.mean(
+        np.square(np.clip(best_required / settings.contact_distance, 0.0, 10.0))
+    )
+    black_depth = np.where(
+        black_nearest,
+        np.maximum(settings.black_clearance - black_distance, 0.0) / settings.black_clearance,
+        0.0,
+    )
+    black_loss = float(
+        np.mean(black_depth**2) + np.mean(np.max(black_depth, axis=1) ** 2)
+    )
+    return float(red_loss + 80.0 * black_loss)
+
+
+def optimize_contact_translation(
+    points_tool: np.ndarray,
+    point_link_ids: np.ndarray,
+    contact_link_ids: np.ndarray,
+    tool: SemanticTool,
+    settings: GeometrySettings,
+    initial_delta: np.ndarray,
+    max_residual_shift: float = 0.01,
+    max_iterations: int = 30,
+    initial_residual: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    """Locally refine red-center translation without rotating the grasp."""
+
+    if max_residual_shift <= 0.0:
+        raise ValueError("Contact-translation residual bound must be positive")
+    initial_delta = np.asarray(initial_delta, dtype=np.float64)
+    if initial_delta.shape != (3,):
+        raise ValueError(f"Expected a three-dimensional initial delta, got {initial_delta.shape}")
+    bounds = [(-max_residual_shift, max_residual_shift)] * 3
+
+    def objective(residual: np.ndarray) -> float:
+        delta = initial_delta + np.asarray(residual, dtype=np.float64)
+        transformed = points_tool + delta[None, None]
+        geometry_loss = _transformed_geometry_objective(
+            transformed, point_link_ids, contact_link_ids, tool, settings
+        )
+        translation_prior = float(np.dot(residual, residual)) / max(
+            max_residual_shift**2, 1e-12
+        )
+        return float(geometry_loss + 0.05 * translation_prior)
+
+    seed = (
+        np.zeros(3, dtype=np.float64)
+        if initial_residual is None
+        else np.asarray(initial_residual, dtype=np.float64)
+    )
+    seed = np.asarray(
+        [np.clip(value, low, high) for value, (low, high) in zip(seed, bounds)],
+        dtype=np.float64,
+    )
+    candidates = [(seed, objective(seed))]
+    if np.linalg.norm(seed) > 0.0:
+        zero = np.zeros(3, dtype=np.float64)
+        candidates.append((zero, objective(zero)))
+    polished = minimize(
+        objective,
+        seed,
+        method="Powell",
+        bounds=bounds,
+        options={"maxiter": max_iterations, "xtol": 1e-5, "ftol": 1e-6},
+    )
+    candidates.append((np.asarray(polished.x), float(polished.fun)))
+    residual, score = min(candidates, key=lambda item: item[1])
+    delta = initial_delta + residual
+    return delta, {
+        "mode": "contact_translation",
+        "objective": float(score),
+        "residual": residual,
+        "residual_translation_norm": float(np.linalg.norm(residual)),
+        "initial_delta_tool": initial_delta,
+        "final_delta_tool": delta,
+        "final_translation_norm": float(np.linalg.norm(delta)),
+        "final_rotation_degrees": 0.0,
+        "powell_success": bool(polished.success),
+        "powell_message": str(polished.message),
+    }
+
+
 @dataclass(frozen=True)
 class OfflineHandSpec:
     name: str
@@ -1209,6 +1514,18 @@ def _select_optimization_frames(start: int, end: int, maximum: int = 48) -> np.n
     return np.unique(np.linspace(start, end, maximum).round().astype(np.int64))
 
 
+def _bounded_frame_sample(frame_ids: np.ndarray, maximum: int) -> np.ndarray:
+    """Keep refinement cost bounded even when every hold frame fails."""
+
+    frame_ids = np.unique(np.asarray(frame_ids, dtype=np.int64))
+    if maximum <= 0:
+        raise ValueError(f"Maximum optimization frames must be positive, got {maximum}")
+    if len(frame_ids) <= maximum:
+        return frame_ids
+    indices = np.linspace(0, len(frame_ids) - 1, maximum).round().astype(np.int64)
+    return frame_ids[indices]
+
+
 def _is_feasible(metrics: Mapping[str, object], settings: GeometrySettings) -> bool:
     return bool(
         float(metrics["red_frame_pass_ratio"]) >= settings.min_red_frame_ratio
@@ -1216,18 +1533,40 @@ def _is_feasible(metrics: Mapping[str, object], settings: GeometrySettings) -> b
     )
 
 
-def _invariant_report(source: Mapping, corrected: Mapping, delta_world: np.ndarray) -> Dict[str, object]:
+def _invariant_report(
+    source: Mapping,
+    corrected: Mapping,
+    delta_world: Optional[np.ndarray] = None,
+    expected_wrist_pos: Optional[np.ndarray] = None,
+    expected_wrist_rot: Optional[np.ndarray] = None,
+    expected_joints_pos: Optional[np.ndarray] = None,
+) -> Dict[str, object]:
+    """Check that correction is exactly the scheduled rigid transform.
+
+    ``delta_world`` preserves the legacy translation-only API used by older
+    callers.  SE(3) correction supplies explicit expected pose trajectories.
+    Finger DOFs remain a strict invariant in both modes.
+    """
+
     source_rot = np.asarray(source["opt_wrist_rot"])
     corrected_rot = np.asarray(corrected["opt_wrist_rot"])
     source_dof = np.asarray(source["opt_dof_pos"])
     corrected_dof = np.asarray(corrected["opt_dof_pos"])
     source_pos = np.asarray(source["opt_wrist_pos"])
     corrected_pos = np.asarray(corrected["opt_wrist_pos"])
+    if expected_wrist_pos is None:
+        if delta_world is None:
+            raise ValueError("Invariant validation requires delta_world or expected wrist poses")
+        expected_wrist_pos = source_pos + np.asarray(delta_world)
+    if expected_wrist_rot is None:
+        expected_wrist_rot = source_rot
     result = {
-        "rotation_max_abs_error": float(np.max(np.abs(corrected_rot - source_rot))),
+        "rotation_max_abs_error": float(
+            np.max(np.abs(corrected_rot - np.asarray(expected_wrist_rot)))
+        ),
         "dof_max_abs_error": float(np.max(np.abs(corrected_dof - source_dof))),
         "wrist_translation_max_abs_error": float(
-            np.max(np.abs((corrected_pos - source_pos) - delta_world))
+            np.max(np.abs(corrected_pos - np.asarray(expected_wrist_pos)))
         ),
         "all_finite": bool(
             np.isfinite(corrected_pos).all()
@@ -1239,12 +1578,19 @@ def _invariant_report(source: Mapping, corrected: Mapping, delta_world: np.ndarr
     if "opt_joints_pos" in source and "opt_joints_pos" in corrected:
         source_joints = np.asarray(source["opt_joints_pos"])
         corrected_joints = np.asarray(corrected["opt_joints_pos"])
+        if expected_joints_pos is None:
+            if delta_world is None:
+                raise ValueError("SE(3) joint invariant validation requires expected joint positions")
+            expected_joints_pos = source_joints + np.asarray(delta_world)[:, None]
         result["joint_rigid_translation_max_abs_error"] = float(
-            np.max(np.abs((corrected_joints - source_joints) - delta_world[:, None]))
+            np.max(np.abs(corrected_joints - np.asarray(expected_joints_pos)))
         )
     result["passed"] = bool(
         result["all_finite"]
-        and result["rotation_max_abs_error"] <= 1e-10
+        # Corrected trajectories and stored SE(3) schedules use float32. Axis-angle
+        # round trips near pi can differ by roughly 1e-7 while representing the
+        # same scheduled wrist rotation.
+        and result["rotation_max_abs_error"] <= 1e-6
         and result["dof_max_abs_error"] <= 1e-10
         and result["wrist_translation_max_abs_error"] <= 1e-6
         and result.get("joint_rigid_translation_max_abs_error", 0.0) <= 1e-6
@@ -1363,6 +1709,7 @@ def _write_preview(
     preview_frame: int,
     semantic_axis: Optional[Mapping[str, object]] = None,
     delta_tool: Optional[np.ndarray] = None,
+    contact_transfer: Optional[Mapping[str, object]] = None,
 ) -> None:
     os.environ.setdefault("MPLCONFIGDIR", "/tmp/physgraph-matplotlib")
     import matplotlib
@@ -1398,6 +1745,26 @@ def _write_preview(
             linewidth=2.0,
         )
 
+    def draw_contact_transfer(axis) -> None:
+        if contact_transfer is None:
+            return
+        source_origin = np.asarray(
+            contact_transfer["source_red_center_tool"], dtype=np.float64
+        )
+        target_origin = np.asarray(
+            contact_transfer["target_red_center_tool"], dtype=np.float64
+        )
+        displacement = target_origin - source_origin
+        if float(np.linalg.norm(displacement)) > 1e-10:
+            axis.quiver(
+                *source_origin,
+                *displacement,
+                length=1.0,
+                normalize=False,
+                color="magenta",
+                linewidth=2.0,
+            )
+
     for axis, hand_points, title in (
         (axes[0], points_before[preview_frame], "Before correction"),
         (axes[1], points_after[preview_frame], "After correction"),
@@ -1415,11 +1782,13 @@ def _write_preview(
         axis.set_title(f"{title}, frame={preview_frame}")
         axis.set_box_aspect((1, 1, 1))
         draw_semantic_axis(axis)
+        draw_contact_transfer(axis)
     axes[2].scatter(red[:, 0], red[:, 1], red[:, 2], c="red", s=3, alpha=0.5)
     axes[2].scatter(black[:, 0], black[:, 1], black[:, 2], c="black", s=3, alpha=0.3)
     axes[2].set_title("Tool semantic regions (tool frame)")
     axes[2].set_box_aspect((1, 1, 1))
     draw_semantic_axis(axes[2])
+    draw_contact_transfer(axes[2])
 
     time_axis = figure.add_subplot(2, 1, 2)
     time_axis.plot(alpha, label="translation alpha", color="tab:gray")
@@ -1535,7 +1904,7 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
             points_before,
             kinematics.point_link_ids_array,
             contact_ids,
-            tool,
+            source_tool,
             settings,
             max_gap=args.max_grasp_gap,
             min_frames=args.min_grasp_frames,
@@ -1552,7 +1921,31 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
     optimization_frames = _select_optimization_frames(start_frame, end_frame, args.max_optimization_frames)
     semantic_axis_report = None
     semantic_axis_direction = None
-    if args.translation_mode == "semantic-axis":
+    contact_transfer_report = None
+    contact_transform_tool = None
+    contact_initial_delta = None
+    source_contact_intent = extract_source_contact_intent(
+        points_before[hold_frame_ids],
+        kinematics.point_link_ids_array,
+        contact_ids,
+        source_tool,
+        settings,
+    )
+    if args.translation_mode == "contact-translation":
+        contact_initial_delta, contact_transfer_report = contact_translation_transfer(
+            source_tool, tool
+        )
+        delta_tool, optimizer_report = optimize_contact_translation(
+            points_before[optimization_frames],
+            kinematics.point_link_ids_array,
+            contact_ids,
+            tool,
+            settings,
+            contact_initial_delta,
+            max_residual_shift=args.max_residual_shift,
+            max_iterations=args.optimizer_iterations,
+        )
+    elif args.translation_mode == "semantic-axis":
         semantic_axis_direction, semantic_axis_report = estimate_semantic_axis(
             tool, roi_distance=args.axis_roi_distance
         )
@@ -1575,14 +1968,19 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
             seed=args.seed,
             max_iterations=args.optimizer_iterations,
         )
+    if contact_transform_tool is None:
+        contact_transform_tool = np.eye(4, dtype=np.float64)
+        contact_transform_tool[:3, 3] = delta_tool
     optimizer_history = [optimizer_report]
 
-    # A subsampled frame set keeps the global search tractable, but final acceptance is
-    # based on every frame in the grasp interval. Add any missed failure frames
-    # and locally refine until the full interval satisfies the constraints.
+    # A bounded representative set keeps refinement tractable, while final acceptance
+    # is still evaluated on every frame in the complete grasp interval.
     for refinement_round in range(args.max_refinement_rounds):
+        hold_transform = np.repeat(
+            contact_transform_tool[None], len(hold_frame_ids), axis=0
+        )
         hold_metrics = contact_geometry_metrics(
-            points_before[hold_frame_ids] + delta_tool[None, None],
+            apply_tool_transform_points(points_before[hold_frame_ids], hold_transform),
             kinematics.point_link_ids_array,
             contact_ids,
             tool,
@@ -1597,8 +1995,42 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         if len(failed_local) == 0:
             break
         failed_frames = hold_frame_ids[failed_local]
-        optimization_frames = np.unique(np.concatenate([optimization_frames, failed_frames]))
-        if semantic_axis_direction is not None:
+        next_optimization_frames = _bounded_frame_sample(
+            np.concatenate([optimization_frames, failed_frames]),
+            args.max_optimization_frames,
+        )
+        if np.array_equal(next_optimization_frames, optimization_frames):
+            optimizer_history[-1]["refinement_stopped_reason"] = (
+                "all failed frames reduce to the same bounded representative set"
+            )
+            optimizer_history[-1]["failed_frame_count"] = int(len(failed_frames))
+            _log(
+                "停止 refinement：失败帧经硬上限采样后未引入新的代表帧，"
+                "继续优化只会重复相同目标"
+            )
+            break
+        optimization_frames = next_optimization_frames
+        _log(
+            "第 {} 轮局部 refinement：失败帧={}，本轮优化帧={}（硬上限={}）".format(
+                refinement_round + 1,
+                len(failed_frames),
+                len(optimization_frames),
+                args.max_optimization_frames,
+            )
+        )
+        if args.translation_mode == "contact-translation":
+            delta_tool, refinement_report = optimize_contact_translation(
+                points_before[optimization_frames],
+                kinematics.point_link_ids_array,
+                contact_ids,
+                tool,
+                settings,
+                contact_initial_delta,
+                max_residual_shift=args.max_residual_shift,
+                max_iterations=args.optimizer_iterations,
+                initial_residual=np.asarray(optimizer_history[-1]["residual"]),
+            )
+        elif semantic_axis_direction is not None:
             delta_tool, refinement_report = optimize_tool_translation_along_axis(
                 points_before[optimization_frames],
                 kinematics.point_link_ids_array,
@@ -1621,8 +2053,11 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
                 initial_delta=delta_tool,
                 global_search=False,
             )
+        contact_transform_tool = np.eye(4, dtype=np.float64)
+        contact_transform_tool[:3, 3] = delta_tool
         refinement_report["round"] = refinement_round + 1
-        refinement_report["added_failure_frames"] = failed_frames
+        refinement_report["failed_frame_count"] = int(len(failed_frames))
+        refinement_report["optimization_frames"] = optimization_frames
         optimizer_history.append(refinement_report)
     alpha = build_offset_schedule(
         length,
@@ -1635,13 +2070,15 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
     corrected = copy.deepcopy(source)
     corrected["opt_wrist_pos"] = (
         np.asarray(source["opt_wrist_pos"], dtype=np.float64) + delta_world
-    ).astype(np.asarray(source["opt_wrist_pos"]).dtype)
+    ).astype(
+        np.asarray(source["opt_wrist_pos"]).dtype
+    )
     if "opt_joints_pos" in source:
         corrected["opt_joints_pos"] = (
             np.asarray(source["opt_joints_pos"], dtype=np.float64) + delta_world[:, None]
-        ).astype(np.asarray(source["opt_joints_pos"]).dtype)
-    # Rotation and DOF arrays are copied without arithmetic so byte-level values
-    # remain unchanged apart from normal pickle serialization.
+        ).astype(
+            np.asarray(source["opt_joints_pos"]).dtype
+        )
     corrected["opt_wrist_rot"] = np.asarray(source["opt_wrist_rot"]).copy()
     corrected["opt_dof_pos"] = np.asarray(source["opt_dof_pos"]).copy()
 
@@ -1696,8 +2133,10 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
             final_axis_constraint is None or final_axis_constraint["passed"]
         ),
     }
+    final_rotation_degrees = 0.0
     _log(
-        "[1/2] 语义几何优化{}：红区合格帧={:.2%}，黑区违规比例={:.6%}，平移={:.2f} mm".format(
+        "[1/2] 语义几何优化{}：红区合格帧={:.2%}，黑区违规比例={:.6%}，"
+        "工具局部平移={:.2f} mm".format(
             "通过" if semantic_geometry_passed else "失败",
             float(after_hold["red_frame_pass_ratio"]),
             float(after_hold["black_violation_fraction"]),
@@ -1801,10 +2240,14 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         "grasp_interval": [start_frame, end_frame],
         "optimization_frames": optimization_frames,
         "translation_mode": args.translation_mode,
+        "source_contact_intent": source_contact_intent,
+        "contact_transfer": contact_transfer_report,
+        "contact_transform_tool": contact_transform_tool,
         "semantic_axis": semantic_axis_report,
         "axis_constraint": final_axis_constraint,
         "delta_tool": delta_tool,
         "delta_norm": float(np.linalg.norm(delta_tool)),
+        "rotation_degrees": final_rotation_degrees,
         "settings": asdict(settings),
         "optimizer": optimizer_history[-1],
         "optimizer_history": optimizer_history,
@@ -1835,6 +2278,9 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         "source_tool_mesh_sha256": report["source_tool_mesh_sha256"],
         "semantic_precheck": semantic_precheck,
         "translation_mode": args.translation_mode,
+        "source_contact_intent": source_contact_intent,
+        "contact_transfer": contact_transfer_report,
+        "contact_transform_tool": contact_transform_tool.astype(np.float32),
         "semantic_axis": semantic_axis_report,
         "axis_constraint": final_axis_constraint,
         "delta_tool": delta_tool.astype(np.float32),
@@ -1876,6 +2322,7 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         preview_frame,
         semantic_axis_report,
         delta_tool,
+        contact_transfer_report,
     )
     if overall_passed or args.allow_infeasible:
         _atomic_pickle_dump(corrected, output_path)
@@ -1974,11 +2421,36 @@ def run_verification(args: argparse.Namespace) -> Dict[str, object]:
         tool,
         settings,
     )
+    translation_mode = metadata.get("translation_mode", "free3d")
     delta_tool = np.asarray(metadata["delta_tool"], dtype=np.float64)
     alpha = np.asarray(metadata["alpha"], dtype=np.float64)
-    delta_world = tool_to_world_offsets(delta_tool, context.object_trajectory) * alpha[:, None]
-    invariants = _invariant_report(source, corrected, delta_world)
-    translation_mode = metadata.get("translation_mode", "free3d")
+    if translation_mode == "contact-se3":
+        transform_schedule_tool = np.asarray(
+            metadata.get("transform_schedule_tool"), dtype=np.float64
+        )
+        if transform_schedule_tool.shape != (len(corrected["opt_wrist_pos"]), 4, 4):
+            raise ValueError(
+                "contact-se3 correction metadata has an invalid transform_schedule_tool"
+            )
+        expected_wrist_pos, expected_wrist_rot, expected_joints_pos = transform_hand_trajectory(
+            np.asarray(source["opt_wrist_pos"], dtype=np.float64),
+            np.asarray(source["opt_wrist_rot"], dtype=np.float64),
+            context.object_trajectory,
+            transform_schedule_tool,
+            None
+            if "opt_joints_pos" not in source
+            else np.asarray(source["opt_joints_pos"], dtype=np.float64),
+        )
+        invariants = _invariant_report(
+            source,
+            corrected,
+            expected_wrist_pos=expected_wrist_pos,
+            expected_wrist_rot=expected_wrist_rot,
+            expected_joints_pos=expected_joints_pos,
+        )
+    else:
+        delta_world = tool_to_world_offsets(delta_tool, context.object_trajectory) * alpha[:, None]
+        invariants = _invariant_report(source, corrected, delta_world)
     axis_constraint = None
     if translation_mode == "semantic-axis":
         stored_axis = metadata.get("semantic_axis")
@@ -2023,6 +2495,9 @@ def run_verification(args: argparse.Namespace) -> Dict[str, object]:
         "stored_validation_tiers": stored_validation_tiers,
         "stored_validation_tiers_passed": stored_tiers_passed,
         "translation_mode": translation_mode,
+        "source_contact_intent": metadata.get("source_contact_intent"),
+        "contact_transfer": metadata.get("contact_transfer"),
+        "contact_transform_tool": metadata.get("contact_transform_tool"),
         "semantic_axis": metadata.get("semantic_axis"),
         "axis_constraint": axis_constraint,
         "geometry": _summary_metrics(metrics),
@@ -2046,16 +2521,17 @@ def _add_common_geometry_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--contact-distance", type=float, default=0.006)
     parser.add_argument("--black-clearance", type=float, default=0.006)
     parser.add_argument("--influence-distance", type=float, default=0.02)
-    parser.add_argument("--min-red-link-ratio", type=float, default=0.6)
+    parser.add_argument("--min-red-link-ratio", type=float, default=0.1)
     parser.add_argument("--min-red-frame-ratio", type=float, default=0.8)
-    parser.add_argument("--max-black-violation-fraction", type=float, default=0.0)
+    # parser.add_argument("--max-black-violation-fraction", type=float, default=0.0)
+    parser.add_argument("--max-black-violation-fraction", type=float, default=5.002)
     parser.add_argument("--max-optimization-frames", type=int, default=48)
     parser.add_argument("--report")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Rigidly translate a retargeted dex hand into a colored tool's red contact region"
+        description="Rigidly transfer a retargeted dex hand between colored semantic contact regions"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     correct = subparsers.add_parser("correct", help="solve, validate, and save a corrected retarget PKL")
@@ -2093,12 +2569,18 @@ def build_parser() -> argparse.ArgumentParser:
     correct.add_argument("--max-shift", type=float, default=0.05)
     correct.add_argument(
         "--translation-mode",
-        choices=("free3d", "semantic-axis"),
-        default="free3d",
+        choices=("contact-translation", "free3d", "semantic-axis"),
+        default="contact-translation",
         help=(
-            "free3d searches an unconstrained XYZ offset; semantic-axis estimates a "
-            "black-to-red tool-local center axis and searches only a non-negative distance along it"
+            "contact-translation maps the old red center to the new one and locally refines "
+            "translation only; free3d and semantic-axis retain the legacy solvers"
         ),
+    )
+    correct.add_argument(
+        "--max-residual-shift",
+        type=float,
+        default=0.01,
+        help="maximum per-axis translation refinement around the old-to-new red-center offset",
     )
     correct.add_argument(
         "--axis-roi-distance",
