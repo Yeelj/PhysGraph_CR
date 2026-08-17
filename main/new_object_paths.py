@@ -24,6 +24,32 @@ class NewObjectAssets:
     urdf_path: Path
 
 
+def replacement_object_for_side(identifier: Optional[str], side: str) -> Optional[str]:
+    """Return the replacement identifier for the tool-holding hand only.
+
+    In the bimanual OakInk tasks the right hand holds the replaceable tool and
+    the left hand holds the task object.  A single Hydra ``new_obj`` option is
+    therefore intentionally scoped to the right-hand dataset.
+    """
+
+    side_alias = {
+        "right": "right",
+        "rh": "right",
+        "left": "left",
+        "lh": "left",
+    }
+    normalized_side = side_alias.get(str(side).lower())
+    if normalized_side is None:
+        raise ValueError(f"Unsupported hand side: {side!r}")
+    return identifier if normalized_side == "right" else None
+
+
+def object_asset_cache_key(obj_id, urdf_path) -> Tuple[str, str]:
+    """Identify an Isaac Gym asset by both semantic id and physical bundle."""
+
+    return str(obj_id), str(Path(urdf_path).resolve())
+
+
 def _asset_candidates(identifier: str, root: Path) -> Tuple[list, list]:
     direct = root / identifier
     if direct.is_dir():

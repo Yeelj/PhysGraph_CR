@@ -33,6 +33,22 @@ def _contact_retarget_validation_tiers_passed(metadata):
     )
 
 
+def _validate_retargeting_source(metadata, retargeted_data_path, expected_kind):
+    """Fail closed when Stage-1 is given the wrong hand-trajectory PKL."""
+
+    if expected_kind is None:
+        return "contact_corrected" if metadata is not None else "original"
+    if expected_kind not in {"original", "contact_corrected"}:
+        raise ValueError(f"Unsupported retargeting kind: {expected_kind!r}")
+    actual_kind = "contact_corrected" if metadata is not None else "original"
+    if actual_kind != expected_kind:
+        raise ValueError(
+            f"Expected {expected_kind} hand trajectory, but {retargeted_data_path} "
+            f"contains {actual_kind} data"
+        )
+    return actual_kind
+
+
 class ManipData(Dataset, ABC):
     def __init__(
         self,
@@ -387,8 +403,12 @@ class ManipData(Dataset, ABC):
             data["tips_distance"] = data["tips_distance"][: self.max_seq_len]
             data["joints_distance"] = data["joints_distance"][: self.max_seq_len]
 
-    def load_retargeted_data(self, data, retargeted_data_path):
+    def load_retargeted_data(self, data, retargeted_data_path, *, expected_kind=None):
         if not os.path.exists(retargeted_data_path):
+            if expected_kind is not None:
+                raise FileNotFoundError(
+                    f"Required {expected_kind} hand trajectory does not exist: {retargeted_data_path}"
+                )
             if self.verbose:
                 cprint(f"\nWARNING: {retargeted_data_path} does not exist.", "red")
                 cprint(f"WARNING: This may lead to a slower transfer process or even failure to converge.", "red")
@@ -406,15 +426,20 @@ class ManipData(Dataset, ABC):
         else:
             with open(retargeted_data_path, "rb") as stream:
                 opt_params = pickle.load(stream)
+            contact_metadata = opt_params.get("contact_retarget")
+            retargeting_kind = _validate_retargeting_source(
+                contact_metadata, retargeted_data_path, expected_kind
+            )
             data.update(
                 {
                     "opt_wrist_pos": torch.tensor(opt_params["opt_wrist_pos"], device=self.device),
                     "opt_wrist_rot": torch.tensor(opt_params["opt_wrist_rot"], device=self.device),
                     "opt_dof_pos": torch.tensor(opt_params["opt_dof_pos"], device=self.device),
                     # "opt_joints_pos": torch.tensor(opt_params["opt_joints_pos"], device=self.device), # ? only used for ablation study
+                    "retargeted_data_path": os.path.abspath(retargeted_data_path),
+                    "retargeting_kind": retargeting_kind,
                 }
             )
-            contact_metadata = opt_params.get("contact_retarget")
             if contact_metadata is not None:
                 self._apply_contact_retarget_targets(
                     data, contact_metadata, retargeted_data_path
@@ -441,4 +466,18 @@ class ManipData(Dataset, ABC):
             # ? only used for ablation study
             # data["opt_joints_pos"] = data["opt_joints_pos"][: self.max_seq_len]
             # data["opt_joints_velocity"] = data["opt_joints_velocity"][: self.max_seq_len]
-        assert len(data["opt_wrist_pos"]) == len(data["obj_trajectory"])
+        target_length = len(data["obj_trajectory"])
+        for key in (
+            "opt_wrist_pos",
+            "opt_wrist_rot",
+            "opt_wrist_velocity",
+            "opt_wrist_angular_velocity",
+            "opt_dof_pos",
+            "opt_dof_velocity",
+        ):
+            if len(data[key]) != target_length:
+                raise ValueError(
+                    f"Retarget trajectory length mismatch for {key}: "
+                    f"{len(data[key])} != object trajectory {target_length} "
+                    f"({retargeted_data_path})"
+                )

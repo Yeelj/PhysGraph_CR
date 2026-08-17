@@ -37,6 +37,11 @@ from main.dataset.semantic_contact import (
     semantic_reward_terms,
 )
 from main.dataset.transform import aa_to_quat, aa_to_rotmat, quat_to_rotmat, rotmat_to_aa, rotmat_to_quat, rot6d_to_aa
+from main.new_object_paths import (
+    object_asset_cache_key,
+    replacement_object_for_side,
+    resolve_new_object_assets,
+)
 from torch import Tensor
 from tqdm import tqdm
 from ...asset_root import ASSET_ROOT
@@ -304,7 +309,7 @@ class DexHandManipBiHEnv(VecTask):
                 max_seq_len=self.max_episode_length,
                 dexhand=self.dexhand_lh,
                 embodiment=self.cfg["env"]["dexhand"],
-                new_obj=self.new_obj,
+                new_obj=replacement_object_for_side(self.new_obj, "left"),
             )
             self.demo_dataset_rh_dict[dataset_type] = ManipDataFactory.create_data(
                 manipdata_type=dataset_type,
@@ -314,7 +319,7 @@ class DexHandManipBiHEnv(VecTask):
                 max_seq_len=self.max_episode_length,
                 dexhand=self.dexhand_rh,
                 embodiment=self.cfg["env"]["dexhand"],
-                new_obj=self.new_obj,
+                new_obj=replacement_object_for_side(self.new_obj, "right"),
             )
 
         
@@ -452,6 +457,7 @@ class DexHandManipBiHEnv(VecTask):
         self.demo_data_rh = self.pack_data(self.demo_data_rh, side="rh")
         self.demo_data_lh = [segment_data(i, self.demo_dataset_lh_dict) for i in tqdm(range(self.num_envs))]
         self.demo_data_lh = self.pack_data(self.demo_data_lh, side="lh")
+        self._validate_bimanual_training_sources()
 
         # Create environments
         self.manip_obj_rh_mass = []
@@ -578,6 +584,57 @@ class DexHandManipBiHEnv(VecTask):
         # Setup data
         self.init_data()
 
+    def _validate_bimanual_training_sources(self):
+        """Guarantee the Stage-1 hand trajectories and assets cannot cross sides."""
+
+        expected_kinds = {"rh": "contact_corrected", "lh": "original"}
+        for side, expected_kind in expected_kinds.items():
+            side_data = getattr(self, f"demo_data_{side}")
+            kinds = side_data.get("retargeting_kind")
+            if kinds is None:
+                continue
+            invalid = [kind for kind in kinds if kind != expected_kind]
+            if invalid:
+                raise RuntimeError(
+                    f"Stage-1 {side} trajectory must be {expected_kind}; got {invalid[0]}"
+                )
+
+        if self.new_obj is not None:
+            replacement = resolve_new_object_assets(self.new_obj)
+            expected_mesh = os.path.realpath(replacement.mesh_path)
+            expected_urdf = os.path.realpath(replacement.urdf_path)
+            for actual_path in self.demo_data_rh["obj_mesh_path"]:
+                if os.path.realpath(actual_path) != expected_mesh:
+                    raise RuntimeError(
+                        f"RH tool mesh does not match new_obj={self.new_obj}: {actual_path}"
+                    )
+            for actual_path in self.demo_data_rh["obj_urdf_path"]:
+                if os.path.realpath(actual_path) != expected_urdf:
+                    raise RuntimeError(
+                        f"RH tool URDF does not match new_obj={self.new_obj}: {actual_path}"
+                    )
+            if any(
+                os.path.realpath(path) in {expected_mesh, expected_urdf}
+                for key in ("obj_mesh_path", "obj_urdf_path")
+                for path in self.demo_data_lh[key]
+            ):
+                raise RuntimeError("LH task object unexpectedly reuses the RH replacement tool asset")
+
+        print(
+            "[Stage1 data] "
+            f"RH trajectory={self.demo_data_rh.get('retargeting_kind', ['unknown'])[0]}, "
+            f"trajectory_pkl={self.demo_data_rh.get('retargeted_data_path', ['unknown'])[0]}, "
+            f"tool_mesh={self.demo_data_rh['obj_mesh_path'][0]}, "
+            f"tool_urdf={self.demo_data_rh['obj_urdf_path'][0]}"
+        )
+        print(
+            "[Stage1 data] "
+            f"LH trajectory={self.demo_data_lh.get('retargeting_kind', ['unknown'])[0]}, "
+            f"trajectory_pkl={self.demo_data_lh.get('retargeted_data_path', ['unknown'])[0]}, "
+            f"object_mesh={self.demo_data_lh['obj_mesh_path'][0]}, "
+            f"object_urdf={self.demo_data_lh['obj_urdf_path'][0]}"
+        )
+
     def init_data(self):
         # Setup sim handles
         env_ptr = self.envs[0]
@@ -693,6 +750,30 @@ class DexHandManipBiHEnv(VecTask):
             device=self.sim_device,
         ).view(self.num_envs, -1)
 
+        if not self.headless:
+            self._global_mano_joint_rh_indices = torch.tensor(
+                [
+                    [
+                        self.gym.find_actor_index(env, f"rh_mano_joint_{i}", gymapi.DOMAIN_SIM)
+                        for i in range(self.dexhand_rh.n_bodies)
+                    ]
+                    for env in self.envs
+                ],
+                dtype=torch.int32,
+                device=self.sim_device,
+            )
+            self._global_mano_joint_lh_indices = torch.tensor(
+                [
+                    [
+                        self.gym.find_actor_index(env, f"lh_mano_joint_{i}", gymapi.DOMAIN_SIM)
+                        for i in range(self.dexhand_lh.n_bodies)
+                    ]
+                    for env in self.envs
+                ],
+                dtype=torch.int32,
+                device=self.sim_device,
+            )
+
         CONTACT_HISTORY_LEN = 3
         self.rh_tips_contact_history = torch.ones(self.num_envs, CONTACT_HISTORY_LEN, 5, device=self.device).bool()
         self.lh_tips_contact_history = torch.ones(self.num_envs, CONTACT_HISTORY_LEN, 5, device=self.device).bool()
@@ -786,11 +867,18 @@ class DexHandManipBiHEnv(VecTask):
     def _create_obj_assets(self, i, side="rh"):
         if side == "rh":
             obj_id = self.demo_data_rh["obj_id"][i]
+            obj_urdf_path = self.demo_data_rh["obj_urdf_path"][i]
         else:
             obj_id = self.demo_data_lh["obj_id"][i]
+            obj_urdf_path = self.demo_data_lh["obj_urdf_path"][i]
 
-        if obj_id in self.objs_assets:
-            current_asset = self.objs_assets[obj_id]
+        # The two hands can refer to different physical assets with the same
+        # OakInk object id (most notably when only the RH tool is replaced).
+        # Cache by the resolved URDF bundle as well so a LH object can never
+        # silently reuse the RH tool mesh.
+        asset_cache_key = object_asset_cache_key(obj_id, obj_urdf_path)
+        if asset_cache_key in self.objs_assets:
+            current_asset = self.objs_assets[asset_cache_key]
         else:
             asset_options = gymapi.AssetOptions()
             asset_options.override_com = True
@@ -805,10 +893,6 @@ class DexHandManipBiHEnv(VecTask):
             asset_options.vhacd_params = gymapi.VhacdParams()
             asset_options.vhacd_params.resolution = 200000
             asset_options.density = 200  # * the average density of low-fill-rate 3D-printed models
-            if side == "rh":
-                obj_urdf_path = self.demo_data_rh["obj_urdf_path"][i]
-            else:
-                obj_urdf_path = self.demo_data_lh["obj_urdf_path"][i]
             current_asset = self.gym.load_asset(self.sim, *os.path.split(obj_urdf_path), asset_options)
 
             rigid_shape_props_asset = self.gym.get_asset_rigid_shape_properties(current_asset)
@@ -817,7 +901,7 @@ class DexHandManipBiHEnv(VecTask):
                 element.rolling_friction = 0.05
                 element.torsion_friction = 0.05
             self.gym.set_asset_rigid_shape_properties(current_asset, rigid_shape_props_asset)
-            self.objs_assets[obj_id] = current_asset
+            self.objs_assets[asset_cache_key] = current_asset
 
         # * load assigned scale and mass for the object if available
         if obj_id in oakink2_obj_scale:
@@ -841,12 +925,7 @@ class DexHandManipBiHEnv(VecTask):
         else:
             obj_transf = self.demo_data_lh["obj_trajectory"][i][0]
 
-        pose = gymapi.Transform()
-        pose.p = gymapi.Vec3(obj_transf[0, 3], obj_transf[1, 3], obj_transf[2, 3])
-        obj_aa = rotmat_to_aa(obj_transf[:3, :3])
-        obj_aa_angle = torch.norm(obj_aa)
-        obj_aa_axis = obj_aa / obj_aa_angle
-        pose.r = gymapi.Quat.from_axis_angle(gymapi.Vec3(obj_aa_axis[0], obj_aa_axis[1], obj_aa_axis[2]), obj_aa_angle)
+        pose = self._gym_pose_from_matrix(obj_transf)
 
         # ? object actor filter bit is always 1
         if side == "rh":
@@ -890,14 +969,7 @@ class DexHandManipBiHEnv(VecTask):
             scene_obj_pose = self.mujoco2gym_transf @ torch.tensor(
                 scene_obj_pose, device=self.sim_device, dtype=torch.float32
             )
-            pose = gymapi.Transform()
-            pose.p = gymapi.Vec3(scene_obj_pose[0, 3], scene_obj_pose[1, 3], scene_obj_pose[2, 3])
-            obj_aa = rotmat_to_aa(scene_obj_pose[:3, :3])
-            obj_aa_angle = torch.norm(obj_aa)
-            obj_aa_axis = obj_aa / obj_aa_angle
-            pose.r = gymapi.Quat.from_axis_angle(
-                gymapi.Vec3(obj_aa_axis[0], obj_aa_axis[1], obj_aa_axis[2]), obj_aa_angle
-            )
+            pose = self._gym_pose_from_matrix(scene_obj_pose)
             self.gym.create_actor(env_ptr, scene_asset, pose, f"scene_obj_{so_id}", i, 0)
         # add dummy scene object
         MAX_SCENE_OBJS = 0 + (0 if not self.headless else 0)
@@ -961,6 +1033,18 @@ class DexHandManipBiHEnv(VecTask):
                 self.gym.set_rigid_body_color(env_ptr, a, 0, gymapi.MESH_VISUAL, c)
 
         return obj_actor, obj_index
+
+    @staticmethod
+    def _gym_pose_from_matrix(transform):
+        """Convert a homogeneous transform without a zero-angle axis divide."""
+
+        position = transform[:3, 3].detach().cpu().tolist()
+        # rotmat_to_quat returns [w, x, y, z], while Isaac Gym expects xyzw.
+        quaternion = rotmat_to_quat(transform[:3, :3]).detach().cpu().tolist()
+        pose = gymapi.Transform()
+        pose.p = gymapi.Vec3(*position)
+        pose.r = gymapi.Quat(quaternion[1], quaternion[2], quaternion[3], quaternion[0])
+        return pose
 
     def _update_states(self):
         self.rh_states.update(
@@ -1702,29 +1786,37 @@ class DexHandManipBiHEnv(VecTask):
             self.gym.clear_lines(self.viewer)
 
             def set_side_joint(cur_idx, side="rh"):
-                cur_wrist_pos = getattr(self, f"demo_data_{side}")["wrist_pos"][torch.arange(self.num_envs), cur_idx]
-                cur_mano_joint_pos = getattr(self, f"demo_data_{side}")["mano_joints"][
-                    torch.arange(self.num_envs), cur_idx
-                ].reshape(self.num_envs, -1, 3)
+                side_demo_data = getattr(self, f"demo_data_{side}")
+                side_idx = torch.minimum(cur_idx, side_demo_data["seq_len"] - 1)
+                env_idx = torch.arange(self.num_envs, device=self.device)
+                cur_wrist_pos = side_demo_data["wrist_pos"][env_idx, side_idx]
+                cur_mano_joint_pos = side_demo_data["mano_joints"][env_idx, side_idx].reshape(
+                    self.num_envs, -1, 3
+                )
                 cur_mano_joint_pos = torch.concat([cur_wrist_pos[:, None], cur_mano_joint_pos], dim=1)
                 for k in range(len(getattr(self, f"mano_joint_{side}_points"))):
                     getattr(self, f"mano_joint_{side}_points")[k][:, :3] = cur_mano_joint_pos[:, k]
+                dexhand_template = self.dexhand_rh if side == "rh" else self.dexhand_lh
                 for env_id, env_ptr in enumerate(self.envs):
-                    for rh_k, k in zip(
-                        self.dexhand_rh.body_names,
-                        (self.dexhand_rh.body_names if side == "rh" else self.dexhand_lh.body_names),
-                    ):
+                    for body_name in dexhand_template.body_names:
                         self.set_force_vis(
                             env_ptr,
-                            rh_k,
-                            torch.norm(self.net_cf[env_id, getattr(self, f"dexhand_{side}_handles")[k]], dim=-1) != 0,
+                            body_name,
+                            torch.norm(
+                                self.net_cf[
+                                    env_id,
+                                    getattr(self, f"dexhand_{side}_handles")[body_name],
+                                ],
+                                dim=-1,
+                            )
+                            != 0,
                             side,
                         )
 
                     def add_lines(viewer, env_ptr, hand_joints, color):
-                        assert hand_joints.shape[0] == self.dexhand_rh.n_bodies and hand_joints.shape[1] == 3
+                        assert hand_joints.shape[0] == dexhand_template.n_bodies and hand_joints.shape[1] == 3
                         hand_joints = hand_joints.cpu().numpy()
-                        lines = np.array([[hand_joints[b[0]], hand_joints[b[1]]] for b in self.dexhand_rh.bone_links])
+                        lines = np.array([[hand_joints[b[0]], hand_joints[b[1]]] for b in dexhand_template.bone_links])
                         for line in lines:
                             self.gym.add_lines(viewer, env_ptr, 1, line, color)
 
@@ -1733,6 +1825,21 @@ class DexHandManipBiHEnv(VecTask):
 
             set_side_joint(cur_idx, "lh")
             set_side_joint(cur_idx, "rh")
+
+            # Updating the acquired root-state tensor alone does not move an
+            # actor in Isaac Gym. Explicitly submit the visualization actors.
+            mano_joint_indices = torch.concat(
+                [
+                    self._global_mano_joint_lh_indices.flatten(),
+                    self._global_mano_joint_rh_indices.flatten(),
+                ]
+            )
+            self.gym.set_actor_root_state_tensor_indexed(
+                self.sim,
+                gymtorch.unwrap_tensor(self._root_state),
+                gymtorch.unwrap_tensor(mano_joint_indices),
+                len(mano_joint_indices),
+            )
 
         # ? <<< for visualization
         root_control_dim = 9 if self.use_pid_control else 6 #false so res is half
@@ -2000,7 +2107,7 @@ class DexHandManipBiHEnv(VecTask):
         self.gym.set_rigid_body_color(
             env_ptr,
             self.gym.find_actor_handle(env_ptr, "dexhand_l" if side == "lh" else "dexhand_r"),
-            getattr(self, f"dexhand_rh_handles")[part_k],  # tricks here, because the handle is the same
+            getattr(self, f"dexhand_{side}_handles")[part_k],
             gymapi.MESH_VISUAL,
             (
                 gymapi.Vec3(

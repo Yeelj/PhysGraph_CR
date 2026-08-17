@@ -12,6 +12,7 @@ import trimesh
 import torch
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
+from main.new_object_paths import object_asset_cache_key, replacement_object_for_side
 
 
 MODULE = runpy.run_path(
@@ -72,6 +73,41 @@ class SquaredChamfer:
 
 
 class ContactTrajectoryRetargetTest(unittest.TestCase):
+    def test_stage1_rejects_swapped_original_and_corrected_trajectories(self):
+        base_module = load_base_module_without_training_dependencies()
+        validate_source = base_module["_validate_retargeting_source"]
+        metadata = {"side": "right"}
+
+        self.assertEqual(
+            validate_source(metadata, "right.pkl", "contact_corrected"),
+            "contact_corrected",
+        )
+        self.assertEqual(validate_source(None, "left.pkl", "original"), "original")
+        with self.assertRaisesRegex(ValueError, "Expected contact_corrected"):
+            validate_source(None, "right.pkl", "contact_corrected")
+        with self.assertRaisesRegex(ValueError, "Expected original"):
+            validate_source(metadata, "left.pkl", "original")
+
+    def test_stage1_replacement_is_scoped_to_right_hand_tool(self):
+        self.assertEqual(replacement_object_for_side("spoon_01", "right"), "spoon_01")
+        self.assertEqual(replacement_object_for_side("spoon_01", "rh"), "spoon_01")
+        self.assertIsNone(replacement_object_for_side("spoon_01", "left"))
+        self.assertIsNone(replacement_object_for_side("spoon_01", "lh"))
+        with self.assertRaisesRegex(ValueError, "Unsupported hand side"):
+            replacement_object_for_side("spoon_01", "centre")
+
+    def test_isaac_asset_cache_separates_same_id_with_different_urdfs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            right_urdf = root / "tool.urdf"
+            left_urdf = root / "object.urdf"
+            right_urdf.write_text("<robot name='tool'/>", encoding="utf-8")
+            left_urdf.write_text("<robot name='object'/>", encoding="utf-8")
+            self.assertNotEqual(
+                object_asset_cache_key("shared-id", right_urdf),
+                object_asset_cache_key("shared-id", left_urdf),
+            )
+
     def test_semantic_mesh_precheck_requires_complete_red_black_coloring(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             mesh_path = Path(temp_dir) / "semantic.ply"

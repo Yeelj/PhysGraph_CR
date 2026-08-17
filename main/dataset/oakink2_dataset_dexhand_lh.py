@@ -18,9 +18,9 @@ from torch.utils.data import Dataset
 from typing import List
 from main.dataset.oakink2_layer.smplx import SMPLXLayer
 from main.dataset.transform import aa_to_rotmat, caculate_align_mat, rotmat_to_aa
-from main.new_object_paths import resolve_new_object_assets
+from main.new_object_paths import replacement_object_for_side
 from .base import ManipData
-from .oakink2_dataset_utils import load_obj_map, load_obj_mesh, as_mesh
+from .oakink2_dataset_utils import load_obj_map, as_mesh
 from .decorators import register_manipdata
 
 
@@ -77,7 +77,9 @@ class OakInk2DatasetDexHandLH(ManipData):
         self.smplx_faces_np = self.smplx_layer.body_upper_faces.detach().clone().cpu().numpy()
         self.smplx_body_upper_idx = self.smplx_layer.body_upper_vert_idx.detach().clone().cpu().numpy()
         self.smplx_layer = self.smplx_layer.to(self.device)
-        self.new_obj = new_obj
+        # ``new_obj`` is the right-hand tool replacement. The left hand must
+        # keep the original task object mesh, URDF and trajectory pairing.
+        self.new_obj = replacement_object_for_side(new_obj, "left")
         self.load_retargeted = load_retargeted
 
     @lru_cache(maxsize=None)
@@ -193,16 +195,10 @@ class OakInk2DatasetDexHandLH(ManipData):
         )
 
         obj_id = program_info_selected["obj_list_lh"][0]
-        replacement_assets = None
-        if self.new_obj is None:
-            obj_mesh = load_obj_map(
-                os.path.join(self.data_dir, "object_preview", "align_ds"), object_list
-            )
-            obj_mesh_trimesh, obj_mesh_path = obj_mesh[obj_id]
-        else:
-            replacement_assets = resolve_new_object_assets(self.new_obj)
-            obj_mesh_path = str(replacement_assets.mesh_path)
-            obj_mesh_trimesh = load_obj_mesh(obj_mesh_path)
+        obj_mesh = load_obj_map(
+            os.path.join(self.data_dir, "object_preview", "align_ds"), object_list
+        )
+        obj_mesh_trimesh, obj_mesh_path = obj_mesh[obj_id]
 
         mesh = Meshes(
             verts=torch.from_numpy(obj_mesh_trimesh.vertices[None, ...].astype(np.float32)),
@@ -222,15 +218,12 @@ class OakInk2DatasetDexHandLH(ManipData):
             "wrist_rot": wrist_rot,
             "mano_joints": mano_joints,
         }
-        if replacement_assets is not None:
-            data["obj_urdf_path"] = str(replacement_assets.urdf_path)
-        else:
-            obj_mesh_path_dir, obj_mesh_path_file = os.path.split(obj_mesh_path)
-            obj_urdf_path_dir = obj_mesh_path_dir.replace(
-                "/home/ps/data/ylj/ManipTrans/data/OakInk-v2/object_preview", "/home/ps/data/ylj/ManipTrans/data/OakInk-v2/coacd_object_preview"
-            )
-            obj_urdf_path_file = obj_mesh_path_file.replace(".obj", ".urdf").replace(".ply", ".urdf")
-            data["obj_urdf_path"] = os.path.join(obj_urdf_path_dir, obj_urdf_path_file)
+        obj_mesh_path_dir, obj_mesh_path_file = os.path.split(obj_mesh_path)
+        obj_urdf_path_dir = obj_mesh_path_dir.replace(
+            "/home/ps/data/ylj/ManipTrans/data/OakInk-v2/object_preview", "/home/ps/data/ylj/ManipTrans/data/OakInk-v2/coacd_object_preview"
+        )
+        obj_urdf_path_file = obj_mesh_path_file.replace(".obj", ".urdf").replace(".ply", ".urdf")
+        data["obj_urdf_path"] = os.path.join(obj_urdf_path_dir, obj_urdf_path_file)
 
         self.process_data(data, idx, rs_verts_obj)
 
@@ -243,7 +236,17 @@ class OakInk2DatasetDexHandLH(ManipData):
                 os.path.split(self.data_pathes[idx])[-1].replace(".pkl", f"@{stage}.pkl"),
             )
 
-            self.load_retargeted_data(data, opt_path)
+            if not os.path.exists(opt_path):
+                raise FileNotFoundError(
+                    "The left-hand Stage1 dataset requires the original retarget PKL. "
+                    f"Generate it under {RETARGETING_ROOT_LH} before training: {opt_path}"
+                )
+
+            self.load_retargeted_data(
+                data,
+                opt_path,
+                expected_kind="original",
+            )
 
         return data
 

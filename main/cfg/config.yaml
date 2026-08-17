@@ -30,8 +30,8 @@ usePIDControl: False
 
 dataIndices: [7]
 
-# Optional replacement object identifier under OakInk-v2/new_obj.  Null keeps
-# the original object_preview/coacd_object_preview asset paths.
+# Optional right-hand tool replacement under OakInk-v2/new_obj. Null keeps the
+# original tool; the left-hand task object always keeps its original assets.
 new_obj: null
 
 # seed - set to -1 to choose random seed

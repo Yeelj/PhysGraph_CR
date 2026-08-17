@@ -268,7 +268,11 @@ class OakInk2DatasetDexHandRH(ManipData):
                     f"Generate it under {RETARGETING_ROOT_RH} before training: {opt_path}"
                 )
 
-            self.load_retargeted_data(data, opt_path)
+            self.load_retargeted_data(
+                data,
+                opt_path,
+                expected_kind="contact_corrected",
+            )
 
         return data
 
