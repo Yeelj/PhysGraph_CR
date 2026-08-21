@@ -12,7 +12,7 @@ import torch
 from ...utils import torch_jit_utils as torch_jit_utils
 from bps_torch.bps import bps_torch
 from gym import spaces
-from isaacgym import gymapi, gymtorch
+from isaacgym import gymapi, gymtorch, gymutil
 from isaacgym.torch_utils import normalize_angle, quat_conjugate, quat_mul
 from copy import deepcopy
 import math
@@ -80,6 +80,20 @@ class DexHandManipBiHEnv(VecTask):
         self.training = self.cfg["env"]["training"]
         self.dexhand_rh = DexHandFactory.create_hand(self.cfg["env"]["dexhand"], "right")
         self.dexhand_lh = DexHandFactory.create_hand(self.cfg["env"]["dexhand"], "left")
+        self._mano_joint_marker_geometries = None
+        if not headless:
+            self._mano_joint_marker_geometries = {
+                side: [
+                    gymutil.WireframeSphereGeometry(
+                        radius=0.005,
+                        num_lats=4,
+                        num_lons=4,
+                        color=self._mano_joint_marker_color(dexhand.to_hand(body_name)[0]),
+                    )
+                    for body_name in dexhand.body_names
+                ]
+                for side, dexhand in (("rh", self.dexhand_rh), ("lh", self.dexhand_lh))
+            }
 
         self.use_pid_control = self.cfg["env"]["usePIDControl"]
         if self.use_pid_control:
@@ -481,7 +495,6 @@ class DexHandManipBiHEnv(VecTask):
                 + 1
                 + rh_sum_rigid_body_count
                 + lh_sum_rigid_body_count
-                + (0 + (0 + self.dexhand_lh.n_bodies * 2 if not self.headless else 0))
             )  # 1 for table
             max_agg_shapes = (
                 num_dexhand_rh_shapes
@@ -489,7 +502,6 @@ class DexHandManipBiHEnv(VecTask):
                 + 1
                 + rh_sum_rigid_shape_count
                 + lh_sum_rigid_shape_count
-                + (0 + (0 + self.dexhand_lh.n_bodies * 2 if not self.headless else 0))
                 + (1 if self._record else 0)
             )
 
@@ -671,19 +683,6 @@ class DexHandManipBiHEnv(VecTask):
         self._rh_base_state = self._root_state[:, 0, :]
         self._lh_base_state = self._root_state[:, 1, :]
 
-        # ? >>> for visualization
-        if not self.headless:
-
-            self.mano_joint_rh_points = [
-                self._root_state[:, self.gym.find_actor_handle(env_ptr, f"rh_mano_joint_{i}"), :]
-                for i in range(self.dexhand_rh.n_bodies)
-            ]
-            self.mano_joint_lh_points = [
-                self._root_state[:, self.gym.find_actor_handle(env_ptr, f"lh_mano_joint_{i}"), :]
-                for i in range(self.dexhand_lh.n_bodies)
-            ]
-        # ? <<<
-
         self._manip_obj_rh_handle = self.gym.find_actor_handle(env_ptr, "manip_obj_rh")
         self._manip_obj_rh_root_state = self._root_state[:, self._manip_obj_rh_handle, :]
         self._manip_obj_lh_handle = self.gym.find_actor_handle(env_ptr, "manip_obj_lh")
@@ -749,30 +748,6 @@ class DexHandManipBiHEnv(VecTask):
             dtype=torch.int32,
             device=self.sim_device,
         ).view(self.num_envs, -1)
-
-        if not self.headless:
-            self._global_mano_joint_rh_indices = torch.tensor(
-                [
-                    [
-                        self.gym.find_actor_index(env, f"rh_mano_joint_{i}", gymapi.DOMAIN_SIM)
-                        for i in range(self.dexhand_rh.n_bodies)
-                    ]
-                    for env in self.envs
-                ],
-                dtype=torch.int32,
-                device=self.sim_device,
-            )
-            self._global_mano_joint_lh_indices = torch.tensor(
-                [
-                    [
-                        self.gym.find_actor_index(env, f"lh_mano_joint_{i}", gymapi.DOMAIN_SIM)
-                        for i in range(self.dexhand_lh.n_bodies)
-                    ]
-                    for env in self.envs
-                ],
-                dtype=torch.int32,
-                device=self.sim_device,
-            )
 
         CONTACT_HISTORY_LEN = 3
         self.rh_tips_contact_history = torch.ones(self.num_envs, CONTACT_HISTORY_LEN, 5, device=self.device).bool()
@@ -996,43 +971,30 @@ class DexHandManipBiHEnv(VecTask):
             ][so_id + len(scene_objs)]
             self.gym.set_rigid_body_color(env_ptr, a, 0, gymapi.MESH_VISUAL, c)
 
-        # * just for visualization purposes, add a small sphere at the finger positions
-        if not self.headless:
-            dexhand_template = self.dexhand_rh if side == "rh" else self.dexhand_lh
-            for joint_vis_id, joint_name in enumerate(dexhand_template.body_names):
-                joint_name = dexhand_template.to_hand(joint_name)[0]
-                joint_point = self.gym.create_sphere(self.sim, 0.005, scene_asset_options)
-                a = self.gym.create_actor(
-                    env_ptr,
-                    joint_point,
-                    gymapi.Transform(),
-                    f"{side}_mano_joint_{joint_vis_id}",
-                    self.num_envs + 1,
-                    0b1,
-                )
-                if "index" in joint_name:
-                    inter_c = 70
-                elif "middle" in joint_name:
-                    inter_c = 130
-                elif "ring" in joint_name:
-                    inter_c = 190
-                elif "pinky" in joint_name:
-                    inter_c = 250
-                elif "thumb" in joint_name:
-                    inter_c = 10
-                else:
-                    inter_c = 0
-                if "tip" in joint_name:
-                    c = gymapi.Vec3(inter_c / 255, 200 / 255, 200 / 255)
-                elif "proximal" in joint_name:
-                    c = gymapi.Vec3(200 / 255, inter_c / 255, 200 / 255)
-                elif "intermediate" in joint_name:
-                    c = gymapi.Vec3(200 / 255, 200 / 255, inter_c / 255)
-                else:
-                    c = gymapi.Vec3(100 / 255, 150 / 255, 200 / 255)
-                self.gym.set_rigid_body_color(env_ptr, a, 0, gymapi.MESH_VISUAL, c)
-
         return obj_actor, obj_index
+
+    @staticmethod
+    def _mano_joint_marker_color(joint_name):
+        if "index" in joint_name:
+            inter_c = 70
+        elif "middle" in joint_name:
+            inter_c = 130
+        elif "ring" in joint_name:
+            inter_c = 190
+        elif "pinky" in joint_name:
+            inter_c = 250
+        elif "thumb" in joint_name:
+            inter_c = 10
+        else:
+            inter_c = 0
+
+        if "tip" in joint_name:
+            return inter_c / 255, 200 / 255, 200 / 255
+        if "proximal" in joint_name:
+            return 200 / 255, inter_c / 255, 200 / 255
+        if "intermediate" in joint_name:
+            return 200 / 255, 200 / 255, inter_c / 255
+        return 100 / 255, 150 / 255, 200 / 255
 
     @staticmethod
     def _gym_pose_from_matrix(transform):
@@ -1794,8 +1756,6 @@ class DexHandManipBiHEnv(VecTask):
                     self.num_envs, -1, 3
                 )
                 cur_mano_joint_pos = torch.concat([cur_wrist_pos[:, None], cur_mano_joint_pos], dim=1)
-                for k in range(len(getattr(self, f"mano_joint_{side}_points"))):
-                    getattr(self, f"mano_joint_{side}_points")[k][:, :3] = cur_mano_joint_pos[:, k]
                 dexhand_template = self.dexhand_rh if side == "rh" else self.dexhand_lh
                 for env_id, env_ptr in enumerate(self.envs):
                     for body_name in dexhand_template.body_names:
@@ -1821,25 +1781,24 @@ class DexHandManipBiHEnv(VecTask):
                             self.gym.add_lines(viewer, env_ptr, 1, line, color)
 
                     color = np.array([[0.0, 1.0, 0.0]], dtype=np.float32)
-                    add_lines(self.viewer, env_ptr, cur_mano_joint_pos[env_id].cpu(), color)
+                    hand_joints = cur_mano_joint_pos[env_id].cpu()
+                    add_lines(self.viewer, env_ptr, hand_joints, color)
+                    # draw colorjoint markers
+                    # for joint_pos, marker_geometry in zip(
+                    #     hand_joints.tolist(), self._mano_joint_marker_geometries[side]
+                    # ):
+                    #     marker_pose = gymapi.Transform()
+                    #     marker_pose.p = gymapi.Vec3(*joint_pos)
+                    #     gymutil.draw_lines(
+                    #         marker_geometry,
+                    #         self.gym,
+                    #         self.viewer,
+                    #         env_ptr,
+                    #         marker_pose,
+                    #     )
 
             set_side_joint(cur_idx, "lh")
             set_side_joint(cur_idx, "rh")
-
-            # Updating the acquired root-state tensor alone does not move an
-            # actor in Isaac Gym. Explicitly submit the visualization actors.
-            mano_joint_indices = torch.concat(
-                [
-                    self._global_mano_joint_lh_indices.flatten(),
-                    self._global_mano_joint_rh_indices.flatten(),
-                ]
-            )
-            self.gym.set_actor_root_state_tensor_indexed(
-                self.sim,
-                gymtorch.unwrap_tensor(self._root_state),
-                gymtorch.unwrap_tensor(mano_joint_indices),
-                len(mano_joint_indices),
-            )
 
         # ? <<< for visualization
         root_control_dim = 9 if self.use_pid_control else 6 #false so res is half

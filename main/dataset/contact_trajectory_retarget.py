@@ -2524,7 +2524,7 @@ def _add_common_geometry_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--min-red-link-ratio", type=float, default=0.1)
     parser.add_argument("--min-red-frame-ratio", type=float, default=0.8)
     # parser.add_argument("--max-black-violation-fraction", type=float, default=0.0)
-    parser.add_argument("--max-black-violation-fraction", type=float, default=5.002)
+    parser.add_argument("--max-black-violation-fraction", type=float, default=0.02)
     parser.add_argument("--max-optimization-frames", type=int, default=48)
     parser.add_argument("--report")
 

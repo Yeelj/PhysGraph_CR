@@ -411,8 +411,8 @@ def run_validation(request: Dict) -> Dict:
             finite
             and object_contact_ratio >= min_contact_ratio
             and intended_contact_ratio >= min_contact_ratio
-            and maximum_force <= max_force_limit
-            and maximum_overlap <= max_overlap_limit
+            and maximum_force <= max_force_limit # 控制接触力大小
+            and maximum_overlap <= max_overlap_limit 
         )
 
         return {
