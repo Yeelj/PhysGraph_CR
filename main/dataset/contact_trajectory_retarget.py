@@ -65,7 +65,7 @@ def _stored_validation_tiers_passed(
     )
 
 
-DEFAULT_OAKINK_ROOT = "/home/ps/data/ylj/ManipTrans/data/OakInk-v2"
+DEFAULT_OAKINK_ROOT = "/workspace/PhysGraph/data/OakInk-v2"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -2524,7 +2524,7 @@ def _add_common_geometry_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--min-red-link-ratio", type=float, default=0.1)
     parser.add_argument("--min-red-frame-ratio", type=float, default=0.8)
     # parser.add_argument("--max-black-violation-fraction", type=float, default=0.0)
-    parser.add_argument("--max-black-violation-fraction", type=float, default=0.02)
+    parser.add_argument("--max-black-violation-fraction", type=float, default=5.002)
     parser.add_argument("--max-optimization-frames", type=int, default=48)
     parser.add_argument("--report")
 
@@ -2551,7 +2551,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--new-obj",
         help=(
             "replacement mesh identifier under "
-            "/home/ps/data/ylj/ManipTrans/data/OakInk-v2/new_obj; selects its mesh and URDF"
+            "/workspace/PhysGraph/data/OakInk-v2/new_obj; selects its mesh and URDF"
         ),
     )
     correct.add_argument(

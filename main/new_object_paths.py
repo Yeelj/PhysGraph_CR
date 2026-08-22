@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional, Sequence, Tuple
 
 
-NEW_OBJECT_ROOT = Path("/home/ps/data/ylj/ManipTrans/data/OakInk-v2/new_obj")
+NEW_OBJECT_ROOT = Path("/workspace/PhysGraph/data/OakInk-v2/new_obj")
 MESH_SUFFIXES = (".ply", ".obj", ".stl")
 
 
