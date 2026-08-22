@@ -219,6 +219,16 @@ class DexHandManipBiHEnv(VecTask):
             high=np.inf,
             shape=(TARGET_OBS_DIM,),
         )
+        # Match ManoTopology order: RH bodies, LH bodies, Tool (RH object), Object (LH object).
+        num_phys_nodes = self.dexhand_rh.n_bodies + self.dexhand_lh.n_bodies + 2
+        self.obs_dict["phys_node_pos"] = torch.zeros(
+            (self.num_envs, num_phys_nodes, 3), device=self.device
+        )
+        obs_space["phys_node_pos"] = spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(num_phys_nodes, 3),
+        )
         if self.semantic_contact_enabled:
             self.obs_dict["semantic_contact"] = torch.zeros(
                 (self.num_envs, 5, SEMANTIC_FEATURE_DIM), device=self.device
@@ -1247,6 +1257,15 @@ class DexHandManipBiHEnv(VecTask):
         
         for k in obs_rh.keys():
             self.obs_dict[k] = torch.cat([obs_rh[k], obs_lh[k]], dim=-1)
+        self.obs_dict["phys_node_pos"] = torch.cat(
+            [
+                self.rh_states["joints_state"][:, :, :3],
+                self.lh_states["joints_state"][:, :, :3],
+                self.rh_states["manip_obj_pos"][:, None, :],
+                self.lh_states["manip_obj_pos"][:, None, :],
+            ],
+            dim=1,
+        )
         if self.semantic_contact_enabled:
             self._semantic_contact_cache = self._compute_semantic_contact()
             self.obs_dict["semantic_contact"] = self._semantic_contact_cache

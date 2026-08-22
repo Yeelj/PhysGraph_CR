@@ -173,7 +173,7 @@ class PhysicallyGroundedBias(nn.Module):
         self.edge_encoder = nn.Embedding(4, num_heads)
         nn.init.zeros_(self.spatial_bias.weight)
         nn.init.zeros_(self.edge_encoder.weight)
-        self.topo_bias_scale = nn.Parameter(torch.tensor(0.0))
+        self.topo_bias_scale = nn.Parameter(torch.tensor(1e-3))
         # Near-zero rather than exact zero keeps the legacy bias initially
         # negligible while allowing the zero-initialized edge embeddings to learn.
         self.edge_bias_scale = nn.Parameter(torch.tensor(1e-3))
@@ -657,7 +657,13 @@ class LATENT_ENCODER(nn.Module):
         )
         
         semantic_contact = obs.get("semantic_contact")
-        attn_bias_base = self.bias_gen(B, device, semantic_contact=semantic_contact)
+        x_pos = obs["phys_node_pos"]
+        attn_bias_base = self.bias_gen(
+            B,
+            device,
+            semantic_contact=semantic_contact,
+            x_pos=x_pos,
+        )
         # define mapping: 60 Physical Tokens -> 58 Graph Nodes
         # we duplicate Node 0 (RH Palm) and Node 28 (LH Palm)
         # sequence: [RH_Palm, RH_Curr, RH_Links..., LH_Palm, LH_Curr, LH_Links..., Tool, Obj]
