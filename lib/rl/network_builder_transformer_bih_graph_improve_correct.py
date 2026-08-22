@@ -678,6 +678,7 @@ class LATENT_ENCODER(nn.Module):
         contact_token_ids = torch.stack(
             [(idx_map == node).nonzero(as_tuple=False)[0, 0] + 1 for node in self.bias_gen.rh_contact_node_ids]
         )
+        # semantic - policy
         attn_bias = self.bias_gen.add_policy_semantic_bias(
             attn_bias, semantic_contact, contact_token_ids
         )
