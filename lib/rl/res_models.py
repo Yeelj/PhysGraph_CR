@@ -32,11 +32,24 @@ class ModelA2CContinuousLogStdBiH(BaseModel):
             return self
 
         def load_state_dict(self, state_dict, strict=True):
-            # Old Stage-1 checkpoints predate semantic relations. Inject only
-            # the new near-zero scale; every legacy key remains strict.
+            # Preserve strict loading for checkpoints created before semantic
+            # AdaLN-Zero. Newly introduced modules start from their current
+            # initialization (AdaLN projections are exactly zero initialized).
             state_dict = dict(state_dict)
+            compatible_new_key_fragments = (
+                "semantic_condition_encoder.",
+                ".semantic_adaln.",
+            )
             for name, value in self.state_dict().items():
-                if name.endswith("bias_gen.semantic_relation_scale") and name not in state_dict:
+                is_legacy_semantic_scale = name.endswith(
+                    "bias_gen.semantic_relation_scale"
+                )
+                is_semantic_adaln_parameter = any(
+                    fragment in name for fragment in compatible_new_key_fragments
+                )
+                if (
+                    is_legacy_semantic_scale or is_semantic_adaln_parameter
+                ) and name not in state_dict:
                     state_dict[name] = value
             return super().load_state_dict(state_dict, strict=strict)
 

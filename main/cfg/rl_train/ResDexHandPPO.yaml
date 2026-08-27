@@ -125,8 +125,8 @@ params:
     ppo: True
     mixed_precision: False
     normalize_input: True
-    # Keep bounded semantics and metric-space physical positions in their native scales.
-    normalize_input_excluded_keys: [semantic_contact, phys_node_pos]
+    # Keep bounded contacts/semantics and metric-space positions in their native scales.
+    normalize_input_excluded_keys: [physical_contact, semantic_contact, phys_node_pos]
     normalize_value: True
     use_pid_control: ${....usePIDControl}
     value_bootstrap: True

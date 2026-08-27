@@ -50,8 +50,127 @@ class CustomMultiheadAttention(nn.Module):
         return self.out_proj(out), None
 
 
+class SemanticConditionEncoder(nn.Module):
+    """Encode six uncompressed semantic relations for the five RH contact links."""
+
+    NUM_CONTACT_LINKS = 5
+    SEMANTIC_CONDITION_DIM = 6
+
+    def __init__(
+        self,
+        d_model: int,
+        finger_embedding_dim: int = 8,
+        hidden_dim: int = 32,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.finger_embedding = nn.Embedding(
+            self.NUM_CONTACT_LINKS, finger_embedding_dim
+        )
+        self.net = nn.Sequential(
+            nn.Linear(self.SEMANTIC_CONDITION_DIM + finger_embedding_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
+            nn.SiLU(),
+        )
+
+    @staticmethod
+    def build_relation_features(semantic_contact: torch.Tensor) -> torch.Tensor:
+        """Keep semantic relations separate; AdaLN applies curriculum once as its mask."""
+        curriculum = semantic_contact[:, :, CURRICULUM_WEIGHT]
+        expected = semantic_contact[:, :, EXPECTED_CONTACT]
+        return torch.stack(
+            [
+                expected,
+                expected * semantic_contact[:, :, RED_PROXIMITY],
+                semantic_contact[:, :, RED_CONTACT],
+                semantic_contact[:, :, BLACK_PROXIMITY],
+                semantic_contact[:, :, BLACK_VIOLATION],
+                curriculum,
+            ],
+            dim=-1,
+        )
+
+    def forward(self, semantic_contact: torch.Tensor) -> torch.Tensor:
+        if semantic_contact.ndim != 3:
+            raise ValueError(
+                "semantic_contact must have shape [batch, 5, feature_dim], "
+                f"got {tuple(semantic_contact.shape)}"
+            )
+        if semantic_contact.shape[1] != self.NUM_CONTACT_LINKS:
+            raise ValueError(
+                f"semantic_contact must describe {self.NUM_CONTACT_LINKS} contact links, "
+                f"got {semantic_contact.shape[1]}"
+            )
+        if semantic_contact.shape[2] <= CURRICULUM_WEIGHT:
+            raise ValueError(
+                "semantic_contact does not contain all required semantic channels"
+            )
+
+        relation_features = self.build_relation_features(semantic_contact)
+        finger_ids = torch.arange(
+            self.NUM_CONTACT_LINKS, device=semantic_contact.device
+        )
+        finger_embedding = self.finger_embedding(finger_ids).unsqueeze(0).expand(
+            semantic_contact.shape[0], -1, -1
+        )
+        return self.net(torch.cat([relation_features, finger_embedding], dim=-1))
+
+
+class SemanticAdaLNZero(nn.Module):
+    """Baseline-preserving AdaLN-Zero modulation for pre-attention tokens."""
+
+    def __init__(
+        self,
+        d_model: int,
+        gamma_max: float = 0.1,
+        beta_max: float = 0.1,
+        gate_max: float = 0.1,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.gamma_max = gamma_max
+        self.beta_max = beta_max
+        self.gate_max = gate_max
+        self.modulation = nn.Linear(d_model, 2 * d_model + 1)
+        nn.init.zeros_(self.modulation.weight)
+        nn.init.zeros_(self.modulation.bias)
+
+    def forward(
+        self,
+        normalized_tokens: torch.Tensor,
+        semantic_condition: torch.Tensor,
+        semantic_token_mask: torch.Tensor,
+    ):
+        modulation = self.modulation(semantic_condition)
+        delta_gamma, beta, delta_gate = torch.split(
+            modulation, [self.d_model, self.d_model, 1], dim=-1
+        )
+        delta_gamma = self.gamma_max * torch.tanh(delta_gamma)
+        beta = self.beta_max * torch.tanh(beta)
+        delta_gate = self.gate_max * torch.tanh(delta_gate)
+
+        # Explicit masking is required: after training, the projection bias must
+        # still be unable to modulate policy, palm, tool, object, or other links.
+        delta_gamma = delta_gamma * semantic_token_mask
+        beta = beta * semantic_token_mask
+        delta_gate = delta_gate * semantic_token_mask
+        conditioned_tokens = (1.0 + delta_gamma) * normalized_tokens + beta
+        return conditioned_tokens, 1.0 + delta_gate
+
+
 class TransformerLayer(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.0, activation="relu", layer_norm_eps=1e-5):
+    def __init__(
+        self,
+        d_model,
+        nhead,
+        dim_feedforward=2048,
+        dropout=0.0,
+        activation="relu",
+        layer_norm_eps=1e-5,
+        use_semantic_adaln=False,
+    ):
         super().__init__()
         self.self_attn = CustomMultiheadAttention(d_model, nhead, dropout=dropout)
 
@@ -63,16 +182,36 @@ class TransformerLayer(nn.Module):
         self.norm2 = nn.LayerNorm(d_model, eps=layer_norm_eps)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
+        self.semantic_adaln = (
+            SemanticAdaLNZero(d_model) if use_semantic_adaln else None
+        )
         
         self.activation = getattr(F, activation)
 
-    def forward(self, src, src_mask=None):
+    def forward(
+        self,
+        src,
+        src_mask=None,
+        semantic_condition=None,
+        semantic_token_mask=None,
+    ):
         # src: [Batch, SeqLen, D_model]
         # src_mask: [Batch * Heads, SeqLen, SeqLen] (The complex mask)
         
         # 1. Self Attention (Pre-Norm)
         src2 = self.norm1(src)
+        residual_gate = None
+        if self.semantic_adaln is not None and semantic_condition is not None:
+            if semantic_token_mask is None:
+                raise ValueError(
+                    "semantic_token_mask is required when semantic_condition is provided"
+                )
+            src2, residual_gate = self.semantic_adaln(
+                src2, semantic_condition, semantic_token_mask
+            )
         src2, _ = self.self_attn(src2, src2, src2, attn_mask=src_mask, need_weights=False)
+        if residual_gate is not None:
+            src2 = residual_gate * src2
         src = src + self.dropout1(src2)
         
         # 2. Feed Forward (Pre-Norm)
@@ -157,13 +296,10 @@ class ManoTopology(nn.Module):
         return degs
 
 class PhysicallyGroundedBias(nn.Module):
-    # Semantic relation channels. Original topology/anatomy/geometry and the
-    # legacy 4-way edge embedding remain separate additive sources.
-    EXPECTED_REL = 0
-    RED_PROXIMITY_REL = 1
-    RED_CONTACT_REL = 2
-    BLACK_PROXIMITY_REL = 3
-    BLACK_VIOLATION_REL = 4
+    # Semantic relations are intentionally excluded from attention logits in A1.
+    # They condition RH contact-link tokens through AdaLN-Zero instead.
+    TOOL_NODE_ID = 56
+    OBJECT_NODE_ID = 57
 
     def __init__(self, topo: ManoTopology, num_heads=8):
         super().__init__()
@@ -195,28 +331,41 @@ class PhysicallyGroundedBias(nn.Module):
         self.serial_scale = nn.Parameter(torch.tensor(0.0)) 
         self.synergy_scale = nn.Parameter(torch.tensor(0.0))
 
-        # Five new relation types are multi-hot and learnable. Near-zero scales
-        # preserve the old Stage-1 behavior while avoiding a dead semantic path.
-        # Start extremely close to the legacy policy while keeping the semantic
-        # path non-zero and trainable from the first optimizer step.
+        # Retain the legacy state-dict key so semantic-bias checkpoints remain
+        # loadable. This parameter is frozen and is not used by A1 attention.
         semantic_scale_init = torch.full((5, num_heads), 1e-3)
-        semantic_scale_init[self.BLACK_PROXIMITY_REL :] = -1e-3
-        self.semantic_relation_scale = nn.Parameter(semantic_scale_init)
-        semantic_head_mask = torch.zeros(5, num_heads)
-        red_heads = [h for h in (4, 5) if h < num_heads]
-        black_heads = [h for h in (6, 7) if h < num_heads]
-        semantic_head_mask[self.EXPECTED_REL, red_heads] = 1.0
-        semantic_head_mask[self.RED_PROXIMITY_REL, red_heads] = 1.0
-        semantic_head_mask[self.RED_CONTACT_REL, red_heads] = 1.0
-        semantic_head_mask[self.BLACK_PROXIMITY_REL, black_heads] = 1.0
-        semantic_head_mask[self.BLACK_VIOLATION_REL, black_heads] = 1.0
-        self.register_buffer("semantic_head_mask", semantic_head_mask, persistent=False)
+        semantic_scale_init[3:] = -1e-3
+        self.semantic_relation_scale = nn.Parameter(
+            semantic_scale_init, requires_grad=False
+        )
 
         # Dataset/contact-body order: thumb, index, middle, ring, pinky.
         self.register_buffer(
             "rh_contact_node_ids",
             torch.tensor([26, 4, 9, 19, 14], dtype=torch.long),
             persistent=False,
+        )
+        self.register_buffer(
+            "lh_contact_node_ids",
+            torch.tensor([54, 32, 37, 47, 42], dtype=torch.long),
+            persistent=False,
+        )
+
+        # Restrict the generic geometric bias to the physically relevant,
+        # side-specific contact pairs. The mask is symmetric because attention
+        # is allowed in both query directions:
+        #   RH contact links <-> tool, LH contact links <-> object.
+        geometric_pair_mask = torch.zeros(
+            self.topo.num_phys_nodes,
+            self.topo.num_phys_nodes,
+            dtype=torch.float32,
+        )
+        geometric_pair_mask[self.rh_contact_node_ids, self.TOOL_NODE_ID] = 1.0
+        geometric_pair_mask[self.TOOL_NODE_ID, self.rh_contact_node_ids] = 1.0
+        geometric_pair_mask[self.lh_contact_node_ids, self.OBJECT_NODE_ID] = 1.0
+        geometric_pair_mask[self.OBJECT_NODE_ID, self.lh_contact_node_ids] = 1.0
+        self.register_buffer(
+            "geometric_pair_mask", geometric_pair_mask, persistent=False
         )
 
         # --- SPEED OPTIMIZATION: Pre-calculate indices ---
@@ -239,28 +388,14 @@ class PhysicallyGroundedBias(nn.Module):
         static_edge_relations[range(N), range(N), 3] = 1.0
         self.register_buffer("static_edge_relations", static_edge_relations, persistent=False)
 
-    def _semantic_relation_values(self, semantic_strengths):
-        relation_weights = 2.0 * torch.tanh(self.semantic_relation_scale) * self.semantic_head_mask
-        raw_bias = torch.einsum("bir,rh->bhi", semantic_strengths, relation_weights)
-        # Several relations on one node pair remain present and additive, while
-        # their combined semantic contribution is bounded to [-2, 2].
-        return 2.0 * torch.tanh(raw_bias / 2.0)
-
-    def _semantic_strengths(self, semantic_contact):
-        curriculum = semantic_contact[:, :, CURRICULUM_WEIGHT]
-        return torch.stack(
-            [
-                curriculum * semantic_contact[:, :, EXPECTED_CONTACT],
-                curriculum * semantic_contact[:, :, EXPECTED_CONTACT]
-                * semantic_contact[:, :, RED_PROXIMITY],
-                curriculum * semantic_contact[:, :, RED_CONTACT],
-                curriculum * semantic_contact[:, :, BLACK_PROXIMITY],
-                curriculum * semantic_contact[:, :, BLACK_VIOLATION],
-            ],
-            dim=-1,
-        )
-
-    def forward(self, B, device, semantic_contact=None, x_pos=None):
+    def forward(
+        self,
+        B,
+        device,
+        semantic_contact=None,
+        x_pos=None,
+        physical_contact=None,
+    ):
         # 1. Topological Bias
         topo_bias = self.topo_bias_scale*self.spatial_bias(self.topo.dist_mat).permute(2,0,1).unsqueeze(0)
 
@@ -269,32 +404,32 @@ class PhysicallyGroundedBias(nn.Module):
             "ijr,rh->hij", self.static_edge_relations, self.edge_encoder.weight
         ).unsqueeze(0)
         soft_bias = topo_bias + self.edge_bias_scale * static_edge_bias
-        if semantic_contact is not None:
-            contact = semantic_contact[:, :, ACTUAL_CONTACT]
-            nodes = self.rh_contact_node_ids
-            tool_node = 56
+        nodes = self.rh_contact_node_ids
+        tool_node = self.TOOL_NODE_ID
+        # Backward-compatible fallback for observations created before the
+        # standalone physical_contact field was introduced.
+        if physical_contact is None and semantic_contact is not None:
+            physical_contact = semantic_contact[:, :, ACTUAL_CONTACT]
+        if physical_contact is not None:
             # For a soft physical edge, interpolate only its legacy NONE/PHYSICAL
-            # channel while all other relations remain additive and untouched.
-            physical_delta = contact[:, None, :] * (
+            # channel. This path is independent of semanticContact.enabled.
+            physical_delta = physical_contact[:, None, :] * (
                 self.edge_encoder.weight[2] - self.edge_encoder.weight[0]
             ).reshape(1, -1, 1)
             soft_bias = soft_bias.expand(B, -1, -1, -1).clone()
             soft_bias[:, :, nodes, tool_node] += self.edge_bias_scale * physical_delta
             soft_bias[:, :, tool_node, nodes] += self.edge_bias_scale * physical_delta
-
-            strengths = self._semantic_strengths(semantic_contact)
-            semantic_values = self._semantic_relation_values(strengths)
-            soft_bias[:, :, nodes, tool_node] += semantic_values
-            soft_bias[:, :, tool_node, nodes] += semantic_values
         else:
             soft_bias = soft_bias.expand(B, -1, -1, -1)
 
-        # 3. Geometric Bias
+        # 3. Sparse geometric bias. A1 preserves its original all-head use.
         if x_pos is not None:
             dists = torch.cdist(x_pos, x_pos)
-            geo = self.w_geo(torch.exp(-dists**2/(2*self.sigma**2)).unsqueeze(-1)).permute(0,3,1,2)
-            far_mask = (self.topo.dist_mat > 2).float().unsqueeze(0).unsqueeze(0)
-            soft_bias = soft_bias + self.geo_bias_scale*(geo * far_mask)
+            sigma_sq = self.sigma.square().clamp_min(1e-8)
+            geo_affinity = torch.exp(-dists.square() / (2.0 * sigma_sq))
+            geo = self.w_geo(geo_affinity.unsqueeze(-1)).permute(0, 3, 1, 2)
+            geo_pair_mask = self.geometric_pair_mask.unsqueeze(0).unsqueeze(0)
+            soft_bias = soft_bias + self.geo_bias_scale * (geo * geo_pair_mask)
         
         
         # 4. Anatomical Masks
@@ -311,16 +446,6 @@ class PhysicallyGroundedBias(nn.Module):
         for h in self.synergy_heads:
             soft_bias[:, h] = soft_bias[:, h] + (self.synergy_scale * is_synergy_valid)
         return soft_bias
-
-    def add_policy_semantic_bias(self, attn_bias, semantic_contact, contact_token_ids):
-        """Add the same semantic relations between contact links and policy token."""
-        if semantic_contact is None:
-            return attn_bias
-        strengths = self._semantic_strengths(semantic_contact)
-        values = self._semantic_relation_values(strengths)
-        attn_bias[:, :, contact_token_ids, 0] += values
-        attn_bias[:, :, 0, contact_token_ids] += values
-        return attn_bias
 
 class MLP_new(nn.Module):
     def __init__(self, in_dim: int):
@@ -402,6 +527,7 @@ class LATENT_ENCODER(nn.Module):
 
         self.d_model = d_model
         self.action_dim = action_dim
+        self.num_global_layers = num_global_layers
 
         self.rlink_tokenizer = MLP_new(243)
         self.llink_tokenizer = MLP_new(243)
@@ -439,6 +565,27 @@ class LATENT_ENCODER(nn.Module):
 
         self.topo = ManoTopology()
         self.bias_gen = PhysicallyGroundedBias(self.topo, num_heads)
+        self.semantic_condition_encoder = SemanticConditionEncoder(d_model=d_model)
+
+        physical_token_node_ids = torch.cat([
+            torch.tensor([0, 0]),                    # RH Palm & Curr -> Node 0
+            torch.arange(1, 28),                     # RH Links
+            torch.tensor([28, 28]),                  # LH Palm & Curr -> Node 28
+            torch.arange(29, 56),                    # LH Links
+            torch.tensor([56, 57]),                  # Tool, Obj
+        ])
+        self.register_buffer(
+            "physical_token_node_ids", physical_token_node_ids, persistent=False
+        )
+        rh_contact_token_ids = torch.stack(
+            [
+                (physical_token_node_ids == node).nonzero(as_tuple=False)[0, 0] + 1
+                for node in self.bias_gen.rh_contact_node_ids
+            ]
+        )
+        self.register_buffer(
+            "rh_contact_token_ids", rh_contact_token_ids, persistent=False
+        )
 
         self.layers = nn.ModuleList([
             TransformerLayer(
@@ -446,11 +593,35 @@ class LATENT_ENCODER(nn.Module):
                 nhead=num_heads, 
                 dim_feedforward=512, 
                 dropout=0.0,
-                activation="relu"
+                activation="relu",
+                use_semantic_adaln=layer_idx >= max(0, num_global_layers - 2),
             )
-            for _ in range(4) # num_global_layers
+            for layer_idx in range(num_global_layers)
         ])
         self.final_norm = nn.LayerNorm(d_model)
+
+    def build_semantic_token_condition(
+        self,
+        semantic_contact: torch.Tensor,
+        tokens: torch.Tensor,
+    ):
+        """Scatter five per-finger conditions onto only the RH contact tokens."""
+        if semantic_contact is None:
+            return None, None
+
+        finger_condition = self.semantic_condition_encoder(semantic_contact)
+        finger_condition = finger_condition.to(dtype=tokens.dtype)
+        token_condition = tokens.new_zeros(tokens.shape)
+        token_condition = token_condition.index_copy(
+            1, self.rh_contact_token_ids, finger_condition
+        )
+        token_mask = tokens.new_zeros(tokens.shape[0], tokens.shape[1], 1)
+        curriculum_mask = semantic_contact[:, :, CURRICULUM_WEIGHT].unsqueeze(-1)
+        curriculum_mask = curriculum_mask.to(dtype=tokens.dtype)
+        token_mask = token_mask.index_copy(
+            1, self.rh_contact_token_ids, curriculum_mask
+        )
+        return token_condition, token_mask
 
     # type+side embeddings and token builders
     def add_type_side_emb(self, x: torch.Tensor, type_id: int, side_id: int) -> torch.Tensor:
@@ -657,37 +828,23 @@ class LATENT_ENCODER(nn.Module):
         )
         
         semantic_contact = obs.get("semantic_contact")
+        physical_contact = obs.get("physical_contact")
         x_pos = obs["phys_node_pos"]
         attn_bias_base = self.bias_gen(
             B,
             device,
             semantic_contact=semantic_contact,
+            physical_contact=physical_contact,
             x_pos=x_pos,
         )
         # define mapping: 60 Physical Tokens -> 58 Graph Nodes
         # we duplicate Node 0 (RH Palm) and Node 28 (LH Palm)
         # sequence: [RH_Palm, RH_Curr, RH_Links..., LH_Palm, LH_Curr, LH_Links..., Tool, Obj]
-        idx_map = torch.cat([
-            torch.tensor([0, 0], device=device),           # RH Palm & Curr -> Node 0
-            torch.arange(1, 28, device=device),            # RH Links
-            torch.tensor([28, 28], device=device),         # LH Palm & Curr -> Node 28
-            torch.arange(29, 56, device=device),           # LH Links
-            torch.tensor([56, 57], device=device)          # Tool, Obj
-        ]) # Shape: [60]
+        idx_map = self.physical_token_node_ids
         # 3. Expand the Bias Matrix [B, H, 60, 60]
         # duplicate the rows/cols for the palms/wrists so they share the same bias
         attn_bias = attn_bias_base[:, :, idx_map, :][:, :, :, idx_map]
         attn_bias = F.pad(attn_bias, (1,0, 1,0), value=0.0).to(device)
-
-        # Locate each RH contact graph node in the actual token sequence. The
-        # +1 accounts for the policy token prepended above.
-        contact_token_ids = torch.stack(
-            [(idx_map == node).nonzero(as_tuple=False)[0, 0] + 1 for node in self.bias_gen.rh_contact_node_ids]
-        )
-        # semantic - policy
-        attn_bias = self.bias_gen.add_policy_semantic_bias(
-            attn_bias, semantic_contact, contact_token_ids
-        )
 
         deg_base = self.topo.centrality.to(device)
         # Expand degrees to match the 60 tokens
@@ -698,8 +855,16 @@ class LATENT_ENCODER(nn.Module):
         attn_bias[:, :, 0, 1:] += self.bias_gen.cls_centrality_scale * b
         attn_bias[:, :, 1:, 0] += self.bias_gen.cls_centrality_scale * b
 
+        semantic_condition, semantic_token_mask = self.build_semantic_token_condition(
+            semantic_contact, tokens
+        )
         for layer in self.layers:
-            tokens = layer(tokens, src_mask=attn_bias)
+            tokens = layer(
+                tokens,
+                src_mask=attn_bias,
+                semantic_condition=semantic_condition,
+                semantic_token_mask=semantic_token_mask,
+            )
         tokens = self.final_norm(tokens)
 
         # 6) Read policy token -> action/value

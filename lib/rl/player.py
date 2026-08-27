@@ -646,6 +646,7 @@ class MyPPOPlayerContinuous(MyBasePlayer):
                 checkpoint['model'].pop(k)'''
             #print("checkpoint['model']", checkpoint['model'].keys())
             self.model.load_state_dict(checkpoint["model"])
+            # self.model.load_state_dict(checkpoint["model"], strict=False)
             if self.normalize_input and "running_mean_std" in checkpoint:
                 self.model.running_mean_std.load_state_dict(checkpoint["running_mean_std"])
 

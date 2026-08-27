@@ -42,11 +42,13 @@ env:
   tightenFactor: 0.7 # 1.0 means no tightening restriction
   tightenSteps: 3200
 
-  # Stage-1 red/black semantic contact. The first 30% remains
-  # imitation-dominant (0--5% pure imitation, 5--30% semantic 0->0.25).
+  # Stage-1 red/black semantic contact. Dynamic physical edges remain enabled
+  # independently. The first 30% remains imitation-dominant
+  # (0--5% pure imitation, 5--30% semantic 0->0.25).
   semanticContact:
     enabled: True
     curriculumSteps: 320000
+    # These two thresholds also parameterize the always-on physical_contact signal.
     forceCenter: 1.0
     forceSmooth: 0.25
     forceNormalizer: 10.0

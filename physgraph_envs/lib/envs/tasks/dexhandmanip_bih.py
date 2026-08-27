@@ -121,6 +121,8 @@ class DexHandManipBiHEnv(VecTask):
         self.lh_states = {}
         self.dexhand_rh_handles = {}  # will be dict mapping names to relevant sim handles
         self.dexhand_lh_handles = {}  # will be dict mapping names to relevant sim handles
+        self.dexhand_rh_body_indices = {}  # actor-relative indices used by rendering APIs
+        self.dexhand_lh_body_indices = {}  # actor-relative indices used by rendering APIs
         self.objs_handles = {}  # for obj handlers
         self.objs_assets = {}
         self.num_dofs = None  # Total number of DOFs per env
@@ -228,6 +230,15 @@ class DexHandManipBiHEnv(VecTask):
             low=-np.inf,
             high=np.inf,
             shape=(num_phys_nodes, 3),
+        )
+        # Dynamic physical edges are independent of semanticContact.enabled.
+        self.obs_dict["physical_contact"] = torch.zeros(
+            (self.num_envs, 5), device=self.device
+        )
+        obs_space["physical_contact"] = spaces.Box(
+            low=0.0,
+            high=1.0,
+            shape=(5,),
         )
         if self.semantic_contact_enabled:
             self.obs_dict["semantic_contact"] = torch.zeros(
@@ -669,6 +680,10 @@ class DexHandManipBiHEnv(VecTask):
         self.dexhand_lh_handles = {
             k: self.gym.find_actor_rigid_body_handle(env_ptr, dexhand_lh_handle, k) for k in self.dexhand_lh.body_names
         }
+        # Tensor access uses environment-relative rigid-body handles above, while
+        # set_rigid_body_color expects an index relative to the selected actor.
+        self.dexhand_rh_body_indices = self.gym.get_actor_rigid_body_dict(env_ptr, dexhand_rh_handle)
+        self.dexhand_lh_body_indices = self.gym.get_actor_rigid_body_dict(env_ptr, dexhand_lh_handle)
         self.dexhand_rh_cf_weights = {
             k: (1.0 if ("intermediate" in k or "distal" in k) else 0.0) for k in self.dexhand_rh.body_names
         }
@@ -1266,8 +1281,13 @@ class DexHandManipBiHEnv(VecTask):
             ],
             dim=1,
         )
+        physical_contact, force_magnitude = self._compute_physical_contact()
+        self.obs_dict["physical_contact"] = physical_contact
         if self.semantic_contact_enabled:
-            self._semantic_contact_cache = self._compute_semantic_contact()
+            self._semantic_contact_cache = self._compute_semantic_contact(
+                actual_contact=physical_contact,
+                force_magnitude=force_magnitude,
+            )
             self.obs_dict["semantic_contact"] = self._semantic_contact_cache
 
     def _semantic_curriculum(self):
@@ -1276,21 +1296,14 @@ class DexHandManipBiHEnv(VecTask):
         control_step = float(self.total_train_env_frames) / float(max(self.num_envs, 1))
         return semantic_curriculum_weight(control_step, self.semantic_curriculum_steps).to(self.device)
 
-    def _compute_semantic_contact(self):
-        """Build five per-contact-link features from live physics and corrected demo data."""
+    def _compute_physical_contact(self):
+        """Build the five live contact strengths used by dynamic physical edges."""
         if len(self.dexhand_rh.contact_body_names) != 5:
             raise RuntimeError(
-                "Red/black semantic contact currently requires exactly five ordered contact bodies, got "
+                "Dynamic physical contact requires exactly five ordered contact bodies, got "
                 f"{self.dexhand_rh.contact_body_names}"
             )
 
-        contact_positions = torch.stack(
-            [
-                self._rigid_body_state[:, self.dexhand_rh_handles[name], :3]
-                for name in self.dexhand_rh.contact_body_names
-            ],
-            dim=1,
-        )
         force_magnitude = torch.stack(
             [
                 torch.linalg.vector_norm(self.net_cf[:, self.dexhand_rh_handles[name], :], dim=-1)
@@ -1300,6 +1313,20 @@ class DexHandManipBiHEnv(VecTask):
         )
         actual_contact = torch.sigmoid(
             (force_magnitude - self.semantic_force_center) / self.semantic_force_smooth
+        )
+        return actual_contact, force_magnitude
+
+    def _compute_semantic_contact(self, actual_contact=None, force_magnitude=None):
+        """Build five per-contact-link features from live physics and corrected demo data."""
+        if actual_contact is None or force_magnitude is None:
+            actual_contact, force_magnitude = self._compute_physical_contact()
+
+        contact_positions = torch.stack(
+            [
+                self._rigid_body_state[:, self.dexhand_rh_handles[name], :3]
+                for name in self.dexhand_rh.contact_body_names
+            ],
+            dim=1,
         )
 
         red_local = self.demo_data_rh["tool_red_points"] * self.demo_data_rh[
@@ -2085,7 +2112,7 @@ class DexHandManipBiHEnv(VecTask):
         self.gym.set_rigid_body_color(
             env_ptr,
             self.gym.find_actor_handle(env_ptr, "dexhand_l" if side == "lh" else "dexhand_r"),
-            getattr(self, f"dexhand_{side}_handles")[part_k],
+            getattr(self, f"dexhand_{side}_body_indices")[part_k],
             gymapi.MESH_VISUAL,
             (
                 gymapi.Vec3(
