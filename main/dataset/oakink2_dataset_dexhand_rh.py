@@ -2,6 +2,7 @@ import json
 import os
 import pickle
 from functools import lru_cache
+from pathlib import Path
 
 import numpy as np
 import smplx
@@ -19,6 +20,7 @@ from typing import List
 from main.dataset.oakink2_layer.smplx import SMPLXLayer
 from main.dataset.transform import aa_to_rotmat, caculate_align_mat, rotmat_to_aa
 from main.new_object_paths import resolve_new_object_assets
+from main.contact_retarget_memory import right_hand_retarget_path
 from .base import ManipData
 from .oakink2_dataset_utils import (
     extract_red_black_regions,
@@ -30,8 +32,11 @@ from .oakink2_dataset_utils import (
 from .decorators import register_manipdata
 
 
-RETARGETING_ROOT_RH = os.path.abspath(
+RETARGETING_ROOT_CORRECTED_RH = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "data", "retargeting_contact")
+)
+RETARGETING_ROOT_ORIGINAL_RH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "data", "retargeting")
 )
 
 
@@ -48,6 +53,7 @@ class OakInk2DatasetDexHandRH(ManipData):
         max_seq_len=int(1e10),
         dexhand=None,
         new_obj=None,
+        correct=False,
         load_retargeted=True,
         **kwargs,
     ):
@@ -84,6 +90,7 @@ class OakInk2DatasetDexHandRH(ManipData):
         self.smplx_body_upper_idx = self.smplx_layer.body_upper_vert_idx.detach().clone().cpu().numpy()
         self.smplx_layer = self.smplx_layer.to(self.device)
         self.new_obj = new_obj
+        self.correct = bool(correct)
         self.load_retargeted = load_retargeted
 
     @lru_cache(maxsize=None)
@@ -254,24 +261,29 @@ class OakInk2DatasetDexHandRH(ManipData):
         self.process_data(data, idx, rs_verts_obj)
 
         if self.load_retargeted:
-            opt_inspire_path = os.path.join(
-                RETARGETING_ROOT_RH, "OakInk-v2", f"mano2{str(self.dexhand)}"
+            hand_directory = f"mano2{str(self.dexhand)}"
+            filename = os.path.split(self.data_pathes[idx])[-1].replace(
+                ".pkl", f"@{stage}.pkl"
             )
-            opt_path = os.path.join(
-                opt_inspire_path,
-                os.path.split(self.data_pathes[idx])[-1].replace(".pkl", f"@{stage}.pkl"),
+            opt_path, expected_kind = right_hand_retarget_path(
+                Path(RETARGETING_ROOT_ORIGINAL_RH),
+                Path(RETARGETING_ROOT_CORRECTED_RH),
+                hand_directory,
+                f"{index[0]}@{stage}",
+                self.new_obj,
+                filename,
+                correct=self.correct,
             )
 
-            if not os.path.exists(opt_path):
+            if not opt_path.exists():
                 raise FileNotFoundError(
-                    "The right-hand Stage1 dataset requires a geometrically corrected retarget PKL. "
-                    f"Generate it under {RETARGETING_ROOT_RH} before training: {opt_path}"
+                    f"The right-hand Stage1 dataset requires a {expected_kind} retarget PKL: {opt_path}"
                 )
 
             self.load_retargeted_data(
                 data,
-                opt_path,
-                expected_kind="contact_corrected",
+                str(opt_path),
+                expected_kind=expected_kind,
             )
 
         return data

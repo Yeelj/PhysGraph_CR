@@ -439,6 +439,7 @@ class ContactTrajectoryRetargetTest(unittest.TestCase):
             ]
         )
         self.assertFalse(args.overwrite)
+        self.assertFalse(args.bank)
         self.assertEqual(args.new_obj, "spoon_01")
         self.assertEqual(args.translation_mode, "contact-translation")
         self.assertFalse(hasattr(args, "max_residual_rotation_deg"))
@@ -451,6 +452,18 @@ class ContactTrajectoryRetargetTest(unittest.TestCase):
             ["correct", "--data-idx", "9fc3e@0", "--physx", "--headless"]
         )
         self.assertTrue(physx_args.physx)
+
+        bank_args = MODULE["build_parser"]().parse_args(
+            [
+                "correct",
+                "--data-idx",
+                "9fc3e@0",
+                "--new-obj",
+                "kni@1",
+                "--bank",
+            ]
+        )
+        self.assertTrue(bank_args.bank)
 
     def test_optional_physx_is_not_part_of_configured_acceptance_gate(self):
         tiers = {

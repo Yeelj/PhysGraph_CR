@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Tuple
 
 
 NEW_OBJECT_ROOT = Path("/workspace/PhysGraph/data/OakInk-v2/new_obj")
@@ -107,24 +107,3 @@ def resolve_new_object_assets(
         mesh_path=meshes[0].resolve(),
         urdf_path=urdfs[0].resolve(),
     )
-
-
-def normalize_new_obj_cli_args(argv: Sequence[str]) -> list:
-    """Translate ``--new-obj VALUE`` into Hydra's ``new_obj=VALUE`` form."""
-
-    result = []
-    index = 0
-    while index < len(argv):
-        argument = argv[index]
-        if argument == "--new-obj":
-            if index + 1 >= len(argv) or argv[index + 1].startswith("--"):
-                raise SystemExit("--new-obj requires an asset identifier")
-            result.append(f"new_obj={argv[index + 1]}")
-            index += 2
-            continue
-        if argument.startswith("--new-obj="):
-            result.append(f"new_obj={argument.split('=', 1)[1]}")
-        else:
-            result.append(argument)
-        index += 1
-    return result

@@ -309,7 +309,8 @@ class PhysicallyGroundedBias(nn.Module):
         self.edge_encoder = nn.Embedding(4, num_heads)
         nn.init.zeros_(self.spatial_bias.weight)
         nn.init.zeros_(self.edge_encoder.weight)
-        self.topo_bias_scale = nn.Parameter(torch.tensor(1e-3))
+        # self.topo_bias_scale = nn.Parameter(torch.tensor(1e-3))
+        self.topo_bias_scale = nn.Parameter(torch.tensor(0.0))
         # Near-zero rather than exact zero keeps the legacy bias initially
         # negligible while allowing the zero-initialized edge embeddings to learn.
         self.edge_bias_scale = nn.Parameter(torch.tensor(1e-3))

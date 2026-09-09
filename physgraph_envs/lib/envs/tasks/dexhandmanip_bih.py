@@ -130,6 +130,9 @@ class DexHandManipBiHEnv(VecTask):
 
         self.dataIndices = self.cfg["env"]["dataIndices"]
         self.new_obj = self.cfg["env"].get("newObj", None)
+        self.correct = bool(self.cfg["env"].get("correct", False))
+        if self.correct and self.new_obj is None:
+            raise ValueError("correct=true requires new_obj to select the right-hand corrected PKL")
         self.obs_future_length = self.cfg["env"]["obsFutureLength"]
         self.rollout_state_init = self.cfg["env"]["rolloutStateInit"]
         self.random_state_init = self.cfg["env"]["randomStateInit"]
@@ -355,6 +358,7 @@ class DexHandManipBiHEnv(VecTask):
                 dexhand=self.dexhand_rh,
                 embodiment=self.cfg["env"]["dexhand"],
                 new_obj=replacement_object_for_side(self.new_obj, "right"),
+                correct=self.correct,
             )
 
         
@@ -620,7 +624,10 @@ class DexHandManipBiHEnv(VecTask):
     def _validate_bimanual_training_sources(self):
         """Guarantee the Stage-1 hand trajectories and assets cannot cross sides."""
 
-        expected_kinds = {"rh": "contact_corrected", "lh": "original"}
+        expected_kinds = {
+            "rh": "contact_corrected" if self.correct else "original",
+            "lh": "original",
+        }
         for side, expected_kind in expected_kinds.items():
             side_data = getattr(self, f"demo_data_{side}")
             kinds = side_data.get("retargeting_kind")

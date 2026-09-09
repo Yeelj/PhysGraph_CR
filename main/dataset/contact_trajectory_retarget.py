@@ -2,9 +2,9 @@
 
 This module deliberately runs before Stage 1.  It keeps wrist orientation and
 all finger DOFs unchanged, maps the old red-region center to the new one, and
-locally refines only a tool-local translation.  Corrected PKLs mirror
-``data/retargeting`` below
-``data/retargeting_contact`` and remain compatible with ``load_retargeted_data``.
+locally refines only a tool-local translation.  Corrected right-hand PKLs are
+stored by data id and replacement-tool name below ``data/retargeting_contact``
+and remain compatible with ``load_retargeted_data``.
 
 The optimizer itself has no Isaac Gym dependency.  Hand collision surfaces and
 forward kinematics are reconstructed directly from the dex-hand URDF.  After
@@ -71,6 +71,18 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from main.new_object_paths import resolve_new_object_assets
+from main.contact_retarget_memory import (
+    bank_sequence_dir,
+    build_mesh_descriptor,
+    corrected_retarget_path,
+    load_ranked_entries,
+    require_compatible_sequence,
+    stable_mapping_hash,
+    write_memory_entry,
+)
+
+
+DEFAULT_BANK_ROOT = PROJECT_ROOT / "data" / "retargeting_bank" / "OakInk-v2"
 
 
 def _log(message: str) -> None:
@@ -1810,6 +1822,14 @@ def _write_preview(
 
 def run_correction(args: argparse.Namespace) -> Dict[str, object]:
     _log(f"开始修正 data_idx={args.data_idx}, dexhand={args.dexhand}, side={args.side}")
+    if args.side != "right":
+        raise ValueError("Contact trajectory correction and its memory bank are right-hand only")
+    if args.new_obj is None:
+        raise ValueError("Right-hand contact correction requires --new-obj to name the target tool")
+    if args.bank and args.translation_mode != "contact-translation":
+        raise ValueError("--bank currently requires --translation-mode contact-translation")
+    if args.bank and args.output_pkl:
+        raise ValueError("--bank cannot be combined with --output-pkl; use the canonical bank-backed path")
     if args.physx and not args.headless and not os.environ.get("DISPLAY"):
         raise RuntimeError(
             "Isaac Gym Viewer was requested because --headless was omitted, but DISPLAY is empty. "
@@ -1823,7 +1843,13 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
     output_path = (
         Path(args.output_pkl).resolve()
         if args.output_pkl
-        else mirror_retarget_output_path(input_path, output_root)
+        else corrected_retarget_path(
+            output_root,
+            input_path.parent.name,
+            args.data_idx,
+            args.new_obj,
+            input_path.name,
+        )
     )
     if output_path == input_path:
         raise ValueError("Corrected output must not overwrite the source retarget PKL")
@@ -1897,6 +1923,20 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         max_shift=args.max_shift,
         max_black_violation_fraction=args.max_black_violation_fraction,
     )
+    validation_settings = {
+        "geometry": asdict(settings),
+        "translation_mode": args.translation_mode,
+        "max_residual_shift": args.max_residual_shift,
+        "ramp_in_frames": args.ramp_in_frames,
+        "ramp_out_frames": args.ramp_out_frames,
+        "physics_required": bool(args.physx),
+        "physics_max_frames": args.physics_max_frames,
+        "physics_settle_steps": args.physics_settle_steps,
+        "physics_min_contact_frame_ratio": args.physics_min_contact_frame_ratio,
+        "physics_max_contact_force": args.physics_max_contact_force,
+        "physics_max_initial_overlap": args.physics_max_initial_overlap,
+    }
+    validation_settings_hash = stable_mapping_hash(validation_settings)
     if (args.start_frame is None) != (args.end_frame is None):
         raise ValueError("--start-frame and --end-frame must be provided together")
     if args.start_frame is None:
@@ -1931,20 +1971,127 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         source_tool,
         settings,
     )
+    memory_sequence_directory = bank_sequence_dir(DEFAULT_BANK_ROOT, args.data_idx)
+    memory_descriptor = build_mesh_descriptor(tool) if args.bank else None
+    memory_sequence_metadata = {
+        "data_id": args.data_idx,
+        "side": args.side,
+        "dexhand": args.dexhand,
+        "source_pkl_sha256": _sha256(input_path),
+        "source_tool_mesh_sha256": _sha256(context.source_mesh_path),
+        "annotation_sha256": _sha256(context.annotation_path),
+        "trajectory_length": int(length),
+        "skip": int(args.skip),
+        "hand_urdf_bundle_sha256": _urdf_bundle_sha256(Path(hand.urdf_path)),
+        "contact_links": contact_names,
+    }
+    memory_retrieval_report = {
+        "enabled": bool(args.bank),
+        "bank_sequence_directory": memory_sequence_directory,
+        "sequence_found": False,
+        "candidates": [],
+        "selected_tool_mesh_name": None,
+        "direct_validation_passed": False,
+        "used_as_optimizer_warm_start": False,
+    }
     if args.translation_mode == "contact-translation":
         contact_initial_delta, contact_transfer_report = contact_translation_transfer(
             source_tool, tool
         )
-        delta_tool, optimizer_report = optimize_contact_translation(
-            points_before[optimization_frames],
-            kinematics.point_link_ids_array,
-            contact_ids,
-            tool,
-            settings,
-            contact_initial_delta,
-            max_residual_shift=args.max_residual_shift,
-            max_iterations=args.optimizer_iterations,
-        )
+        ranked_entries = []
+        if args.bank and require_compatible_sequence(
+            memory_sequence_directory, memory_sequence_metadata
+        ):
+            memory_retrieval_report["sequence_found"] = True
+            ranked_entries = load_ranked_entries(
+                memory_sequence_directory, memory_descriptor, top_k=3
+            )
+
+        evaluated_candidates = []
+        for entry in ranked_entries:
+            residual = np.asarray(
+                entry.get("correction", {}).get("residual_tool"), dtype=np.float64
+            )
+            if residual.shape != (3,) or not np.isfinite(residual).all():
+                continue
+            residual = np.clip(
+                residual, -args.max_residual_shift, args.max_residual_shift
+            )
+            candidate_delta = contact_initial_delta + residual
+            candidate_metrics = contact_geometry_metrics(
+                points_before[hold_frame_ids] + candidate_delta[None, None],
+                kinematics.point_link_ids_array,
+                contact_ids,
+                tool,
+                settings,
+            )
+            candidate_objective = _transformed_geometry_objective(
+                points_before[optimization_frames] + candidate_delta[None, None],
+                kinematics.point_link_ids_array,
+                contact_ids,
+                tool,
+                settings,
+            )
+            candidate_record = {
+                "tool_mesh_name": entry.get("tool_mesh_name"),
+                "similarity": entry["similarity"],
+                "delta_tool": candidate_delta,
+                "residual_tool": residual,
+                "geometry_objective": float(candidate_objective),
+                "red_frame_pass_ratio": float(candidate_metrics["red_frame_pass_ratio"]),
+                "black_violation_fraction": float(candidate_metrics["black_violation_fraction"]),
+                "passed": _is_feasible(candidate_metrics, settings),
+            }
+            evaluated_candidates.append(candidate_record)
+
+        memory_retrieval_report["candidates"] = evaluated_candidates
+        passing_candidates = [item for item in evaluated_candidates if item["passed"]]
+        if passing_candidates:
+            selected = min(passing_candidates, key=lambda item: item["geometry_objective"])
+            delta_tool = np.asarray(selected["delta_tool"], dtype=np.float64)
+            optimizer_report = {
+                "mode": "memory_direct",
+                "objective": float(selected["geometry_objective"]),
+                "residual": np.asarray(selected["residual_tool"], dtype=np.float64),
+                "residual_translation_norm": float(np.linalg.norm(selected["residual_tool"])),
+                "initial_delta_tool": contact_initial_delta,
+                "final_delta_tool": delta_tool,
+                "final_translation_norm": float(np.linalg.norm(delta_tool)),
+                "final_rotation_degrees": 0.0,
+                "source_tool_mesh_name": selected["tool_mesh_name"],
+            }
+            memory_retrieval_report["selected_tool_mesh_name"] = selected["tool_mesh_name"]
+            memory_retrieval_report["direct_validation_passed"] = True
+            _log(
+                "Memory bank 直接候选通过语义几何预验收：{}".format(
+                    selected["tool_mesh_name"]
+                )
+            )
+        else:
+            initial_residual = None
+            if evaluated_candidates:
+                selected = min(
+                    evaluated_candidates, key=lambda item: item["geometry_objective"]
+                )
+                initial_residual = np.asarray(selected["residual_tool"], dtype=np.float64)
+                memory_retrieval_report["selected_tool_mesh_name"] = selected["tool_mesh_name"]
+                memory_retrieval_report["used_as_optimizer_warm_start"] = True
+                _log(
+                    "Memory bank 候选未直接通过；使用 {} 的修正残差作为优化初值".format(
+                        selected["tool_mesh_name"]
+                    )
+                )
+            delta_tool, optimizer_report = optimize_contact_translation(
+                points_before[optimization_frames],
+                kinematics.point_link_ids_array,
+                contact_ids,
+                tool,
+                settings,
+                contact_initial_delta,
+                max_residual_shift=args.max_residual_shift,
+                max_iterations=args.optimizer_iterations,
+                initial_residual=initial_residual,
+            )
     elif args.translation_mode == "semantic-axis":
         semantic_axis_direction, semantic_axis_report = estimate_semantic_axis(
             tool, roi_distance=args.axis_roi_distance
@@ -2251,6 +2398,8 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         "settings": asdict(settings),
         "optimizer": optimizer_history[-1],
         "optimizer_history": optimizer_history,
+        "memory_retrieval": memory_retrieval_report,
+        "validation_settings_hash": validation_settings_hash,
         "before_hold": _summary_metrics(before_hold),
         "after_hold": _summary_metrics(after_hold),
         "before_full": _summary_metrics(before_full),
@@ -2290,6 +2439,8 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         "physics_validation_required": bool(args.physx),
         "validation_tiers": validation_tiers,
         "settings": asdict(settings),
+        "memory_retrieval": memory_retrieval_report,
+        "validation_settings_hash": validation_settings_hash,
         "validation_summary": {
             "before_hold": report["before_hold"],
             "after_hold": report["after_hold"],
@@ -2327,6 +2478,47 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
     if overall_passed or args.allow_infeasible:
         _atomic_pickle_dump(corrected, output_path)
         _log(f"修正 PKL 已原子{'覆盖' if output_existed else '写入'}：{output_path}")
+        if args.bank and overall_passed:
+            center_delta = np.asarray(
+                contact_transfer_report["initial_delta_tool"], dtype=np.float64
+            )
+            memory_entry = {
+                "data_id": args.data_idx,
+                "tool_mesh_name": args.new_obj,
+                "tool_mesh_sha256": report["tool_mesh_sha256"],
+                "collision_bundle_sha256": report["collision_bundle_sha256"],
+                "descriptor_file": "descriptor.npz",
+                "correction": {
+                    "delta_tool": _jsonable(delta_tool),
+                    "center_delta_tool": _jsonable(center_delta),
+                    "residual_tool": _jsonable(delta_tool - center_delta),
+                    "grasp_interval": [int(start_frame), int(end_frame)],
+                    "ramp_in_frames": int(args.ramp_in_frames),
+                    "ramp_out_frames": int(args.ramp_out_frames),
+                },
+                "validation_settings_hash": validation_settings_hash,
+                "validation": {
+                    "overall_passed": True,
+                    "semantic_geometry_passed": bool(semantic_geometry_tier["passed"]),
+                    "physics_required": bool(args.physx),
+                    "physics_passed": bool(physics_tier["passed"]),
+                    "red_frame_pass_ratio": float(after_hold["red_frame_pass_ratio"]),
+                    "red_link_ratio_mean": float(after_hold["red_link_ratio_mean"]),
+                    "black_violation_fraction": float(after_hold["black_violation_fraction"]),
+                    "invariants_passed": bool(invariant_report["passed"]),
+                },
+                "corrected_pkl": str(output_path.resolve()),
+                "corrected_pkl_sha256": _sha256(output_path),
+                "report_path": str(report_path.resolve()),
+            }
+            write_memory_entry(
+                memory_sequence_directory,
+                memory_sequence_metadata,
+                args.new_obj,
+                memory_descriptor,
+                memory_entry,
+            )
+            _log(f"Memory bank 已更新：{memory_sequence_directory / args.new_obj}")
         _log(f"预览图已写入：{preview_path}")
         if overall_passed:
             _log(
@@ -2524,7 +2716,7 @@ def _add_common_geometry_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--min-red-link-ratio", type=float, default=0.1)
     parser.add_argument("--min-red-frame-ratio", type=float, default=0.8)
     # parser.add_argument("--max-black-violation-fraction", type=float, default=0.0)
-    parser.add_argument("--max-black-violation-fraction", type=float, default=5.002)
+    parser.add_argument("--max-black-violation-fraction", type=float, default=0.2)
     parser.add_argument("--max-optimization-frames", type=int, default=48)
     parser.add_argument("--report")
 
@@ -2541,6 +2733,14 @@ def build_parser() -> argparse.ArgumentParser:
     correct.add_argument("--input-pkl")
     correct.add_argument("--output-root", default=str(PROJECT_ROOT / "data" / "retargeting_contact"))
     correct.add_argument("--output-pkl")
+    correct.add_argument(
+        "--bank",
+        action="store_true",
+        help=(
+            "retrieve verified corrections from data/retargeting_bank/OakInk-v2 "
+            "and update the bank after successful validation"
+        ),
+    )
     correct.add_argument(
         "--overwrite",
         action="store_true",

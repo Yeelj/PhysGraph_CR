@@ -26,11 +26,11 @@
 比例达到 `min_red_frame_ratio` 才通过。默认分别为 60% 和 80%。该逻辑不再构建 MANO/
 retarget 稀疏接触图，也不再迁移 link 对应的语义 surface patch。
 
-修正结果默认镜像保存到 `data/retargeting_contact`。例如：
+修正结果按 `data_id` 和 `new_obj` 分目录保存到 `data/retargeting_contact`。例如：
 
 ```text
 data/retargeting/OakInk-v2/mano2artimano_rh/<sequence>@0.pkl
-    -> data/retargeting_contact/OakInk-v2/mano2artimano_rh/<sequence>@0.pkl
+    -> data/retargeting_contact/OakInk-v2/mano2artimano_rh/<data_id>/<new_obj>/<sequence>@0.pkl
 ```
 
 ## 1. 资产准备
@@ -39,7 +39,7 @@ data/retargeting/OakInk-v2/mano2artimano_rh/<sequence>@0.pkl
 `coacd_object_preview` 目录读取旧 mesh/URDF。新资产单独放在固定目录：
 
 ```text
-/home/ps/data/ylj/ManipTrans/data/OakInk-v2/new_obj
+/home/ps/data/ylj/PhysGraph/data/OakInk-v2/new_obj
 ```
 
 支持 `<编号>.ply + <编号>.urdf`，或 `<编号>/` 目录内恰好一个mesh和一个URDF。
@@ -57,6 +57,18 @@ python main/dataset/contact_trajectory_retarget.py correct \
   --side right \
   --new-obj spoon_01 \
   --translation-mode contact-translation
+```
+
+需要优先复用同一 `data_id` 下已验收的 mesh 修正残差时添加 `--bank`：
+
+```bash
+python main/dataset/contact_trajectory_retarget.py correct \
+  --data-idx 083f7@0 \
+  --dexhand artimano \
+  --side right \
+  --new-obj spoon_01 \
+  --translation-mode contact-translation \
+  --bank
 ```
 
 工具会自动完成以下步骤：
@@ -135,17 +147,21 @@ python main/dataset/contact_trajectory_retarget.py correct \
 常用输出为：
 
 ```text
-data/retargeting_contact/.../<sequence>@0.pkl
-data/retargeting_contact/.../<sequence>@0/<sequence>@0.contact_report.json
-data/retargeting_contact/.../<sequence>@0/<sequence>@0.contact_preview.png
-data/retargeting_contact/.../<sequence>@0/<sequence>@0.verify_report.json
+data/retargeting_contact/.../<data_id>/<new_obj>/<sequence>@0.pkl
+data/retargeting_contact/.../<data_id>/<new_obj>/<sequence>@0/<sequence>@0.contact_report.json
+data/retargeting_contact/.../<data_id>/<new_obj>/<sequence>@0/<sequence>@0.contact_preview.png
+data/retargeting_contact/.../<data_id>/<new_obj>/<sequence>@0/<sequence>@0.verify_report.json
 ```
 
 修正 PKL 继续保存在原路径。其余三个检查文件统一放在与 PKL 同级、以
 `<sequence>@0` 命名的目录中；`verify_report.json` 在执行独立复验命令后生成。
 
 不要把 `--allow-infeasible` 生成的诊断 PKL 用于 Stage1。正常模式下约束未通过时不会写出 PKL。
-每次 `correct` 都从原始 `data/retargeting` PKL 重新计算，不再提前检查目标 PKL 是否存在；全部已配置验证通过后直接原子覆盖已有修正 PKL。保留的 `--overwrite` 仅用于兼容旧命令，不再影响行为。
+默认每次 `correct` 都从原始 `data/retargeting` PKL 重新计算。添加 `--bank` 后，程序从
+`data/retargeting_bank/OakInk-v2/<data_id>` 检索最相似的已验收 tool mesh：先尝试迁移其
+工具局部修正残差并直接执行完整语义几何验收；候选失败时再将最佳残差作为现有优化器
+的初值。全部已配置验证通过后，修正 PKL 和对应 bank entry 都采用原子写入。bank 只保存
+通过验收的结果，不保存算法或 schema 版本字段。
 
 ## 3. 修正结果验证
 
@@ -184,7 +200,7 @@ python -m unittest tests/test_contact_trajectory_retarget.py -v
 
 ```bash
 python main/dataset/contact_trajectory_retarget.py verify \
-  --input-pkl data/retargeting_contact/OakInk-v2/mano2artimano_rh/<sequence>@0.pkl \
+  --input-pkl data/retargeting_contact/OakInk-v2/mano2artimano_rh/<data_id>/<new_obj>/<sequence>@0.pkl \
   --new-obj spoon_01
 ```
 
@@ -197,7 +213,7 @@ python main/dataset/contact_trajectory_retarget.py verify \
 ```bash
 python main/rl/train.py \
   task=ResDexHand dexhand=artimano side=BiH \
-  --new-obj spoon_01 \
+  new_obj=spoon_01 correct=true \
   headless=true num_envs=4 max_iterations=1 \
   dataIndices=[083f7@0] \
   experiment=083f7_contact_smoke
@@ -212,7 +228,7 @@ python main/rl/train.py \
 ```bash
 python main/rl/train.py \
   task=ResDexHand dexhand=artimano side=BiH \
-  --new-obj spoon_01 \
+  new_obj=spoon_01 correct=true \
   headless=true num_envs=4096 learning_rate=2e-4 \
   test=false randomStateInit=true dataIndices=[083f7@0] \
   early_stop_epochs=10000 actionsMovingAverage=0.4 \
@@ -228,12 +244,14 @@ python main/rl/train.py \
 
 因此 Stage1 的复位目标、观测目标和奖励目标不会互相冲突。左手仍从 `data/retargeting` 读取，姿态和轨迹不变。
 
-左右手路径已经直接固定在对应 OakInk 数据集实现中：右手读取
-`data/retargeting_contact`，左手读取 `data/retargeting`，训练命令不再需要传入路径参数。
-如果右手对应的修正 PKL 不存在，Stage1 会直接报错并停止，不会退回未经修正的轨迹或零 DOF 初值继续训练。
+左手始终从 `data/retargeting` 读取原始 PKL、object mesh 和 URDF。右手读取由 Hydra
+原生参数 `correct` 控制：`correct=false` 从 `data/retargeting` 读取原始右手 PKL；
+`correct=true` 按 `<data_id>/<new_obj>` 从 `data/retargeting_contact` 读取修正 PKL。
+`correct=true` 必须同时给出 `new_obj`，且目标修正 PKL 不存在时直接报错，不静默回退。
 
-Stage1 的训练和测试使用同一入口，因此测试命令也加入
-`--new-obj spoon_01`。Hydra 原生写法 `new_obj=spoon_01` 同样可用。省略该参数时，
-视觉mesh和碰撞URDF保持原来的旧资产路径。
+Stage1 的训练和测试使用同一入口。`new_obj=spoon_01` 选择右手新 tool mesh/URDF；
+省略时读取 data_id 对应的原始 tool。`correct` 与 mesh 选择相互独立，因此
+`correct=false new_obj=spoon_01` 会使用原始右手轨迹配合新 tool，而
+`correct=true new_obj=spoon_01` 会读取该 tool 对应的修正右手轨迹。
 
 该项目的完整执行流程到 Stage1 训练结束，不再包含后续残差修正阶段。

@@ -19,6 +19,7 @@ env:
 
   dataIndices: ${resolve_default:[],${...dataIndices}}
   newObj: ${...new_obj}
+  correct: ${...correct}
   obsFutureLength: 1
 
   rolloutLen: ${resolve_default:None,${...rolloutLen}}
