@@ -26,6 +26,8 @@ def _contact_retarget_validation_tiers_passed(metadata):
     # required PhysX, so absence deliberately remains strict.
     if bool(metadata.get("physics_validation_required", True)):
         required_tiers.append("isaac_gym_physics")
+        if int(metadata.get("schema_version", 0)) >= 8:
+            required_tiers.extend(("physical_optimization", "mano_target_sync"))
     return all(
         isinstance(validation_tiers.get(name), dict)
         and bool(validation_tiers[name].get("passed", False))
@@ -337,6 +339,43 @@ class ManipData(Dataset, ABC):
                 f"Invalid correction alpha shape: {tuple(alpha.shape)}, target_length={target_length}"
             )
 
+        corrected_body_targets = data.get("corrected_mano_body_targets")
+        if corrected_body_targets is not None:
+            body_names = data.get("corrected_mano_body_names")
+            expected_body_names = list(self.dexhand.body_names)
+            if list(body_names or ()) != expected_body_names:
+                raise ValueError(
+                    "Corrected MANO body ordering does not match the Stage-1 dex-hand: "
+                    f"stored={body_names}, expected={expected_body_names}"
+                )
+            expected_shape = (len(expected_body_names), 3)
+            if corrected_body_targets.ndim != 3 or tuple(
+                corrected_body_targets.shape[1:]
+            ) != expected_shape:
+                raise ValueError(
+                    "Invalid corrected MANO body target shape: "
+                    f"{tuple(corrected_body_targets.shape)}"
+                )
+            if len(corrected_body_targets) < target_length:
+                raise ValueError(
+                    "Corrected MANO body targets are shorter than the Stage-1 target: "
+                    f"{len(corrected_body_targets)} < {target_length}"
+                )
+            corrected_body_targets = corrected_body_targets[:target_length]
+            data["corrected_mano_body_targets"] = corrected_body_targets
+            grouped_targets = {}
+            for body_index, body_name in enumerate(expected_body_names):
+                mano_name = self.dexhand.to_hand(body_name)[0]
+                if mano_name == "wrist":
+                    continue
+                grouped_targets.setdefault(mano_name, []).append(
+                    corrected_body_targets[:, body_index]
+                )
+            for mano_name, values in grouped_targets.items():
+                data["mano_joints"][mano_name] = torch.stack(values, dim=1).mean(dim=1)
+            data["wrist_pos"] = data["opt_wrist_pos"][:target_length]
+            data["wrist_rot"] = data["opt_wrist_rot"][:target_length]
+
         time_delta = 1 / (120 / self.skip)
         data["wrist_velocity"] = self.compute_velocity(
             data["wrist_pos"][:, None], time_delta, guassian_filter=True
@@ -344,6 +383,10 @@ class ManipData(Dataset, ABC):
         for key in data["mano_joints"].keys():
             data["mano_joints_velocity"][key] = self.compute_velocity(
                 data["mano_joints"][key], time_delta, guassian_filter=True
+            )
+        if corrected_body_targets is not None:
+            data["corrected_mano_body_targets_velocity"] = self.compute_velocity(
+                corrected_body_targets, time_delta, guassian_filter=True
             )
         if "wrist_rot" in data:
             data["wrist_angular_velocity"] = self.compute_angular_velocity(
@@ -440,6 +483,13 @@ class ManipData(Dataset, ABC):
                     "retargeting_kind": retargeting_kind,
                 }
             )
+            if "corrected_mano_body_targets" in opt_params:
+                data["corrected_mano_body_targets"] = torch.tensor(
+                    opt_params["corrected_mano_body_targets"], device=self.device
+                )
+                data["corrected_mano_body_names"] = list(
+                    opt_params.get("corrected_mano_body_names", ())
+                )
             if contact_metadata is not None:
                 self._apply_contact_retarget_targets(
                     data, contact_metadata, retargeted_data_path

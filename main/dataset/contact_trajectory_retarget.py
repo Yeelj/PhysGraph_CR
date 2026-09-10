@@ -32,11 +32,12 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 import trimesh
 from scipy.optimize import differential_evolution, minimize, minimize_scalar
+from scipy.ndimage import gaussian_filter1d
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 def _physics_validation_required(metadata: Mapping[str, object]) -> bool:
@@ -58,6 +59,8 @@ def _stored_validation_tiers_passed(
     required_names = ["semantic_geometry"]
     if _physics_validation_required(metadata):
         required_names.append("isaac_gym_physics")
+        if int(metadata.get("schema_version", 0)) >= 8:
+            required_names.extend(("physical_optimization", "mano_target_sync"))
     return all(
         isinstance(tiers.get(name), Mapping)
         and bool(tiers[name].get("passed", False))
@@ -65,7 +68,7 @@ def _stored_validation_tiers_passed(
     )
 
 
-DEFAULT_OAKINK_ROOT = "/workspace/PhysGraph/data/OakInk-v2"
+DEFAULT_OAKINK_ROOT = "/home/ps/data/ylj/PhysGraph/data/OakInk-v2"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -427,6 +430,30 @@ class URDFCollisionKinematics:
             root_points = self.root_frame_surface_points(dof[frame_id])
             frames.append(root_points @ wrist_rotations[local_idx].T + wrist_pos[frame_id])
         return np.stack(frames, axis=0)
+
+    def world_link_origins_trajectory(
+        self,
+        link_names: Sequence[str],
+        wrist_pos: np.ndarray,
+        wrist_rotvec: np.ndarray,
+        dof: np.ndarray,
+    ) -> np.ndarray:
+        """Return URDF link origins in the exact order requested by Stage 1."""
+
+        wrist_pos = np.asarray(wrist_pos, dtype=np.float64)
+        wrist_rotations = Rotation.from_rotvec(
+            np.asarray(wrist_rotvec, dtype=np.float64)
+        ).as_matrix()
+        dof = np.asarray(dof, dtype=np.float64)
+        frames = []
+        for frame in range(len(wrist_pos)):
+            transforms = self.link_transforms(dof[frame])
+            missing = [name for name in link_names if name not in transforms]
+            if missing:
+                raise ValueError(f"Stage-1 body links are absent from the hand URDF: {missing}")
+            local = np.stack([transforms[name][:3, 3] for name in link_names])
+            frames.append(local @ wrist_rotations[frame].T + wrist_pos[frame])
+        return np.stack(frames)
 
 
 @dataclass
@@ -1708,6 +1735,416 @@ def run_isaac_gym_validation(
         return result
 
 
+def _physics_failure_score(report: Mapping[str, object]) -> float:
+    """Continuous score used only to accept monotonic PhysX repair steps."""
+
+    if report.get("status") == "error" or not bool(report.get("all_finite", True)):
+        return float("inf")
+    thresholds = report.get("thresholds", {})
+    min_ratio = max(float(thresholds.get("min_contact_frame_ratio", 0.5)), 1e-9)
+    max_force = max(float(thresholds.get("max_contact_force", 1.0)), 1e-9)
+    max_overlap = max(float(thresholds.get("max_initial_overlap", 0.01)), 1e-9)
+    object_ratio = float(report.get("object_contact_frame_ratio", 0.0))
+    intended_ratio = float(report.get("intended_link_contact_frame_ratio", 0.0))
+    force = float(report.get("maximum_contact_force", float("inf")))
+    overlap = float(report.get("maximum_initial_overlap", float("inf")))
+    return float(
+        max(0.0, (min_ratio - object_ratio) / min_ratio)
+        + max(0.0, (min_ratio - intended_ratio) / min_ratio)
+        + max(0.0, force / max_force - 1.0)
+        + max(0.0, overlap / max_overlap - 1.0)
+    )
+
+
+def _finger_name(body_name: Optional[str]) -> Optional[str]:
+    value = "" if body_name is None else str(body_name).lower()
+    for finger in ("thumb", "index", "middle", "ring", "pinky"):
+        if finger in value:
+            return finger
+    return None
+
+
+def _interpolate_sample_correction(
+    length: int,
+    sample_frames: np.ndarray,
+    sample_values: np.ndarray,
+    *,
+    sigma: float = 3.0,
+) -> np.ndarray:
+    """Interpolate sparse PhysX corrections without per-frame discontinuities."""
+
+    sample_frames = np.asarray(sample_frames, dtype=np.int64)
+    sample_values = np.asarray(sample_values, dtype=np.float64)
+    if sample_values.ndim != 2 or len(sample_values) != len(sample_frames):
+        raise ValueError("Sparse physical correction arrays have inconsistent shapes")
+    result = np.zeros((length, sample_values.shape[1]), dtype=np.float64)
+    timeline = np.arange(length, dtype=np.float64)
+    for column in range(sample_values.shape[1]):
+        result[:, column] = np.interp(
+            timeline,
+            sample_frames.astype(np.float64),
+            sample_values[:, column],
+            left=0.0,
+            right=0.0,
+        )
+    if sigma > 0 and length > 2:
+        result = gaussian_filter1d(result, sigma=sigma, axis=0, mode="nearest")
+    return result
+
+
+def _contact_normal_ik_delta(
+    kinematics: URDFCollisionKinematics,
+    body_name: str,
+    dof_position: np.ndarray,
+    wrist_rotvec: np.ndarray,
+    active_indices: np.ndarray,
+    escape_normal_world: np.ndarray,
+    escape_distance: float,
+) -> np.ndarray:
+    """Solve a damped positional IK step for one colliding finger link."""
+
+    dof_position = np.asarray(dof_position, dtype=np.float64)
+    active_indices = np.asarray(active_indices, dtype=np.int64)
+    normal = np.asarray(escape_normal_world, dtype=np.float64)
+    normal_norm = float(np.linalg.norm(normal))
+    result = np.zeros_like(dof_position)
+    if not len(active_indices) or normal_norm <= 1e-9:
+        return result
+    transforms = kinematics.link_transforms(dof_position)
+    if body_name not in transforms or body_name not in kinematics.link_points:
+        return result
+    root_rotation = Rotation.from_rotvec(
+        np.asarray(wrist_rotvec, dtype=np.float64)
+    ).as_matrix()
+    link_samples = kinematics.link_points[body_name]
+    base_samples = _transform_points(link_samples, transforms[body_name])
+    normal_unit = normal / normal_norm
+    world_samples = base_samples @ root_rotation.T
+    # The object-facing side is opposite the force/escape direction. Tracking
+    # a collision-surface sample (instead of the link origin) lets proximal
+    # joints resolve contact by rotation even when two joint origins coincide.
+    contact_sample_index = int(np.argmin(world_samples @ normal_unit))
+    base_local = base_samples[contact_sample_index]
+    jacobian = np.zeros((3, len(active_indices)), dtype=np.float64)
+    epsilon = 1e-4
+    for column, dof_index in enumerate(active_indices):
+        perturbed = dof_position.copy()
+        perturbed[dof_index] += epsilon
+        moved_transform = kinematics.link_transforms(perturbed)[body_name]
+        moved_local = _transform_points(
+            link_samples[contact_sample_index : contact_sample_index + 1],
+            moved_transform,
+        )[0]
+        jacobian[:, column] = root_rotation @ ((moved_local - base_local) / epsilon)
+    desired = normal_unit * float(escape_distance)
+    damping = 2e-4
+    try:
+        active_delta = jacobian.T @ np.linalg.solve(
+            jacobian @ jacobian.T + damping * np.eye(3), desired
+        )
+    except np.linalg.LinAlgError:
+        return result
+    active_delta = np.clip(active_delta, -np.deg2rad(3.0), np.deg2rad(3.0))
+    result[active_indices] = active_delta
+    return result
+
+
+def _physical_invariant_report(
+    semantic: Mapping,
+    corrected: Mapping,
+    dof_lower: np.ndarray,
+    dof_upper: np.ndarray,
+    active_dof_names: Sequence[str],
+    hand: "OfflineHandSpec",
+) -> Dict[str, object]:
+    semantic_pos = np.asarray(semantic["opt_wrist_pos"], dtype=np.float64)
+    corrected_pos = np.asarray(corrected["opt_wrist_pos"], dtype=np.float64)
+    semantic_rot = np.asarray(semantic["opt_wrist_rot"], dtype=np.float64)
+    corrected_rot = np.asarray(corrected["opt_wrist_rot"], dtype=np.float64)
+    semantic_dof = np.asarray(semantic["opt_dof_pos"], dtype=np.float64)
+    corrected_dof = np.asarray(corrected["opt_dof_pos"], dtype=np.float64)
+    delta_dof = corrected_dof - semantic_dof
+    delta_wrist = corrected_pos - semantic_pos
+    active = {str(name) for name in active_dof_names}
+    inactive_indices = [index for index, name in enumerate(hand.dof_names) if name not in active]
+    inactive_error = 0.0 if not inactive_indices else float(
+        np.max(np.abs(delta_dof[:, inactive_indices]))
+    )
+    lower_violation = np.maximum(np.asarray(dof_lower)[None] - corrected_dof, 0.0)
+    upper_violation = np.maximum(corrected_dof - np.asarray(dof_upper)[None], 0.0)
+    result = {
+        "all_finite": bool(
+            np.isfinite(corrected_pos).all()
+            and np.isfinite(corrected_rot).all()
+            and np.isfinite(corrected_dof).all()
+        ),
+        "rotation_max_abs_error": float(np.max(np.abs(corrected_rot - semantic_rot))),
+        "inactive_dof_max_abs_error": inactive_error,
+        "dof_max_abs_correction": float(np.max(np.abs(delta_dof))),
+        "wrist_max_correction": float(np.max(np.linalg.norm(delta_wrist, axis=1))),
+        "dof_limit_max_violation": float(max(lower_violation.max(), upper_violation.max())),
+        "dof_delta_max_step": float(np.max(np.abs(np.diff(delta_dof, axis=0))))
+        if len(delta_dof) > 1
+        else 0.0,
+        "wrist_delta_max_step": float(np.max(np.linalg.norm(np.diff(delta_wrist, axis=0), axis=1)))
+        if len(delta_wrist) > 1
+        else 0.0,
+        "active_dof_names": list(active_dof_names),
+    }
+    result["passed"] = bool(
+        result["all_finite"]
+        and result["rotation_max_abs_error"] <= 1e-7
+        and result["inactive_dof_max_abs_error"] <= 1e-7
+        and result["dof_limit_max_violation"] <= 1e-7
+        and result["dof_max_abs_correction"] <= np.deg2rad(15.0) + 1e-7
+        and result["wrist_max_correction"] <= 0.01 + 1e-7
+        and result["dof_delta_max_step"] <= np.deg2rad(5.0)
+        and result["wrist_delta_max_step"] <= 0.003
+    )
+    return result
+
+
+def _build_corrected_mano_body_targets(
+    semantic: Mapping,
+    corrected: Mapping,
+    kinematics: URDFCollisionKinematics,
+    body_names: Sequence[str],
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    """Move MANO-derived Stage-1 targets by the final dex-hand FK displacement."""
+
+    body_names = tuple(str(name) for name in body_names)
+    semantic_targets = np.asarray(semantic.get("opt_joints_pos"), dtype=np.float64)
+    if semantic_targets.ndim != 3 or semantic_targets.shape[1:] != (len(body_names), 3):
+        raise ValueError(
+            "Cannot synchronize Stage-1 MANO targets: opt_joints_pos shape "
+            f"{semantic_targets.shape} does not match {len(body_names)} PhysX bodies"
+        )
+    semantic_fk = kinematics.world_link_origins_trajectory(
+        body_names,
+        semantic["opt_wrist_pos"],
+        semantic["opt_wrist_rot"],
+        semantic["opt_dof_pos"],
+    )
+    corrected_fk = kinematics.world_link_origins_trajectory(
+        body_names,
+        corrected["opt_wrist_pos"],
+        corrected["opt_wrist_rot"],
+        corrected["opt_dof_pos"],
+    )
+    targets = semantic_targets + corrected_fk - semantic_fk
+    passed = bool(np.isfinite(targets).all())
+    report = {
+        "name": "mano_target_sync",
+        "status": "passed" if passed else "failed",
+        "passed": passed,
+        "method": "dexhand_fk_delta_on_mano_body_targets",
+        "body_names": list(body_names),
+        "body_count": len(body_names),
+        "maximum_target_shift": float(
+            np.max(np.linalg.norm(targets - semantic_targets, axis=-1))
+        ),
+    }
+    return targets.astype(np.float32), report
+
+
+def run_physical_correction(
+    semantic: Mapping,
+    initial_physics: Mapping[str, object],
+    hand: "OfflineHandSpec",
+    context: OakInkContext,
+    contact_names: Sequence[str],
+    hold_frame_ids: np.ndarray,
+    kinematics: URDFCollisionKinematics,
+    tool: SemanticTool,
+    settings: GeometrySettings,
+    args: argparse.Namespace,
+) -> Tuple[Dict, Dict[str, object], Dict[str, object], Dict[str, object]]:
+    """Repair a failed PhysX gate with local finger-chain and palm translations."""
+
+    baseline = copy.deepcopy(semantic)
+    current = copy.deepcopy(semantic)
+    current_physics = dict(initial_physics)
+    history = [{"round": 0, "score": _physics_failure_score(current_physics)}]
+    active_dofs = set()
+    active_links = set()
+    total_wrist_delta = np.zeros_like(np.asarray(current["opt_wrist_pos"], dtype=np.float64))
+    total_dof_delta = np.zeros_like(np.asarray(current["opt_dof_pos"], dtype=np.float64))
+    limits_lower = np.asarray(current_physics.get("dof_lower_limits"), dtype=np.float64)
+    limits_upper = np.asarray(current_physics.get("dof_upper_limits"), dtype=np.float64)
+    if limits_lower.shape != (len(hand.dof_names),) or limits_upper.shape != (len(hand.dof_names),):
+        limits_lower = np.full(len(hand.dof_names), -np.inf, dtype=np.float64)
+        limits_upper = np.full(len(hand.dof_names), np.inf, dtype=np.float64)
+
+    for round_index in range(1, 5):
+        per_frame = list(current_physics.get("per_frame", ()))
+        sample_frames = np.asarray(current_physics.get("frame_ids", ()), dtype=np.int64)
+        if len(per_frame) != len(sample_frames) or len(sample_frames) == 0:
+            break
+        thresholds = current_physics.get("thresholds", {})
+        max_force = float(thresholds.get("max_contact_force", args.physics_max_contact_force))
+        max_overlap = float(thresholds.get("max_initial_overlap", args.physics_max_initial_overlap))
+        sparse_dof = np.zeros((len(sample_frames), len(hand.dof_names)), dtype=np.float64)
+        sparse_wrist = np.zeros((len(sample_frames), 3), dtype=np.float64)
+        current_dof = np.asarray(current["opt_dof_pos"], dtype=np.float64)
+        candidate_found = False
+        for local_index, record in enumerate(per_frame):
+            force_failed = float(record.get("maximum_contact_force", 0.0)) > max_force
+            overlap_failed = float(record.get("maximum_initial_overlap", 0.0)) > max_overlap
+            if not (force_failed or overlap_failed):
+                continue
+            frame = int(record["frame"])
+            body_name = record.get("worst_hand_body_name")
+            if body_name is not None:
+                active_links.add(str(body_name))
+            finger = _finger_name(body_name)
+            if finger is not None:
+                mask = np.asarray([finger in name.lower() for name in hand.dof_names])
+                escape = np.asarray(
+                    record.get("hand_escape_normal", (0.0, 0.0, 0.0)),
+                    dtype=np.float64,
+                )
+                severity = max(
+                    1.0,
+                    float(record.get("maximum_initial_overlap", 0.0))
+                    / max(max_overlap, 1e-9),
+                    float(record.get("maximum_contact_force", 0.0))
+                    / max(max_force, 1e-9),
+                )
+                raw_delta = _contact_normal_ik_delta(
+                    kinematics,
+                    str(body_name),
+                    current_dof[frame],
+                    np.asarray(current["opt_wrist_rot"], dtype=np.float64)[frame],
+                    np.flatnonzero(mask),
+                    escape,
+                    min(0.003, 0.0015 * severity),
+                )
+                if np.max(np.abs(raw_delta)) < 1e-6:
+                    continue
+                sparse_dof[local_index] = raw_delta
+                active_dofs.update(
+                    name
+                    for name, delta in zip(hand.dof_names, raw_delta)
+                    if abs(float(delta)) >= 1e-8
+                )
+                candidate_found = True
+            elif body_name is not None and "palm" in str(body_name).lower():
+                escape = np.asarray(record.get("hand_escape_normal", (0.0, 0.0, 0.0)), dtype=np.float64)
+                norm = float(np.linalg.norm(escape))
+                if norm > 1e-9:
+                    severity = max(
+                        1.0,
+                        float(record.get("maximum_initial_overlap", 0.0)) / max(max_overlap, 1e-9),
+                        float(record.get("maximum_contact_force", 0.0)) / max(max_force, 1e-9),
+                    )
+                    sparse_wrist[local_index] = escape / norm * min(0.002, 0.001 * severity)
+                    candidate_found = True
+        if not candidate_found:
+            break
+
+        dof_step = _interpolate_sample_correction(len(current_dof), sample_frames, sparse_dof)
+        wrist_step = _interpolate_sample_correction(len(current_dof), sample_frames, sparse_wrist)
+        proposed_total_dof = np.clip(
+            total_dof_delta + dof_step, -np.deg2rad(15.0), np.deg2rad(15.0)
+        )
+        proposed_total_wrist = total_wrist_delta + wrist_step
+        wrist_norm = np.linalg.norm(proposed_total_wrist, axis=1)
+        too_large = wrist_norm > 0.01
+        if too_large.any():
+            proposed_total_wrist[too_large] *= (0.01 / wrist_norm[too_large])[:, None]
+
+        proposal = copy.deepcopy(baseline)
+        proposal["opt_dof_pos"] = np.clip(
+            np.asarray(baseline["opt_dof_pos"], dtype=np.float64) + proposed_total_dof,
+            limits_lower[None],
+            limits_upper[None],
+        ).astype(np.asarray(baseline["opt_dof_pos"]).dtype)
+        proposal["opt_wrist_pos"] = (
+            np.asarray(baseline["opt_wrist_pos"], dtype=np.float64) + proposed_total_wrist
+        ).astype(np.asarray(baseline["opt_wrist_pos"]).dtype)
+        proposal["opt_wrist_rot"] = np.asarray(baseline["opt_wrist_rot"]).copy()
+
+        world_points = kinematics.world_surface_trajectory(
+            proposal["opt_wrist_pos"], proposal["opt_wrist_rot"], proposal["opt_dof_pos"]
+        )
+        tool_points = world_to_tool_points(world_points, context.object_trajectory)
+        semantic_metrics = contact_geometry_metrics(
+            tool_points[hold_frame_ids],
+            kinematics.point_link_ids_array,
+            _contact_link_ids(kinematics, contact_names),
+            tool,
+            settings,
+        )
+        if not _is_feasible(semantic_metrics, settings):
+            history.append(
+                {
+                    "round": round_index,
+                    "accepted": False,
+                    "reason": "semantic_geometry_regressed",
+                    "semantic": _summary_metrics(semantic_metrics),
+                }
+            )
+            break
+        proposal_physics = run_isaac_gym_validation(
+            proposal,
+            hand,
+            context,
+            contact_names,
+            hold_frame_ids,
+            headless=args.headless,
+            maximum_frames=args.physics_max_frames,
+            settle_steps=args.physics_settle_steps,
+            min_contact_frame_ratio=args.physics_min_contact_frame_ratio,
+            max_contact_force=args.physics_max_contact_force,
+            max_initial_overlap=args.physics_max_initial_overlap,
+            timeout=args.physics_timeout,
+        )
+        old_score = _physics_failure_score(current_physics)
+        new_score = _physics_failure_score(proposal_physics)
+        accepted = bool(new_score + 1e-9 < old_score or proposal_physics.get("passed", False))
+        history.append(
+            {
+                "round": round_index,
+                "accepted": accepted,
+                "score_before": old_score,
+                "score_after": new_score,
+                "semantic": _summary_metrics(semantic_metrics),
+            }
+        )
+        if not accepted:
+            break
+        current = proposal
+        current_physics = proposal_physics
+        total_dof_delta = (
+            np.asarray(current["opt_dof_pos"], dtype=np.float64)
+            - np.asarray(baseline["opt_dof_pos"], dtype=np.float64)
+        )
+        total_wrist_delta = (
+            np.asarray(current["opt_wrist_pos"], dtype=np.float64)
+            - np.asarray(baseline["opt_wrist_pos"], dtype=np.float64)
+        )
+        if bool(current_physics.get("passed", False)):
+            break
+
+    invariants = _physical_invariant_report(
+        baseline, current, limits_lower, limits_upper, sorted(active_dofs), hand
+    )
+    passed = bool(current_physics.get("passed", False)) and invariants["passed"]
+    report = {
+        "name": "physical_optimization",
+        "status": "passed" if passed else "failed",
+        "passed": passed,
+        "attempted": True,
+        "method": "contact_normal_damped_ik_physx_outer_loop",
+        "round_count": len(history) - 1,
+        "active_link_names": sorted(active_links),
+        "active_dof_names": sorted(active_dofs),
+        "history": history,
+        "invariants": invariants,
+    }
+    return current, current_physics, report, invariants
+
+
 def _write_preview(
     output_path: Path,
     tool: SemanticTool,
@@ -1993,6 +2430,10 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         "selected_tool_mesh_name": None,
         "direct_validation_passed": False,
         "used_as_optimizer_warm_start": False,
+        "physical_transfer_policy": (
+            "reuse geometry residual only; never transfer stored joint/wrist physical deltas; "
+            "always rerun the configured PhysX gate and local repair"
+        ),
     }
     if args.translation_mode == "contact-translation":
         contact_initial_delta, contact_transfer_report = contact_translation_transfer(
@@ -2035,6 +2476,8 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
             candidate_record = {
                 "tool_mesh_name": entry.get("tool_mesh_name"),
                 "similarity": entry["similarity"],
+                "bank_schema_version": int(entry.get("bank_schema_version", 1)),
+                "capabilities": entry.get("capabilities", {}),
                 "delta_tool": candidate_delta,
                 "residual_tool": residual,
                 "geometry_objective": float(candidate_objective),
@@ -2228,6 +2671,7 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         )
     corrected["opt_wrist_rot"] = np.asarray(source["opt_wrist_rot"]).copy()
     corrected["opt_dof_pos"] = np.asarray(source["opt_dof_pos"]).copy()
+    semantic_corrected = copy.deepcopy(corrected)
 
     points_after = points_before + alpha[:, None, None] * delta_tool[None, None]
     before_hold = contact_geometry_metrics(
@@ -2258,7 +2702,8 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         tool,
         settings,
     )
-    invariant_report = _invariant_report(source, corrected, delta_world)
+    semantic_invariant_report = _invariant_report(source, semantic_corrected, delta_world)
+    invariant_report = semantic_invariant_report
     final_axis_constraint = (
         _axis_constraint_report(delta_tool, semantic_axis_direction)
         if semantic_axis_direction is not None
@@ -2267,7 +2712,7 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
     geometry_feasible = _is_feasible(after_hold, settings)
     semantic_geometry_passed = bool(
         geometry_feasible
-        and invariant_report["passed"]
+        and semantic_invariant_report["passed"]
         and (final_axis_constraint is None or final_axis_constraint["passed"])
     )
     semantic_geometry_tier = {
@@ -2275,7 +2720,7 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         "status": "passed" if semantic_geometry_passed else "failed",
         "passed": semantic_geometry_passed,
         "geometry_feasible": geometry_feasible,
-        "invariants_passed": bool(invariant_report["passed"]),
+        "invariants_passed": bool(semantic_invariant_report["passed"]),
         "axis_constraint_passed": bool(
             final_axis_constraint is None or final_axis_constraint["passed"]
         ),
@@ -2290,6 +2735,20 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
             float(np.linalg.norm(delta_tool)) * 1000.0,
         )
     )
+    physical_optimization_tier = {
+        "name": "physical_optimization",
+        "status": "not_requested",
+        "passed": False,
+        "required": False,
+        "attempted": False,
+    }
+    mano_target_sync_tier = {
+        "name": "mano_target_sync",
+        "status": "not_requested",
+        "passed": False,
+        "required": False,
+    }
+    initial_physics_tier = None
     if not args.physx:
         physics_tier = {
             "name": "isaac_gym_physics",
@@ -2306,6 +2765,14 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
             "required": True,
             "reason": "semantic geometry validation did not pass",
         }
+        physical_optimization_tier.update(
+            status="skipped", required=True,
+            reason="semantic geometry validation did not pass",
+        )
+        mano_target_sync_tier.update(
+            status="skipped", required=True,
+            reason="semantic geometry validation did not pass",
+        )
     else:
         if args.headless:
             _log("[2/2] 开始 Isaac Gym/PhysX 无窗口接触验证")
@@ -2313,7 +2780,7 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
             _log("[2/2] 开始 Isaac Gym/PhysX 接触验证；随后打开修正轨迹 Viewer")
             _log("Viewer：唯一工具 + 修正绿手；关闭窗口后继续保存")
         try:
-            physics_tier = run_isaac_gym_validation(
+            initial_physics_tier = run_isaac_gym_validation(
                 corrected,
                 hand,
                 context,
@@ -2328,15 +2795,140 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
                 timeout=args.physics_timeout,
             )
         except Exception as error:
-            physics_tier = {
+            initial_physics_tier = {
                 "name": "isaac_gym_physics",
                 "status": "error",
                 "passed": False,
                 "required": True,
                 "error": f"{type(error).__name__}: {error}",
             }
+        initial_physics_tier.setdefault("required", True)
+        physics_tier = initial_physics_tier
+        if bool(initial_physics_tier.get("passed", False)):
+            physical_optimization_tier = {
+                "name": "physical_optimization",
+                "status": "not_needed",
+                "passed": True,
+                "required": True,
+                "attempted": False,
+                "reason": "initial PhysX validation passed",
+            }
+            mano_target_sync_tier = {
+                "name": "mano_target_sync",
+                "status": "not_needed",
+                "passed": True,
+                "required": True,
+                "reason": "no physical trajectory change was required",
+            }
+        elif initial_physics_tier.get("status") == "failed":
+            _log("[2/3] 初次 PhysX 验收失败；开始局部手指链/掌部物理修正")
+            try:
+                corrected, physics_tier, physical_optimization_tier, invariant_report = (
+                    run_physical_correction(
+                        semantic_corrected,
+                        initial_physics_tier,
+                        hand,
+                        context,
+                        contact_names,
+                        hold_frame_ids,
+                        kinematics,
+                        tool,
+                        settings,
+                        args,
+                    )
+                )
+            except Exception as error:
+                corrected = copy.deepcopy(semantic_corrected)
+                physics_tier = initial_physics_tier
+                physical_optimization_tier = {
+                    "name": "physical_optimization",
+                    "status": "error",
+                    "passed": False,
+                    "required": True,
+                    "attempted": True,
+                    "error": f"{type(error).__name__}: {error}",
+                }
+                invariant_report = semantic_invariant_report
+            if bool(physical_optimization_tier.get("passed", False)):
+                try:
+                    body_names = physics_tier.get("hand_body_names", ())
+                    corrected_mano_targets, mano_target_sync_tier = (
+                        _build_corrected_mano_body_targets(
+                            semantic_corrected, corrected, kinematics, body_names
+                        )
+                    )
+                    corrected["corrected_mano_body_targets"] = corrected_mano_targets
+                    corrected["corrected_mano_body_names"] = list(body_names)
+                    corrected["opt_joints_pos"] = corrected_mano_targets.copy()
+                    mano_target_sync_tier["required"] = True
+                except Exception as error:
+                    mano_target_sync_tier = {
+                        "name": "mano_target_sync",
+                        "status": "error",
+                        "passed": False,
+                        "required": True,
+                        "error": f"{type(error).__name__}: {error}",
+                    }
+            else:
+                mano_target_sync_tier = {
+                    "name": "mano_target_sync",
+                    "status": "skipped",
+                    "passed": False,
+                    "required": True,
+                    "reason": "physical optimization did not pass",
+                }
         else:
-            physics_tier.setdefault("required", True)
+            physical_optimization_tier = {
+                "name": "physical_optimization",
+                "status": "skipped",
+                "passed": False,
+                "required": True,
+                "attempted": False,
+                "reason": "initial PhysX validation could not produce repair diagnostics",
+            }
+            mano_target_sync_tier = {
+                "name": "mano_target_sync",
+                "status": "skipped",
+                "passed": False,
+                "required": True,
+                "reason": "physical optimization was not run",
+            }
+
+    if physical_optimization_tier.get("attempted", False):
+        final_world = kinematics.world_surface_trajectory(
+            np.asarray(corrected["opt_wrist_pos"], dtype=np.float64),
+            np.asarray(corrected["opt_wrist_rot"], dtype=np.float64),
+            np.asarray(corrected["opt_dof_pos"], dtype=np.float64),
+        )
+        points_after = world_to_tool_points(final_world, context.object_trajectory)
+        after_hold = contact_geometry_metrics(
+            points_after[hold_frame_ids],
+            kinematics.point_link_ids_array,
+            contact_ids,
+            tool,
+            settings,
+        )
+        after_full = contact_geometry_metrics(
+            points_after,
+            kinematics.point_link_ids_array,
+            contact_ids,
+            tool,
+            settings,
+        )
+        geometry_feasible = _is_feasible(after_hold, settings)
+        semantic_geometry_passed = bool(
+            geometry_feasible
+            and invariant_report["passed"]
+            and (final_axis_constraint is None or final_axis_constraint["passed"])
+        )
+        semantic_geometry_tier.update(
+            status="passed" if semantic_geometry_passed else "failed",
+            passed=semantic_geometry_passed,
+            geometry_feasible=geometry_feasible,
+            invariants_passed=bool(invariant_report["passed"]),
+        )
+    else:
+        invariant_report = semantic_invariant_report
     if physics_tier["status"] == "passed":
         _log(
             "[2/2] PhysX 验证通过：工具接触帧={:.2%}，指定末端接触帧={:.2%}，最大接触包络={:.2f} mm".format(
@@ -2354,11 +2946,47 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
     validation_tiers = {
         "semantic_geometry": semantic_geometry_tier,
         "isaac_gym_physics": physics_tier,
+        "physical_optimization": physical_optimization_tier,
+        "mano_target_sync": mano_target_sync_tier,
     }
     overall_passed = bool(
         semantic_geometry_tier["passed"]
-        and (not args.physx or physics_tier["passed"])
+        and (
+            not args.physx
+            or (
+                physics_tier["passed"]
+                and physical_optimization_tier["passed"]
+                and mano_target_sync_tier["passed"]
+            )
+        )
     )
+    physical_wrist_delta = (
+        np.asarray(corrected["opt_wrist_pos"], dtype=np.float64)
+        - np.asarray(semantic_corrected["opt_wrist_pos"], dtype=np.float64)
+    )
+    physical_dof_delta = (
+        np.asarray(corrected["opt_dof_pos"], dtype=np.float64)
+        - np.asarray(semantic_corrected["opt_dof_pos"], dtype=np.float64)
+    )
+    physical_correction_metadata = {
+        "enabled": bool(args.physx),
+        "attempted": bool(physical_optimization_tier.get("attempted", False)),
+        "method": physical_optimization_tier.get("method"),
+        "active_link_names": physical_optimization_tier.get("active_link_names", []),
+        "active_dof_names": physical_optimization_tier.get("active_dof_names", []),
+        "wrist_rotation_locked": True,
+        "maximum_wrist_translation": float(
+            np.max(np.linalg.norm(physical_wrist_delta, axis=1))
+        ),
+        "maximum_dof_correction": float(np.max(np.abs(physical_dof_delta))),
+        "mano_target_source": (
+            "corrected_mano_body_targets"
+            if "corrected_mano_body_targets" in corrected
+            else "semantic_rigid_transform"
+        ),
+    }
+    corrected["physical_wrist_delta"] = physical_wrist_delta.astype(np.float32)
+    corrected["physical_dof_delta"] = physical_dof_delta.astype(np.float32)
     report = {
         "schema_version": SCHEMA_VERSION,
         "passed": overall_passed,
@@ -2405,11 +3033,16 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         "before_full": _summary_metrics(before_full),
         "after_full": _summary_metrics(after_full),
         "invariants": invariant_report,
+        "semantic_invariants": semantic_invariant_report,
         "validation_tiers": validation_tiers,
+        "initial_physics_validation": initial_physics_tier,
+        "physical_correction": physical_correction_metadata,
         "physics_validation_required": bool(args.physx),
         "physics_validation_note": (
-            "When enabled, tier two uses fixed-pose PhysX contact replay as a collision-response gate. "
-            "Whole-task dynamic grasp stability is still validated by the Stage-1 simulator."
+            "When enabled, PhysX first validates the semantic trajectory, then drives bounded "
+            "contact-normal finger IK (or palm-only wrist translation) if that gate fails, and "
+            "validates every accepted candidate again. Whole-task dynamic grasp stability is "
+            "still validated by the Stage-1 simulator."
         ),
     }
     corrected["contact_retarget"] = {
@@ -2438,6 +3071,7 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         "geometry_feasible": geometry_feasible,
         "physics_validation_required": bool(args.physx),
         "validation_tiers": validation_tiers,
+        "physical_correction": physical_correction_metadata,
         "settings": asdict(settings),
         "memory_retrieval": memory_retrieval_report,
         "validation_settings_hash": validation_settings_hash,
@@ -2445,6 +3079,7 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
             "before_hold": report["before_hold"],
             "after_hold": report["after_hold"],
             "invariants": invariant_report,
+            "semantic_invariants": semantic_invariant_report,
         },
     }
     report_path = (
@@ -2483,6 +3118,7 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
                 contact_transfer_report["initial_delta_tool"], dtype=np.float64
             )
             memory_entry = {
+                "bank_schema_version": 2,
                 "data_id": args.data_idx,
                 "tool_mesh_name": args.new_obj,
                 "tool_mesh_sha256": report["tool_mesh_sha256"],
@@ -2507,6 +3143,20 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
                     "black_violation_fraction": float(after_hold["black_violation_fraction"]),
                     "invariants_passed": bool(invariant_report["passed"]),
                 },
+                "capabilities": {
+                    "semantic_geometry": bool(semantic_geometry_tier["passed"]),
+                    "physics_validated": bool(args.physx and physics_tier["passed"]),
+                    "physical_joint_correction": bool(
+                        physical_optimization_tier.get("attempted", False)
+                        and np.max(np.abs(physical_dof_delta)) > 0.0
+                    ),
+                    "physical_wrist_correction": bool(
+                        physical_optimization_tier.get("attempted", False)
+                        and np.max(np.abs(physical_wrist_delta)) > 0.0
+                    ),
+                    "mano_target_sync": bool(mano_target_sync_tier["passed"]),
+                },
+                "physical_correction": physical_correction_metadata,
                 "corrected_pkl": str(output_path.resolve()),
                 "corrected_pkl_sha256": _sha256(output_path),
                 "report_path": str(report_path.resolve()),
@@ -2616,6 +3266,7 @@ def run_verification(args: argparse.Namespace) -> Dict[str, object]:
     translation_mode = metadata.get("translation_mode", "free3d")
     delta_tool = np.asarray(metadata["delta_tool"], dtype=np.float64)
     alpha = np.asarray(metadata["alpha"], dtype=np.float64)
+    semantic_expected = copy.deepcopy(source)
     if translation_mode == "contact-se3":
         transform_schedule_tool = np.asarray(
             metadata.get("transform_schedule_tool"), dtype=np.float64
@@ -2633,16 +3284,140 @@ def run_verification(args: argparse.Namespace) -> Dict[str, object]:
             if "opt_joints_pos" not in source
             else np.asarray(source["opt_joints_pos"], dtype=np.float64),
         )
-        invariants = _invariant_report(
+        semantic_expected["opt_wrist_pos"] = expected_wrist_pos
+        semantic_expected["opt_wrist_rot"] = expected_wrist_rot
+        if expected_joints_pos is not None:
+            semantic_expected["opt_joints_pos"] = expected_joints_pos
+        semantic_expected["opt_dof_pos"] = np.asarray(source["opt_dof_pos"]).copy()
+        semantic_invariants = _invariant_report(
             source,
-            corrected,
+            semantic_expected,
             expected_wrist_pos=expected_wrist_pos,
             expected_wrist_rot=expected_wrist_rot,
             expected_joints_pos=expected_joints_pos,
         )
     else:
         delta_world = tool_to_world_offsets(delta_tool, context.object_trajectory) * alpha[:, None]
-        invariants = _invariant_report(source, corrected, delta_world)
+        semantic_expected["opt_wrist_pos"] = (
+            np.asarray(source["opt_wrist_pos"], dtype=np.float64) + delta_world
+        )
+        semantic_expected["opt_wrist_rot"] = np.asarray(source["opt_wrist_rot"]).copy()
+        semantic_expected["opt_dof_pos"] = np.asarray(source["opt_dof_pos"]).copy()
+        if "opt_joints_pos" in source:
+            semantic_expected["opt_joints_pos"] = (
+                np.asarray(source["opt_joints_pos"], dtype=np.float64)
+                + delta_world[:, None]
+            )
+        semantic_invariants = _invariant_report(source, semantic_expected, delta_world)
+
+    physical_metadata = metadata.get("physical_correction", {})
+    physical_attempted = bool(
+        int(metadata.get("schema_version", 0)) >= 8
+        and isinstance(physical_metadata, Mapping)
+        and physical_metadata.get("attempted", False)
+    )
+    physical_delta_consistency = {
+        "passed": True,
+        "wrist_max_abs_error": 0.0,
+        "dof_max_abs_error": 0.0,
+    }
+    mano_target_consistency = {"passed": True, "status": "not_needed"}
+    if physical_attempted:
+        stored_wrist_delta = np.asarray(
+            corrected.get("physical_wrist_delta"), dtype=np.float64
+        )
+        stored_dof_delta = np.asarray(
+            corrected.get("physical_dof_delta"), dtype=np.float64
+        )
+        expected_wrist_delta = (
+            np.asarray(corrected["opt_wrist_pos"], dtype=np.float64)
+            - np.asarray(semantic_expected["opt_wrist_pos"], dtype=np.float64)
+        )
+        expected_dof_delta = (
+            np.asarray(corrected["opt_dof_pos"], dtype=np.float64)
+            - np.asarray(semantic_expected["opt_dof_pos"], dtype=np.float64)
+        )
+        wrist_error = (
+            float("inf")
+            if stored_wrist_delta.shape != expected_wrist_delta.shape
+            else float(np.max(np.abs(stored_wrist_delta - expected_wrist_delta)))
+        )
+        dof_error = (
+            float("inf")
+            if stored_dof_delta.shape != expected_dof_delta.shape
+            else float(np.max(np.abs(stored_dof_delta - expected_dof_delta)))
+        )
+        physical_delta_consistency = {
+            "passed": bool(wrist_error <= 1e-6 and dof_error <= 1e-6),
+            "wrist_max_abs_error": wrist_error,
+            "dof_max_abs_error": dof_error,
+        }
+        invariants = _physical_invariant_report(
+            semantic_expected,
+            corrected,
+            np.full(len(hand.dof_names), -np.inf),
+            np.full(len(hand.dof_names), np.inf),
+            physical_metadata.get("active_dof_names", ()),
+            hand,
+        )
+        stored_body_names = corrected.get("corrected_mano_body_names", ())
+        try:
+            expected_mano_targets, _ = _build_corrected_mano_body_targets(
+                semantic_expected, corrected, model, stored_body_names
+            )
+            stored_mano_targets = np.asarray(
+                corrected.get("corrected_mano_body_targets"), dtype=np.float64
+            )
+            mano_error = (
+                float("inf")
+                if stored_mano_targets.shape != expected_mano_targets.shape
+                else float(
+                    np.max(
+                        np.abs(
+                            stored_mano_targets
+                            - np.asarray(expected_mano_targets, dtype=np.float64)
+                        )
+                    )
+                )
+            )
+            opt_joints_error = (
+                float("inf")
+                if np.asarray(corrected.get("opt_joints_pos")).shape
+                != expected_mano_targets.shape
+                else float(
+                    np.max(
+                        np.abs(
+                            np.asarray(corrected["opt_joints_pos"], dtype=np.float64)
+                            - expected_mano_targets
+                        )
+                    )
+                )
+            )
+            mano_target_consistency = {
+                "passed": bool(mano_error <= 1e-6 and opt_joints_error <= 1e-6),
+                "status": "checked",
+                "maximum_target_error": mano_error,
+                "opt_joints_maximum_error": opt_joints_error,
+                "body_count": len(stored_body_names),
+            }
+        except Exception as error:
+            mano_target_consistency = {
+                "passed": False,
+                "status": "error",
+                "error": f"{type(error).__name__}: {error}",
+            }
+    else:
+        invariants = _invariant_report(
+            source,
+            corrected,
+            expected_wrist_pos=np.asarray(semantic_expected["opt_wrist_pos"]),
+            expected_wrist_rot=np.asarray(semantic_expected["opt_wrist_rot"]),
+            expected_joints_pos=(
+                None
+                if "opt_joints_pos" not in semantic_expected
+                else np.asarray(semantic_expected["opt_joints_pos"])
+            ),
+        )
     axis_constraint = None
     if translation_mode == "semantic-axis":
         stored_axis = metadata.get("semantic_axis")
@@ -2672,6 +3447,9 @@ def run_verification(args: argparse.Namespace) -> Dict[str, object]:
             and source_mesh_matches
             and collision_bundle_matches
             and stored_tiers_passed
+            and semantic_invariants["passed"]
+            and physical_delta_consistency["passed"]
+            and mano_target_consistency["passed"]
             and (axis_constraint is None or axis_constraint["passed"])
         ),
         "corrected_pkl": corrected_path,
@@ -2694,6 +3472,10 @@ def run_verification(args: argparse.Namespace) -> Dict[str, object]:
         "axis_constraint": axis_constraint,
         "geometry": _summary_metrics(metrics),
         "invariants": invariants,
+        "semantic_invariants": semantic_invariants,
+        "physical_delta_consistency": physical_delta_consistency,
+        "mano_target_consistency": mano_target_consistency,
+        "physical_correction": physical_metadata,
         "physics_validation_required": physics_validation_required,
     }
     report_path = (
@@ -2817,7 +3599,10 @@ def build_parser() -> argparse.ArgumentParser:
     physics_group.add_argument(
         "--physx",
         action="store_true",
-        help="run PhysX validation and require it to pass before saving the corrected PKL",
+        help=(
+            "run PhysX validation, repair failed penetrations with bounded local IK, and require "
+            "the final physical/Stage-1 target checks to pass before saving"
+        ),
     )
     physics_group.add_argument(
         "--skip-physics-validation",

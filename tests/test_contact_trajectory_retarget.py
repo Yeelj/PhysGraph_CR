@@ -499,6 +499,29 @@ class ContactTrajectoryRetargetTest(unittest.TestCase):
         self.assertFalse(stage1_gate(required))
         self.assertTrue(stage1_gate(legacy))
 
+    def test_schema8_physx_requires_physical_and_mano_tiers(self):
+        metadata = {
+            "schema_version": 8,
+            "physics_validation_required": True,
+            "validation_tiers": {
+                "semantic_geometry": {"passed": True},
+                "isaac_gym_physics": {"passed": True},
+            },
+        }
+        self.assertFalse(MODULE["_stored_validation_tiers_passed"](metadata))
+        base_module = load_base_module_without_training_dependencies()
+        self.assertFalse(
+            base_module["_contact_retarget_validation_tiers_passed"](metadata)
+        )
+        metadata["validation_tiers"].update(
+            physical_optimization={"passed": True},
+            mano_target_sync={"passed": True},
+        )
+        self.assertTrue(MODULE["_stored_validation_tiers_passed"](metadata))
+        self.assertTrue(
+            base_module["_contact_retarget_validation_tiers_passed"](metadata)
+        )
+
     def test_removed_show_original_hand_option_is_rejected(self):
         with self.assertRaises(SystemExit):
             MODULE["build_parser"]().parse_args(
@@ -697,6 +720,92 @@ class ContactTrajectoryRetargetTest(unittest.TestCase):
         self.assertAlmostEqual(float(torch.linalg.norm(data["wrist_rot"][-1])), np.pi, places=5)
         for name in joint_names:
             self.assertTrue(torch.allclose(data["mano_joints"][name], data["wrist_pos"]))
+
+    def test_stage1_uses_physics_corrected_body_targets(self):
+        base_module = load_base_module_without_training_dependencies()
+
+        class TestManipData(base_module["ManipData"]):
+            def __getitem__(self, index):
+                raise NotImplementedError
+
+        body_names = [
+            "palm", "thumb_tip", "index_tip", "middle_tip", "ring_tip", "pinky_tip"
+        ]
+        mapping = {name: ("wrist" if name == "palm" else name) for name in body_names}
+        dataset = object.__new__(TestManipData)
+        dataset.dexhand = types.SimpleNamespace(
+            side="rh",
+            body_names=body_names,
+            to_hand=lambda name: (mapping[name],),
+        )
+        dataset.device = "cpu"
+        dataset.skip = 2
+        dataset.ch_dist = SquaredChamfer()
+        length = 3
+        original = torch.zeros(length, 3)
+        targets = torch.arange(length * len(body_names) * 3, dtype=torch.float32).reshape(
+            length, len(body_names), 3
+        ) * 0.001
+        final_wrist = torch.tensor([[0.01, 0.0, 0.0]]).repeat(length, 1)
+        data = {
+            "obj_trajectory": torch.eye(4).repeat(length, 1, 1),
+            "obj_verts": torch.tensor([[0.0, 0.0, 0.0]]),
+            "wrist_pos": original.clone(),
+            "wrist_rot": original.clone(),
+            "opt_wrist_pos": final_wrist,
+            "opt_wrist_rot": original.clone(),
+            "mano_joints": {
+                name: original.clone() for name in body_names if name != "palm"
+            },
+            "mano_joints_velocity": {
+                name: original.clone() for name in body_names if name != "palm"
+            },
+            "corrected_mano_body_targets": targets,
+            "corrected_mano_body_names": body_names,
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_dir = Path(temp_dir)
+            mesh_file = temp_dir / "tool.ply"
+            mesh_file.write_bytes(b"same mesh used by correction and stage1")
+            collision_mesh = temp_dir / "collision.ply"
+            collision_mesh.write_bytes(b"matching physical collision mesh")
+            collision_urdf = temp_dir / "collision.urdf"
+            collision_urdf.write_text(
+                '<robot name="tool"><link name="base"><collision><geometry>'
+                '<mesh filename="collision.ply"/></geometry></collision></link></robot>'
+            )
+            data["obj_mesh_path"] = str(mesh_file)
+            data["obj_urdf_path"] = str(collision_urdf)
+            metadata = {
+                "schema_version": 8,
+                "geometry_feasible": True,
+                "side": "right",
+                "semantic_precheck": {"passed": True},
+                "physics_validation_required": True,
+                "tool_mesh": str(mesh_file),
+                "tool_mesh_sha256": hashlib.sha256(mesh_file.read_bytes()).hexdigest(),
+                "collision_bundle_sha256": dataset._urdf_bundle_sha256(collision_urdf),
+                "delta_tool": np.zeros(3, dtype=np.float32),
+                "alpha": np.ones(length, dtype=np.float32),
+                "validation_tiers": {
+                    name: {"passed": True}
+                    for name in (
+                        "semantic_geometry", "isaac_gym_physics",
+                        "physical_optimization", "mano_target_sync",
+                    )
+                },
+            }
+            dataset._apply_contact_retarget_targets(data, metadata, "corrected.pkl")
+
+        self.assertTrue(torch.equal(data["wrist_pos"], final_wrist))
+        for body_index, body_name in enumerate(body_names[1:], start=1):
+            self.assertTrue(
+                torch.equal(data["mano_joints"][body_name], targets[:, body_index])
+            )
+        self.assertEqual(
+            tuple(data["corrected_mano_body_targets_velocity"].shape),
+            tuple(targets.shape),
+        )
 
 
 if __name__ == "__main__":

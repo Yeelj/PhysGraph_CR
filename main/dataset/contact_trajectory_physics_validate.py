@@ -67,6 +67,18 @@ def _color_actor(gym, environment, actor, color: gymapi.Vec3) -> None:
         )
 
 
+def _vector3(value) -> list:
+    """Convert an Isaac Gym contact vector to a JSON-safe xyz list."""
+
+    array = np.asarray(value)
+    if array.dtype.names and all(name in array.dtype.names for name in ("x", "y", "z")):
+        return [float(array[name]) for name in ("x", "y", "z")]
+    flat = np.asarray(value, dtype=np.float64).reshape(-1)
+    if len(flat) < 3:
+        return [0.0, 0.0, 0.0]
+    return [float(item) for item in flat[:3]]
+
+
 def replay_corrected_trajectory(request: Dict) -> Dict:
     """Kinematically replay one corrected green hand and one moving tool."""
 
@@ -285,6 +297,8 @@ def run_validation(request: Dict) -> Dict:
         actors = []
         object_body_indices = []
         intended_body_indices = []
+        hand_body_names_by_index = []
+        canonical_hand_body_names = None
         source_dof_names: Sequence[str] = tuple(request["hand_dof_names"])
         source_name_to_index = {name: index for index, name in enumerate(source_dof_names)}
         num_per_row = max(1, int(np.ceil(np.sqrt(len(frame_ids)))))
@@ -330,6 +344,17 @@ def run_validation(request: Dict) -> Dict:
             gym.set_actor_dof_states(environment, hand_actor, states, gymapi.STATE_ALL)
             gym.set_actor_dof_position_targets(environment, hand_actor, targets)
 
+            body_names = gym.get_actor_rigid_body_names(environment, hand_actor)
+            if canonical_hand_body_names is None:
+                canonical_hand_body_names = tuple(str(name) for name in body_names)
+            body_name_by_index = {}
+            for body_name in body_names:
+                body_handle = gym.find_actor_rigid_body_handle(environment, hand_actor, body_name)
+                body_index = gym.get_actor_rigid_body_index(
+                    environment, hand_actor, body_handle, gymapi.DOMAIN_ENV
+                )
+                body_name_by_index[int(body_index)] = str(body_name)
+
             object_body_indices.append(
                 gym.get_actor_rigid_body_index(
                     environment, object_actor, 0, gymapi.DOMAIN_ENV
@@ -345,6 +370,7 @@ def run_validation(request: Dict) -> Dict:
                         )
                     )
             intended_body_indices.append(set(per_environment_intended))
+            hand_body_names_by_index.append(body_name_by_index)
             environments.append(environment)
             actors.append((hand_actor, object_actor))
 
@@ -359,6 +385,11 @@ def run_validation(request: Dict) -> Dict:
         maximum_overlap = 0.0
         maximum_force = 0.0
         finite = True
+        min_contact_ratio = float(request.get("min_contact_frame_ratio", 0.5))
+        max_force_limit = float(request.get("max_contact_force", 1000.0))
+        max_overlap_limit = float(request.get("max_initial_overlap", 0.01))
+        dof_lower = None
+        dof_upper = None
         for local_index, (frame_id, environment) in enumerate(zip(frame_ids, environments)):
             contacts = gym.get_env_rigid_contacts(environment)
             if len(contacts):
@@ -388,10 +419,43 @@ def run_validation(request: Dict) -> Dict:
                 intended_count = int(np.isin(hand_body, list(intended)).sum())
                 if intended_count:
                     intended_contact_frames += 1
+
+                worst_index = int(
+                    np.argmax(forces)
+                    if frame_force > max_force_limit
+                    else np.argmax(np.maximum(overlaps, 0.0))
+                )
+                worst_contact = object_contacts[worst_index]
+                worst_hand_body_index = int(hand_body[worst_index])
+                worst_hand_body_name = hand_body_names_by_index[local_index].get(
+                    worst_hand_body_index, f"body_{worst_hand_body_index}"
+                )
+                normal = np.asarray(_vector3(worst_contact["normal"]), dtype=np.float64)
+                # PhysX reports the normal as the force direction on body0.  The
+                # corresponding escape direction for the hand is therefore the
+                # normal for body0 and its negation for body1.
+                hand_escape_normal = (
+                    normal
+                    if int(worst_contact["body0"]) == worst_hand_body_index
+                    else -normal
+                )
             else:
                 frame_overlap = 0.0
                 frame_force = 0.0
                 intended_count = 0
+                worst_hand_body_name = None
+                hand_escape_normal = np.zeros(3, dtype=np.float64)
+
+            hand_actor = actors[local_index][0]
+            if dof_lower is None:
+                actor_dof_names = gym.get_actor_dof_names(environment, hand_actor)
+                actor_properties = gym.get_actor_dof_properties(environment, hand_actor)
+                dof_lower = np.full(len(source_dof_names), -np.inf, dtype=np.float64)
+                dof_upper = np.full(len(source_dof_names), np.inf, dtype=np.float64)
+                for actor_index, dof_name in enumerate(actor_dof_names):
+                    source_index = source_name_to_index[dof_name]
+                    dof_lower[source_index] = float(actor_properties["lower"][actor_index])
+                    dof_upper[source_index] = float(actor_properties["upper"][actor_index])
             per_frame.append(
                 {
                     "frame": int(frame_id),
@@ -399,14 +463,13 @@ def run_validation(request: Dict) -> Dict:
                     "intended_link_contact_count": intended_count,
                     "maximum_initial_overlap": frame_overlap,
                     "maximum_contact_force": frame_force,
+                    "worst_hand_body_name": worst_hand_body_name,
+                    "hand_escape_normal": hand_escape_normal.tolist(),
                 }
             )
 
         object_contact_ratio = float(object_contact_frames / len(frame_ids))
         intended_contact_ratio = float(intended_contact_frames / len(frame_ids))
-        min_contact_ratio = float(request.get("min_contact_frame_ratio", 0.5))
-        max_force_limit = float(request.get("max_contact_force", 1000.0))
-        max_overlap_limit = float(request.get("max_initial_overlap", 0.01))
         passed = bool(
             finite
             and object_contact_ratio >= min_contact_ratio
@@ -430,6 +493,9 @@ def run_validation(request: Dict) -> Dict:
             "maximum_initial_overlap": maximum_overlap,
             "maximum_contact_force": maximum_force,
             "all_finite": finite,
+            "hand_body_names": list(canonical_hand_body_names or ()),
+            "dof_lower_limits": None if dof_lower is None else dof_lower.tolist(),
+            "dof_upper_limits": None if dof_upper is None else dof_upper.tolist(),
             "thresholds": {
                 "min_contact_frame_ratio": min_contact_ratio,
                 "max_contact_force": max_force_limit,

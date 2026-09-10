@@ -813,16 +813,38 @@ class DexHandManipBiHEnv(VecTask):
                 mano_joints = []
                 for d in data:
                     if side == "rh":
-                        mano_joints.append(
-                            torch.concat(
-                                [
-                                    d[k][self.dexhand_rh.to_hand(j_name)[0]]
-                                    for j_name in self.dexhand_rh.body_names
-                                    if self.dexhand_rh.to_hand(j_name)[0] != "wrist"
-                                ],
-                                dim=-1,
-                            )
+                        corrected_key = (
+                            "corrected_mano_body_targets"
+                            if k == "mano_joints"
+                            else "corrected_mano_body_targets_velocity"
                         )
+                        if corrected_key in d:
+                            body_names = list(d.get("corrected_mano_body_names", ()))
+                            if body_names != list(self.dexhand_rh.body_names):
+                                raise ValueError(
+                                    "Corrected MANO body ordering differs from the right dex-hand"
+                                )
+                            body_indices = [
+                                index
+                                for index, body_name in enumerate(body_names)
+                                if self.dexhand_rh.to_hand(body_name)[0] != "wrist"
+                            ]
+                            mano_joints.append(
+                                d[corrected_key][:, body_indices].reshape(
+                                    len(d[corrected_key]), -1
+                                )
+                            )
+                        else:
+                            mano_joints.append(
+                                torch.concat(
+                                    [
+                                        d[k][self.dexhand_rh.to_hand(j_name)[0]]
+                                        for j_name in self.dexhand_rh.body_names
+                                        if self.dexhand_rh.to_hand(j_name)[0] != "wrist"
+                                    ],
+                                    dim=-1,
+                                )
+                            )
                     else:
                         mano_joints.append(
                             torch.concat(
