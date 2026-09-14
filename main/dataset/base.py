@@ -14,7 +14,7 @@ import pickle
 
 
 def _contact_retarget_validation_tiers_passed(metadata):
-    """Check only the correction tiers that were explicitly configured."""
+    """Check schema-required tiers plus explicitly configured optional PhysX."""
 
     if int(metadata.get("schema_version", 0)) < 3:
         return True
@@ -22,6 +22,10 @@ def _contact_retarget_validation_tiers_passed(metadata):
     if not isinstance(validation_tiers, dict):
         return False
     required_tiers = ["semantic_geometry"]
+    # Schema-v9 makes collision-mesh penetration a mandatory gate even when
+    # the optional PhysX replay was not requested.
+    if int(metadata.get("schema_version", 0)) >= 9:
+        required_tiers.append("collision_mesh_penetration")
     # Schema-v3/v4 PKLs written before this switch did not carry the field and
     # required PhysX, so absence deliberately remains strict.
     if bool(metadata.get("physics_validation_required", True)):
@@ -215,9 +219,9 @@ class ManipData(Dataset, ABC):
         if int(metadata.get("schema_version", 0)) >= 3:
             if not _contact_retarget_validation_tiers_passed(metadata):
                 raise ValueError(
-                    "Stage-1 requires a schema-v3-or-newer contact trajectory that passed all "
-                    "validation tiers configured during correction (semantic geometry and "
-                    f"optional PhysX): {retargeted_data_path}"
+                    "Stage-1 requires a contact trajectory that passed every validation tier "
+                    "required by its schema (semantic geometry, schema-v9 collision-mesh "
+                    f"penetration, and optional PhysX): {retargeted_data_path}"
                 )
         if int(metadata.get("schema_version", 0)) >= 4:
             semantic_precheck = metadata.get("semantic_precheck")

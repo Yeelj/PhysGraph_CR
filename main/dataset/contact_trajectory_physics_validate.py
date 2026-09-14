@@ -94,6 +94,27 @@ def replay_corrected_trajectory(request: Dict) -> Dict:
         and object_trajectory.shape == (length, 4, 4)
     ):
         raise ValueError("Corrected Viewer replay arrays have inconsistent shapes")
+    sdf_frame_ids = np.asarray(request.get("replay_sdf_frame_ids", ()), dtype=np.int64)
+    sdf_depth = np.asarray(
+        request.get("replay_sdf_penetration_depth", ()), dtype=np.float64
+    )
+    sdf_points = np.asarray(
+        request.get("replay_sdf_worst_points_world", ()), dtype=np.float64
+    )
+    sdf_escape = np.asarray(
+        request.get("replay_sdf_hand_escape_direction_world", ()), dtype=np.float64
+    )
+    if len(sdf_frame_ids):
+        if (
+            sdf_depth.shape != (len(sdf_frame_ids),)
+            or sdf_points.shape != (len(sdf_frame_ids), 3)
+            or sdf_escape.shape != (len(sdf_frame_ids), 3)
+        ):
+            raise ValueError("Viewer collision-SDF arrays have inconsistent shapes")
+        sdf_lookup = {int(frame): index for index, frame in enumerate(sdf_frame_ids)}
+    else:
+        sdf_lookup = {}
+    sdf_threshold = float(request.get("replay_sdf_threshold", 0.0))
 
     gym = gymapi.acquire_gym()
     sim_params = gymapi.SimParams()
@@ -184,6 +205,20 @@ def replay_corrected_trajectory(request: Dict) -> Dict:
             "关闭 Viewer 结束回放。",
             flush=True,
         )
+        if sdf_lookup:
+            print(
+                "[Isaac Gym Viewer][collision SDF] 最大真实/代理穿透={:.3f} mm，"
+                "阈值={:.3f} mm，worst frame={}，link={}，非闭合代理={}；"
+                "红色十字表示超过阈值，黄色十字表示阈值内的正穿透，"
+                "青色线表示手部 SDF 逃逸方向。".format(
+                    float(request.get("replay_sdf_maximum_penetration", 0.0)) * 1000.0,
+                    sdf_threshold * 1000.0,
+                    request.get("replay_sdf_worst_frame"),
+                    request.get("replay_sdf_worst_link"),
+                    bool(request.get("replay_sdf_uses_proxy_geometry", False)),
+                ),
+                flush=True,
+            )
         rendered_frames = 0
         while not gym.query_viewer_has_closed(viewer):
             frame = rendered_frames % length
@@ -206,6 +241,48 @@ def replay_corrected_trajectory(request: Dict) -> Dict:
             gym.set_actor_dof_states(
                 environment, hand_actor, states, gymapi.STATE_ALL
             )
+            gym.clear_lines(viewer)
+            sdf_index = sdf_lookup.get(frame)
+            if sdf_index is not None and sdf_depth[sdf_index] > 1e-7:
+                point = sdf_points[sdf_index]
+                if np.isfinite(point).all():
+                    half_size = max(0.003, min(0.015, float(sdf_depth[sdf_index]) * 2.0))
+                    vertices = np.asarray(
+                        [
+                            point + [-half_size, 0.0, 0.0],
+                            point + [half_size, 0.0, 0.0],
+                            point + [0.0, -half_size, 0.0],
+                            point + [0.0, half_size, 0.0],
+                            point + [0.0, 0.0, -half_size],
+                            point + [0.0, 0.0, half_size],
+                        ],
+                        dtype=np.float32,
+                    )
+                    color = (
+                        np.asarray([1.0, 0.05, 0.05], dtype=np.float32)
+                        if sdf_depth[sdf_index] > sdf_threshold
+                        else np.asarray([1.0, 0.8, 0.05], dtype=np.float32)
+                    )
+                    colors = np.repeat(color[None], 3, axis=0)
+                    gym.add_lines(viewer, environment, 3, vertices, colors)
+                    escape = sdf_escape[sdf_index]
+                    escape_norm = float(np.linalg.norm(escape))
+                    if np.isfinite(escape).all() and escape_norm > 1e-7:
+                        arrow_length = max(
+                            0.008,
+                            min(0.025, float(sdf_depth[sdf_index]) * 2.5),
+                        )
+                        arrow = np.asarray(
+                            [point, point + escape / escape_norm * arrow_length],
+                            dtype=np.float32,
+                        )
+                        gym.add_lines(
+                            viewer,
+                            environment,
+                            1,
+                            arrow,
+                            np.asarray([[0.05, 0.9, 1.0]], dtype=np.float32),
+                        )
             # Viewer playback is purely kinematic.  The independent tier-three
             # validator already ran PhysX; simulating here would let contacts
             # alter the fixed PKL finger angles before rendering.
@@ -223,6 +300,7 @@ def replay_corrected_trajectory(request: Dict) -> Dict:
             "displayed_hand_actor_count": 1,
             "tool_actor_count": 1,
             "physics_simulation_during_replay": False,
+            "collision_sdf_overlay": bool(sdf_lookup),
         }
     finally:
         if viewer is not None:

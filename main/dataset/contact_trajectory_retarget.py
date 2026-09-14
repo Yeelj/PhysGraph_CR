@@ -37,7 +37,7 @@ from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 
 def _physics_validation_required(metadata: Mapping[str, object]) -> bool:
@@ -57,6 +57,8 @@ def _stored_validation_tiers_passed(
     if not isinstance(tiers, Mapping):
         return False
     required_names = ["semantic_geometry"]
+    if int(metadata.get("schema_version", 0)) >= 9:
+        required_names.append("collision_mesh_penetration")
     if _physics_validation_required(metadata):
         required_names.append("isaac_gym_physics")
         if int(metadata.get("schema_version", 0)) >= 8:
@@ -260,6 +262,26 @@ def _primitive_samples(geometry: ET.Element, count: int) -> np.ndarray:
     return np.empty((0, 3), dtype=np.float64)
 
 
+def _primitive_mesh(geometry: ET.Element) -> Optional[trimesh.Trimesh]:
+    box = geometry.find("box")
+    if box is not None:
+        extents = np.fromstring(box.attrib["size"], sep=" ", dtype=np.float64)
+        return trimesh.creation.box(extents=extents)
+    sphere = geometry.find("sphere")
+    if sphere is not None:
+        return trimesh.creation.icosphere(
+            subdivisions=2, radius=float(sphere.attrib["radius"])
+        )
+    cylinder = geometry.find("cylinder")
+    if cylinder is not None:
+        return trimesh.creation.cylinder(
+            radius=float(cylinder.attrib["radius"]),
+            height=float(cylinder.attrib["length"]),
+            sections=24,
+        )
+    return None
+
+
 @dataclass(frozen=True)
 class URDFJoint:
     name: str
@@ -284,7 +306,9 @@ class URDFCollisionKinematics:
     ):
         self.urdf_path = urdf_path.resolve()
         self.dof_names = list(dof_names)
-        root = ET.parse(self.urdf_path).getroot()
+        # Some generated object URDFs contain a leading blank line before the
+        # XML declaration. ElementTree rejects that layout unless it is stripped.
+        root = ET.fromstring(self.urdf_path.read_text(encoding="utf-8").lstrip())
         links = [element.attrib["name"] for element in root.findall("link")]
         self.joints: List[URDFJoint] = []
         child_links = set()
@@ -324,10 +348,13 @@ class URDFCollisionKinematics:
             raise ValueError(f"Expected one URDF root link, found {roots}")
         self.root_link = roots[0]
         self.children: Dict[str, List[URDFJoint]] = {}
+        self.parent_joint_by_child: Dict[str, URDFJoint] = {}
         for joint in self.joints:
             self.children.setdefault(joint.parent, []).append(joint)
+            self.parent_joint_by_child[joint.child] = joint
 
         collision_points: Dict[str, List[np.ndarray]] = {}
+        collision_meshes: Dict[str, List[trimesh.Trimesh]] = {}
         for link in root.findall("link"):
             link_name = link.attrib["name"]
             collision_elements = link.findall("collision")
@@ -347,12 +374,15 @@ class URDFCollisionKinematics:
                         raise ValueError(f"Invalid mesh scale in {self.urdf_path}: {mesh_element.attrib}")
                     mesh = mesh.copy()
                     mesh.vertices = np.asarray(mesh.vertices) * scale[None]
-                    points = _deterministic_mesh_samples(mesh, per_collision)
                 else:
-                    points = _primitive_samples(geometry, per_collision)
-                if len(points):
-                    points = _transform_points(points, _origin_matrix(collision.find("origin")))
+                    mesh = _primitive_mesh(geometry)
+                if mesh is not None and len(mesh.vertices):
+                    mesh = mesh.copy()
+                    mesh.apply_transform(_origin_matrix(collision.find("origin")))
+                    points = _deterministic_mesh_samples(mesh, per_collision)
                     collision_points.setdefault(link_name, []).append(points)
+                    collision_meshes.setdefault(link_name, []).append(mesh)
+        self.link_collision_meshes = collision_meshes
         self.link_points: Dict[str, np.ndarray] = {
             link: np.concatenate(parts, axis=0)[:points_per_link]
             for link, parts in collision_points.items()
@@ -406,6 +436,27 @@ class URDFCollisionKinematics:
                 stack.append(joint.child)
         return transforms
 
+    def actuated_ancestor_dof_indices(self, link_name: str) -> np.ndarray:
+        """Return only stored DOFs that can kinematically move ``link_name``."""
+
+        indices = []
+        current = str(link_name)
+        visited = set()
+        while current != self.root_link:
+            if current in visited or current not in self.parent_joint_by_child:
+                break
+            visited.add(current)
+            joint = self.parent_joint_by_child[current]
+            controlling_name = (
+                joint.name
+                if joint.name in self.dof_names
+                else joint.mimic_joint
+            )
+            if controlling_name in self.dof_names:
+                indices.append(self.dof_names.index(controlling_name))
+            current = joint.parent
+        return np.asarray(sorted(set(indices)), dtype=np.int64)
+
     def root_frame_surface_points(self, dof: np.ndarray) -> np.ndarray:
         transforms = self.link_transforms(dof)
         result = []
@@ -454,6 +505,733 @@ class URDFCollisionKinematics:
             local = np.stack([transforms[name][:3, 3] for name in link_names])
             frames.append(local @ wrist_rotations[frame].T + wrist_pos[frame])
         return np.stack(frames)
+
+
+def _collision_sdf_proxy(mesh: trimesh.Trimesh) -> Tuple[trimesh.Trimesh, Dict[str, object]]:
+    """Return a closed mesh suitable for a signed query and describe any proxying."""
+
+    original = mesh.copy()
+    original_watertight = bool(original.is_watertight)
+    original_winding = bool(original.is_winding_consistent)
+    use_original = bool(
+        original_watertight
+        and original_winding
+        and np.isfinite(original.volume)
+        and abs(float(original.volume)) > 1e-12
+    )
+    if use_original:
+        proxy = original
+        proxy_kind = "original_collision_mesh"
+    else:
+        proxy = original.convex_hull
+        proxy_kind = "convex_hull_for_non_watertight_collision_mesh"
+    proxy.fix_normals()
+    if not proxy.is_watertight:
+        raise ValueError("Could not construct a watertight collision SDF proxy")
+    return proxy, {
+        "proxy_kind": proxy_kind,
+        "original_watertight": original_watertight,
+        "original_winding_consistent": original_winding,
+        "proxy_watertight": bool(proxy.is_watertight),
+        "original_vertex_count": int(len(original.vertices)),
+        "proxy_vertex_count": int(len(proxy.vertices)),
+    }
+
+
+def _union_signed_distance(
+    meshes: Sequence[trimesh.Trimesh], points: np.ndarray
+) -> np.ndarray:
+    """Signed distance to a mesh union using trimesh's positive-inside convention."""
+
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    if not len(meshes):
+        raise ValueError("Signed-distance query requires at least one collision mesh")
+    values = []
+    chunk_size = 100_000
+    for mesh in meshes:
+        chunks = []
+        for start in range(0, len(points), chunk_size):
+            chunks.append(
+                trimesh.proximity.signed_distance(
+                    mesh, points[start : start + chunk_size]
+                )
+            )
+        values.append(np.concatenate(chunks) if chunks else np.empty(0))
+    # Each component is positive inside and negative outside. The union is
+    # therefore represented by the maximum component signed distance.
+    return np.max(np.stack(values, axis=0), axis=0)
+
+
+def _union_signed_distance_gradient(
+    meshes: Sequence[trimesh.Trimesh], points: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return union SDF, its query-point gradient, and closest surface points.
+
+    Trimesh uses positive values inside. Away from medial-axis ambiguities, the
+    gradient is the signed point-to-surface direction. Physical correction only
+    consumes positive-penetration rows, for which this points farther inside the
+    queried volume; the caller chooses the corresponding hand escape direction.
+    """
+
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    if not len(meshes):
+        raise ValueError("Signed-distance gradient requires collision geometry")
+    component_values = np.stack(
+        [_union_signed_distance((mesh,), points) for mesh in meshes], axis=0
+    )
+    component_ids = np.argmax(component_values, axis=0)
+    signed = component_values[component_ids, np.arange(len(points))]
+    gradients = np.zeros_like(points)
+    closest_points = np.zeros_like(points)
+    for component_id, mesh in enumerate(meshes):
+        rows = np.flatnonzero(component_ids == component_id)
+        if not len(rows):
+            continue
+        closest, distance, _ = trimesh.proximity.closest_point(mesh, points[rows])
+        closest_points[rows] = closest
+        delta = points[rows] - closest
+        valid = np.asarray(distance, dtype=np.float64) > 1e-12
+        if valid.any():
+            # signed = +distance inside and -distance outside.
+            gradients[rows[valid]] = (
+                np.sign(signed[rows[valid]])[:, None]
+                * delta[valid]
+                / np.asarray(distance, dtype=np.float64)[valid, None]
+            )
+    return signed, gradients, closest_points
+
+
+class CollisionMeshSDFValidator:
+    """Signed penetration and gradient evaluator for URDF collision geometry."""
+
+    def __init__(
+        self,
+        hand_kinematics: URDFCollisionKinematics,
+        object_urdf: Path,
+        *,
+        surface_samples_per_link: int = 64,
+        penetration_points_per_link: int = 2,
+        maximum_points_per_frame: int = 16,
+        cluster_radius: float = 0.0015,
+        cluster_normal_degrees: float = 20.0,
+    ):
+        self.hand = hand_kinematics
+        self.surface_samples_per_link = max(8, int(surface_samples_per_link))
+        self.penetration_points_per_link = max(
+            1, int(penetration_points_per_link)
+        )
+        self.maximum_points_per_frame = max(1, int(maximum_points_per_frame))
+        self.cluster_radius = max(0.0, float(cluster_radius))
+        self.cluster_normal_cosine = float(
+            np.cos(np.deg2rad(float(cluster_normal_degrees)))
+        )
+        object_dofs = _urdf_actuated_joint_names(Path(object_urdf))
+        if object_dofs:
+            raise ValueError(
+                "Read-only collision SDF currently requires a rigid object URDF; "
+                f"found movable joints {object_dofs}"
+            )
+        self.object = URDFCollisionKinematics(
+            Path(object_urdf), (), points_per_link=self.surface_samples_per_link
+        )
+        object_transforms = self.object.link_transforms(np.empty(0, dtype=np.float64))
+
+        self.hand_sdf_meshes: Dict[str, List[trimesh.Trimesh]] = {}
+        self.hand_surface_points: Dict[str, np.ndarray] = {}
+        self.object_sdf_meshes: List[trimesh.Trimesh] = []
+        object_surface_parts = []
+        component_reports = []
+
+        for link_name, components in self.hand.link_collision_meshes.items():
+            proxies = []
+            samples = []
+            per_component = max(
+                8, int(np.ceil(self.surface_samples_per_link / len(components)))
+            )
+            for component_index, component in enumerate(components):
+                proxy, proxy_report = _collision_sdf_proxy(component)
+                proxies.append(proxy)
+                samples.append(_deterministic_mesh_samples(proxy, per_component))
+                component_reports.append(
+                    {
+                        "owner": "hand",
+                        "link_name": link_name,
+                        "component_index": component_index,
+                        **proxy_report,
+                    }
+                )
+            self.hand_sdf_meshes[link_name] = proxies
+            self.hand_surface_points[link_name] = np.concatenate(samples)[
+                : self.surface_samples_per_link
+            ]
+
+        for link_name, components in self.object.link_collision_meshes.items():
+            link_transform = object_transforms[link_name]
+            per_component = max(
+                8, int(np.ceil(self.surface_samples_per_link / len(components)))
+            )
+            for component_index, component in enumerate(components):
+                root_component = component.copy()
+                root_component.apply_transform(link_transform)
+                proxy, proxy_report = _collision_sdf_proxy(root_component)
+                self.object_sdf_meshes.append(proxy)
+                object_surface_parts.append(
+                    _deterministic_mesh_samples(proxy, per_component)
+                )
+                component_reports.append(
+                    {
+                        "owner": "object",
+                        "link_name": link_name,
+                        "component_index": component_index,
+                        **proxy_report,
+                    }
+                )
+        if not self.hand_sdf_meshes or not self.object_sdf_meshes:
+            raise ValueError("Collision SDF requires both hand and object collision meshes")
+        self.object_surface_points = np.concatenate(object_surface_parts)
+        self.component_reports = component_reports
+
+        digest = hashlib.sha256()
+        for link_name in sorted(self.hand_sdf_meshes):
+            digest.update(link_name.encode("utf-8"))
+            for mesh in self.hand_sdf_meshes[link_name]:
+                digest.update(np.asarray(mesh.vertices, dtype=np.float64).tobytes())
+                digest.update(np.asarray(mesh.faces, dtype=np.int64).tobytes())
+        self.hand_proxy_geometry_sha256 = digest.hexdigest()
+
+    def write_physx_aligned_hand_urdf(
+        self, output_directory: Path
+    ) -> Tuple[Path, Dict[str, object]]:
+        """Materialize the exact closed hand proxies used by SDF for PhysX.
+
+        Collision origins are baked into the exported meshes and reset to the
+        identity in the derived URDF. Visual mesh references are made absolute
+        so relocating the URDF into an isolated validation directory does not
+        change Viewer behavior.
+        """
+
+        output_directory = Path(output_directory)
+        output_directory.mkdir(parents=True, exist_ok=True)
+        root = ET.fromstring(
+            self.hand.urdf_path.read_text(encoding="utf-8").lstrip()
+        )
+        exported = []
+        for link in root.findall("link"):
+            link_name = link.attrib["name"]
+            proxies = self.hand_sdf_meshes.get(link_name, ())
+            proxy_index = 0
+            safe_link = "".join(
+                character if character.isalnum() else "_"
+                for character in link_name
+            )
+            for collision in link.findall("collision"):
+                geometry = collision.find("geometry")
+                if geometry is None or not any(
+                    geometry.find(kind) is not None
+                    for kind in ("mesh", "box", "sphere", "cylinder")
+                ):
+                    continue
+                if proxy_index >= len(proxies):
+                    raise ValueError(
+                        f"Collision proxy mapping is incomplete for hand link {link_name!r}"
+                    )
+                proxy_path = output_directory / (
+                    f"collision_{safe_link}_{proxy_index}.obj"
+                )
+                proxies[proxy_index].export(proxy_path)
+                geometry.clear()
+                ET.SubElement(
+                    geometry,
+                    "mesh",
+                    {"filename": proxy_path.name, "scale": "1 1 1"},
+                )
+                origin = collision.find("origin")
+                if origin is None:
+                    origin = ET.SubElement(collision, "origin")
+                origin.attrib.clear()
+                origin.attrib.update({"xyz": "0 0 0", "rpy": "0 0 0"})
+                exported.append(
+                    {
+                        "link_name": link_name,
+                        "component_index": proxy_index,
+                        "mesh_file": proxy_path.name,
+                    }
+                )
+                proxy_index += 1
+            if proxy_index != len(proxies):
+                raise ValueError(
+                    f"Collision proxy mapping count mismatch for hand link {link_name!r}: "
+                    f"URDF={proxy_index}, SDF={len(proxies)}"
+                )
+
+        for visual_mesh in root.findall(".//visual/geometry/mesh"):
+            visual_mesh.attrib["filename"] = str(
+                self.hand._resolve_mesh_path(visual_mesh.attrib["filename"])
+            )
+        derived_urdf = output_directory / "hand_sdf_physx_aligned.urdf"
+        ET.ElementTree(root).write(
+            derived_urdf, encoding="utf-8", xml_declaration=True
+        )
+        return derived_urdf, {
+            "mode": "shared_watertight_sdf_proxy_urdf",
+            "component_count": len(exported),
+            "geometry_sha256": self.hand_proxy_geometry_sha256,
+            "components": exported,
+        }
+
+    def validate(
+        self,
+        corrected: Mapping,
+        object_trajectory: np.ndarray,
+        frame_ids: np.ndarray,
+        *,
+        maximum_penetration: float,
+        collect_constraints: bool = False,
+    ) -> Dict[str, object]:
+        frame_ids = np.asarray(frame_ids, dtype=np.int64)
+        wrist_pos = np.asarray(corrected["opt_wrist_pos"], dtype=np.float64)[frame_ids]
+        wrist_rot = Rotation.from_rotvec(
+            np.asarray(corrected["opt_wrist_rot"], dtype=np.float64)[frame_ids]
+        ).as_matrix()
+        dof = np.asarray(corrected["opt_dof_pos"], dtype=np.float64)[frame_ids]
+        object_pose = np.asarray(object_trajectory, dtype=np.float64)[frame_ids]
+        object_rot = object_pose[:, :3, :3]
+        object_pos = object_pose[:, :3, 3]
+        frame_count = len(frame_ids)
+        depth_frame = np.zeros(frame_count, dtype=np.float64)
+        direction_frame = np.full(frame_count, "none", dtype=object)
+        link_frame = np.full(frame_count, "", dtype=object)
+        # Zero is a serialization-safe placeholder when a frame has no positive
+        # penetration. ``penetration_depth_frame`` determines whether the point
+        # is meaningful and whether the Viewer draws it.
+        point_world_frame = np.zeros((frame_count, 3), dtype=np.float64)
+        closest_world_frame = np.zeros((frame_count, 3), dtype=np.float64)
+        sdf_gradient_world_frame = np.zeros((frame_count, 3), dtype=np.float64)
+        hand_escape_world_frame = np.zeros((frame_count, 3), dtype=np.float64)
+        hand_contact_link_frame = np.zeros((frame_count, 3), dtype=np.float64)
+        gradient_valid_frame = np.zeros(frame_count, dtype=bool)
+        raw_constraints_frame: List[List[Dict[str, object]]] = [
+            [] for _ in range(frame_count)
+        ]
+        positive_tolerance = 1e-7
+        constraint_points_per_link = (
+            self.penetration_points_per_link if collect_constraints else 0
+        )
+
+        transforms_by_link = {name: [] for name in self.hand_sdf_meshes}
+        for frame_dof in dof:
+            transforms = self.hand.link_transforms(frame_dof)
+            for link_name in transforms_by_link:
+                transforms_by_link[link_name].append(transforms[link_name])
+        transforms_by_link = {
+            name: np.stack(values) for name, values in transforms_by_link.items()
+        }
+
+        # Direction A: hand collision surfaces inside the object collision volume.
+        for link_name, local_points in self.hand_surface_points.items():
+            link_transform = transforms_by_link[link_name]
+            root_points = np.einsum(
+                "fij,pj->fpi", link_transform[:, :3, :3], local_points
+            ) + link_transform[:, None, :3, 3]
+            world_points = np.einsum("fij,fpj->fpi", wrist_rot, root_points) + wrist_pos[:, None]
+            object_points = np.einsum(
+                "fji,fpj->fpi", object_rot, world_points - object_pos[:, None]
+            )
+            signed = _union_signed_distance(
+                self.object_sdf_meshes, object_points.reshape(-1, 3)
+            ).reshape(frame_count, -1)
+            candidate_rows = []
+            candidate_samples = []
+            for frame_local in range(frame_count):
+                positive = np.flatnonzero(
+                    signed[frame_local] > positive_tolerance
+                )
+                if not len(positive):
+                    continue
+                ordered = positive[
+                    np.argsort(signed[frame_local, positive])[::-1]
+                ][:constraint_points_per_link]
+                candidate_rows.extend([frame_local] * len(ordered))
+                candidate_samples.extend(ordered.tolist())
+            if candidate_rows:
+                candidate_rows_array = np.asarray(candidate_rows, dtype=np.int64)
+                candidate_samples_array = np.asarray(
+                    candidate_samples, dtype=np.int64
+                )
+                query_object = object_points[
+                    candidate_rows_array, candidate_samples_array
+                ]
+                candidate_depth, candidate_gradient_object, candidate_closest_object = (
+                    _union_signed_distance_gradient(
+                        self.object_sdf_meshes, query_object
+                    )
+                )
+                candidate_gradient_world = np.einsum(
+                    "fij,fj->fi",
+                    object_rot[candidate_rows_array],
+                    candidate_gradient_object,
+                )
+                candidate_closest_world = np.einsum(
+                    "fij,fj->fi",
+                    object_rot[candidate_rows_array],
+                    candidate_closest_object,
+                ) + object_pos[candidate_rows_array]
+                for candidate_index, frame_local in enumerate(candidate_rows):
+                    gradient_world = candidate_gradient_world[candidate_index]
+                    if np.linalg.norm(gradient_world) <= 0.5:
+                        continue
+                    sample_index = candidate_samples[candidate_index]
+                    raw_constraints_frame[frame_local].append(
+                        {
+                            "link_name": link_name,
+                            "direction": "hand_surface_inside_object",
+                            "depth": float(candidate_depth[candidate_index]),
+                            "point_world": world_points[
+                                frame_local, sample_index
+                            ],
+                            "closest_surface_point_world": candidate_closest_world[
+                                candidate_index
+                            ],
+                            "sdf_gradient_world": gradient_world,
+                            "hand_escape_direction_world": -gradient_world,
+                            "hand_contact_point_link": local_points[sample_index],
+                        }
+                    )
+            local_index = np.argmax(signed, axis=1)
+            local_depth = signed[np.arange(frame_count), local_index]
+            update = local_depth > depth_frame
+            if update.any():
+                update_rows = np.flatnonzero(update)
+                sample_ids = local_index[update]
+                query_object = object_points[update_rows, sample_ids]
+                _, gradient_object, closest_object = _union_signed_distance_gradient(
+                    self.object_sdf_meshes, query_object
+                )
+                gradient_world = np.einsum(
+                    "fij,fj->fi", object_rot[update], gradient_object
+                )
+                depth_frame[update] = local_depth[update]
+                direction_frame[update] = "hand_surface_inside_object"
+                link_frame[update] = link_name
+                point_world_frame[update] = world_points[update_rows, sample_ids]
+                closest_world_frame[update] = np.einsum(
+                    "fij,fj->fi", object_rot[update], closest_object
+                ) + object_pos[update]
+                sdf_gradient_world_frame[update] = gradient_world
+                hand_escape_world_frame[update] = -gradient_world
+                hand_contact_link_frame[update] = local_points[sample_ids]
+                gradient_valid_frame[update] = (
+                    np.linalg.norm(gradient_world, axis=1) > 0.5
+                )
+
+        # Direction B: object collision surfaces inside individual hand links.
+        object_world_points = np.einsum(
+            "fij,pj->fpi", object_rot, self.object_surface_points
+        ) + object_pos[:, None]
+        for link_name, link_meshes in self.hand_sdf_meshes.items():
+            link_transform = transforms_by_link[link_name]
+            link_world_rot = np.einsum(
+                "fij,fjk->fik", wrist_rot, link_transform[:, :3, :3]
+            )
+            link_world_pos = (
+                np.einsum("fij,fj->fi", wrist_rot, link_transform[:, :3, 3])
+                + wrist_pos
+            )
+            link_points = np.einsum(
+                "fji,fpj->fpi",
+                link_world_rot,
+                object_world_points - link_world_pos[:, None],
+            )
+            signed = _union_signed_distance(
+                link_meshes, link_points.reshape(-1, 3)
+            ).reshape(frame_count, -1)
+            candidate_rows = []
+            candidate_samples = []
+            for frame_local in range(frame_count):
+                positive = np.flatnonzero(
+                    signed[frame_local] > positive_tolerance
+                )
+                if not len(positive):
+                    continue
+                ordered = positive[
+                    np.argsort(signed[frame_local, positive])[::-1]
+                ][:constraint_points_per_link]
+                candidate_rows.extend([frame_local] * len(ordered))
+                candidate_samples.extend(ordered.tolist())
+            if candidate_rows:
+                candidate_rows_array = np.asarray(candidate_rows, dtype=np.int64)
+                candidate_samples_array = np.asarray(
+                    candidate_samples, dtype=np.int64
+                )
+                query_link = link_points[
+                    candidate_rows_array, candidate_samples_array
+                ]
+                candidate_depth, candidate_gradient_link, candidate_closest_link = (
+                    _union_signed_distance_gradient(link_meshes, query_link)
+                )
+                candidate_gradient_world = np.einsum(
+                    "fij,fj->fi",
+                    link_world_rot[candidate_rows_array],
+                    candidate_gradient_link,
+                )
+                candidate_closest_world = np.einsum(
+                    "fij,fj->fi",
+                    link_world_rot[candidate_rows_array],
+                    candidate_closest_link,
+                ) + link_world_pos[candidate_rows_array]
+                for candidate_index, frame_local in enumerate(candidate_rows):
+                    gradient_world = candidate_gradient_world[candidate_index]
+                    if np.linalg.norm(gradient_world) <= 0.5:
+                        continue
+                    sample_index = candidate_samples[candidate_index]
+                    raw_constraints_frame[frame_local].append(
+                        {
+                            "link_name": link_name,
+                            "direction": "object_surface_inside_hand",
+                            "depth": float(candidate_depth[candidate_index]),
+                            "point_world": object_world_points[
+                                frame_local, sample_index
+                            ],
+                            "closest_surface_point_world": candidate_closest_world[
+                                candidate_index
+                            ],
+                            "sdf_gradient_world": gradient_world,
+                            "hand_escape_direction_world": gradient_world,
+                            "hand_contact_point_link": candidate_closest_link[
+                                candidate_index
+                            ],
+                        }
+                    )
+            local_index = np.argmax(signed, axis=1)
+            local_depth = signed[np.arange(frame_count), local_index]
+            update = local_depth > depth_frame
+            if update.any():
+                update_rows = np.flatnonzero(update)
+                sample_ids = local_index[update]
+                query_link = link_points[update_rows, sample_ids]
+                _, gradient_link, closest_link = _union_signed_distance_gradient(
+                    link_meshes, query_link
+                )
+                gradient_world = np.einsum(
+                    "fij,fj->fi", link_world_rot[update], gradient_link
+                )
+                depth_frame[update] = local_depth[update]
+                direction_frame[update] = "object_surface_inside_hand"
+                link_frame[update] = link_name
+                point_world_frame[update] = object_world_points[update_rows, sample_ids]
+                closest_world_frame[update] = np.einsum(
+                    "fij,fj->fi", link_world_rot[update], closest_link
+                ) + link_world_pos[update]
+                sdf_gradient_world_frame[update] = gradient_world
+                # The query point is fixed on the object. Translating the hand
+                # along +grad moves its SDF volume away from that point.
+                hand_escape_world_frame[update] = gradient_world
+                hand_contact_link_frame[update] = closest_link
+                gradient_valid_frame[update] = (
+                    np.linalg.norm(gradient_world, axis=1) > 0.5
+                )
+
+        constraints_frame = []
+        for raw_constraints in raw_constraints_frame:
+            selected = []
+            for constraint in sorted(
+                raw_constraints,
+                key=lambda item: float(item["depth"]),
+                reverse=True,
+            ):
+                point = np.asarray(constraint["point_world"], dtype=np.float64)
+                normal = np.asarray(
+                    constraint["hand_escape_direction_world"], dtype=np.float64
+                )
+                normal /= max(float(np.linalg.norm(normal)), 1e-12)
+                duplicate = False
+                for existing in selected:
+                    if existing["link_name"] != constraint["link_name"]:
+                        continue
+                    existing_point = np.asarray(
+                        existing["point_world"], dtype=np.float64
+                    )
+                    existing_normal = np.asarray(
+                        existing["hand_escape_direction_world"], dtype=np.float64
+                    )
+                    existing_normal /= max(
+                        float(np.linalg.norm(existing_normal)), 1e-12
+                    )
+                    if (
+                        np.linalg.norm(point - existing_point)
+                        <= self.cluster_radius
+                        and float(normal @ existing_normal)
+                        >= self.cluster_normal_cosine
+                    ):
+                        duplicate = True
+                        break
+                if not duplicate:
+                    selected.append(constraint)
+                if len(selected) >= self.maximum_points_per_frame:
+                    break
+            constraints_frame.append(selected)
+
+        depth_frame = np.maximum(depth_frame, 0.0)
+        finite = bool(np.isfinite(depth_frame).all())
+        maximum_depth = float(depth_frame.max(initial=0.0))
+        worst_local = int(np.argmax(depth_frame)) if frame_count else 0
+        penetrating = depth_frame > positive_tolerance
+        violating = depth_frame > float(maximum_penetration)
+        proxy_count = sum(
+            item["proxy_kind"] != "original_collision_mesh"
+            for item in self.component_reports
+        )
+        passed = bool(finite and not violating.any())
+        return {
+            "name": "collision_mesh_penetration",
+            "status": "passed" if passed else "failed",
+            "passed": passed,
+            "required": True,
+            "read_only": False,
+            "affects_correction": True,
+            "correction_role": "sdf_point_and_gradient_source_when_physx_enabled",
+            "affects_overall_acceptance": True,
+            "method": "bidirectional_triangle_signed_distance_with_reported_proxies",
+            "sign_convention": "positive_inside_negative_outside",
+            "maximum_penetration": maximum_depth,
+            "maximum_penetration_threshold": float(maximum_penetration),
+            "penetrating_frame_count": int(penetrating.sum()),
+            "penetrating_frame_ratio": float(penetrating.mean()) if frame_count else 0.0,
+            "threshold_exceeding_frame_count": int(violating.sum()),
+            "threshold_exceeding_frame_ratio": float(violating.mean()) if frame_count else 0.0,
+            "worst_frame": int(frame_ids[worst_local]) if frame_count else None,
+            "worst_link": str(link_frame[worst_local]) if frame_count else None,
+            "worst_direction": str(direction_frame[worst_local]) if frame_count else None,
+            "worst_point_world": (
+                point_world_frame[worst_local]
+                if frame_count and maximum_depth > positive_tolerance
+                else None
+            ),
+            "worst_closest_surface_point_world": (
+                closest_world_frame[worst_local]
+                if frame_count and maximum_depth > positive_tolerance
+                else None
+            ),
+            "worst_sdf_gradient_world": (
+                sdf_gradient_world_frame[worst_local]
+                if frame_count and maximum_depth > positive_tolerance
+                else None
+            ),
+            "worst_hand_escape_direction_world": (
+                hand_escape_world_frame[worst_local]
+                if frame_count and maximum_depth > positive_tolerance
+                else None
+            ),
+            "worst_hand_contact_point_link": (
+                hand_contact_link_frame[worst_local]
+                if frame_count and maximum_depth > positive_tolerance
+                else None
+            ),
+            "worst_gradient_valid": bool(
+                frame_count and gradient_valid_frame[worst_local]
+            ),
+            "frame_ids": frame_ids,
+            "penetration_depth_frame": depth_frame,
+            "worst_link_frame": link_frame.tolist(),
+            "worst_direction_frame": direction_frame.tolist(),
+            "worst_point_world_frame": point_world_frame,
+            "closest_surface_point_world_frame": closest_world_frame,
+            "sdf_gradient_world_frame": sdf_gradient_world_frame,
+            "hand_escape_direction_world_frame": hand_escape_world_frame,
+            "hand_contact_point_link_frame": hand_contact_link_frame,
+            "gradient_valid_frame": gradient_valid_frame,
+            "penetration_constraints_frame": constraints_frame,
+            "penetration_constraint_count_frame": [
+                len(constraints) for constraints in constraints_frame
+            ],
+            "penetration_points_per_link": self.penetration_points_per_link,
+            "maximum_points_per_frame": self.maximum_points_per_frame,
+            "constraints_collected": bool(collect_constraints),
+            "cluster_radius": self.cluster_radius,
+            "cluster_normal_degrees": float(
+                np.rad2deg(np.arccos(np.clip(self.cluster_normal_cosine, -1.0, 1.0)))
+            ),
+            "surface_samples_per_link": self.surface_samples_per_link,
+            "component_count": len(self.component_reports),
+            "convex_hull_proxy_count": int(proxy_count),
+            "uses_proxy_geometry": bool(proxy_count),
+            "geometry_reliability": "proxy" if proxy_count else "exact",
+            "hand_proxy_geometry_sha256": self.hand_proxy_geometry_sha256,
+            "physx_alignment_mode": "shared_watertight_sdf_proxy_urdf",
+            "component_geometry": self.component_reports,
+            "all_finite": finite,
+            "scope_note": (
+                "Independent collision-mesh penetration gate. During a requested PhysX repair, "
+                "its penetration points and gradients drive local finger/palm correction; PhysX "
+                "still gives the final contact-force verdict. Failure blocks normal PKL saving "
+                "and schema-v9 Stage-1 loading. Non-watertight URDF collision meshes use an "
+                "explicitly reported convex-hull proxy for a well-defined signed volume."
+            ),
+        }
+
+
+def _collision_mesh_penetration_report(
+    validator: Optional[CollisionMeshSDFValidator],
+    initialization_error: Optional[Exception],
+    corrected: Mapping,
+    object_trajectory: np.ndarray,
+    frame_ids: np.ndarray,
+    maximum_penetration: float,
+    *,
+    collect_constraints: bool = False,
+) -> Dict[str, object]:
+    """Convert SDF setup/query errors into an explicit failed validation tier."""
+
+    try:
+        if validator is None:
+            if initialization_error is None:
+                raise RuntimeError("collision SDF validator was not initialized")
+            raise initialization_error
+        return validator.validate(
+            corrected,
+            object_trajectory,
+            frame_ids,
+            maximum_penetration=maximum_penetration,
+            collect_constraints=collect_constraints,
+        )
+    except Exception as error:
+        return {
+            "name": "collision_mesh_penetration",
+            "status": "error",
+            "passed": False,
+            "required": True,
+            "read_only": False,
+            "affects_correction": True,
+            "correction_role": "required_but_unavailable",
+            "affects_overall_acceptance": True,
+            "maximum_penetration_threshold": float(maximum_penetration),
+            "error": f"{type(error).__name__}: {error}",
+        }
+
+
+def _compact_collision_mesh_penetration_report(
+    report: Mapping[str, object],
+) -> Dict[str, object]:
+    """Keep required Stage-1 gate metadata small while preserving its verdict."""
+
+    per_frame_fields = {
+        "frame_ids",
+        "penetration_depth_frame",
+        "worst_link_frame",
+        "worst_direction_frame",
+        "worst_point_world_frame",
+        "closest_surface_point_world_frame",
+        "sdf_gradient_world_frame",
+        "hand_escape_direction_world_frame",
+        "hand_contact_point_link_frame",
+        "gradient_valid_frame",
+        "penetration_constraints_frame",
+        "penetration_constraint_count_frame",
+        "component_geometry",
+    }
+    return {
+        key: value for key, value in report.items() if key not in per_frame_fields
+    }
 
 
 @dataclass
@@ -1408,7 +2186,7 @@ class OfflineHandSpec:
 
 
 def _urdf_actuated_joint_names(urdf_path: Path) -> Tuple[str, ...]:
-    root = ET.parse(urdf_path).getroot()
+    root = ET.fromstring(Path(urdf_path).read_text(encoding="utf-8").lstrip())
     result = []
     for joint in root.findall("joint"):
         if joint.attrib.get("type", "fixed") in ("fixed", "floating"):
@@ -1637,6 +2415,17 @@ def _invariant_report(
     return result
 
 
+def _evenly_spaced_frame_ids(
+    frame_ids: np.ndarray, maximum_frames: int
+) -> np.ndarray:
+    frame_ids = np.asarray(frame_ids, dtype=np.int64)
+    if not len(frame_ids):
+        return frame_ids
+    sample_count = min(len(frame_ids), max(1, int(maximum_frames)))
+    sample_indices = np.linspace(0, len(frame_ids) - 1, sample_count).round().astype(np.int64)
+    return np.unique(frame_ids[sample_indices])
+
+
 def run_isaac_gym_validation(
     corrected: Mapping,
     hand: "OfflineHandSpec",
@@ -1650,11 +2439,13 @@ def run_isaac_gym_validation(
     max_contact_force: float,
     max_initial_overlap: float,
     timeout: float,
+    collision_sdf_report: Optional[Mapping[str, object]] = None,
+    collision_sdf_validator: Optional[CollisionMeshSDFValidator] = None,
 ) -> Dict[str, object]:
     """Run tier-three PhysX contact replay in an isolated Isaac Gym process."""
 
     if not headless and not os.environ.get("DISPLAY"):
-        return {
+        result = {
             "name": "isaac_gym_physics",
             "status": "error",
             "passed": False,
@@ -1663,13 +2454,13 @@ def run_isaac_gym_validation(
                 "Run from a graphical desktop/X-forwarded shell or add --headless."
             ),
         }
+        if collision_sdf_report is not None:
+            result["collision_mesh_penetration"] = collision_sdf_report
+        return result
     helper_path = Path(__file__).with_name("contact_trajectory_physics_validate.py")
     if not helper_path.is_file():
         raise FileNotFoundError(f"Isaac Gym validation helper is missing: {helper_path}")
-    sample_count = min(len(hold_frame_ids), maximum_frames)
-    frame_ids = np.unique(
-        np.linspace(hold_frame_ids[0], hold_frame_ids[-1], sample_count).round().astype(np.int64)
-    )
+    frame_ids = _evenly_spaced_frame_ids(hold_frame_ids, maximum_frames)
     request = {
         "hand_urdf": str(hand.urdf_path),
         "hand_dof_names": tuple(hand.dof_names),
@@ -1695,10 +2486,52 @@ def run_isaac_gym_validation(
                 "replay_object_trajectory": np.asarray(context.object_trajectory, dtype=np.float64),
             }
         )
+        if collision_sdf_report is not None:
+            request.update(
+                {
+                    "replay_sdf_frame_ids": np.asarray(
+                        collision_sdf_report.get("frame_ids", ()), dtype=np.int64
+                    ),
+                    "replay_sdf_penetration_depth": np.asarray(
+                        collision_sdf_report.get("penetration_depth_frame", ()),
+                        dtype=np.float64,
+                    ),
+                    "replay_sdf_worst_points_world": np.asarray(
+                        collision_sdf_report.get("worst_point_world_frame", ()),
+                        dtype=np.float64,
+                    ),
+                    "replay_sdf_hand_escape_direction_world": np.asarray(
+                        collision_sdf_report.get(
+                            "hand_escape_direction_world_frame", ()
+                        ),
+                        dtype=np.float64,
+                    ),
+                    "replay_sdf_maximum_penetration": float(
+                        collision_sdf_report.get("maximum_penetration", 0.0)
+                    ),
+                    "replay_sdf_threshold": float(
+                        collision_sdf_report.get("maximum_penetration_threshold", 0.0)
+                    ),
+                    "replay_sdf_worst_frame": collision_sdf_report.get("worst_frame"),
+                    "replay_sdf_worst_link": collision_sdf_report.get("worst_link"),
+                    "replay_sdf_uses_proxy_geometry": bool(
+                        collision_sdf_report.get("uses_proxy_geometry", False)
+                    ),
+                }
+            )
     with tempfile.TemporaryDirectory(prefix="contact-physics-") as temporary_directory:
         temporary_directory = Path(temporary_directory)
         request_path = temporary_directory / "request.pkl"
         result_path = temporary_directory / "result.json"
+        alignment_report = None
+        if collision_sdf_validator is not None:
+            aligned_hand_urdf, alignment_report = (
+                collision_sdf_validator.write_physx_aligned_hand_urdf(
+                    temporary_directory / "hand_collision_proxy"
+                )
+            )
+            request["hand_urdf"] = str(aligned_hand_urdf)
+            request["hand_collision_geometry_alignment"] = alignment_report
         _atomic_pickle_dump(request, request_path)
         environment = os.environ.copy()
         python_library = str(Path(sys.prefix) / "lib")
@@ -1718,13 +2551,18 @@ def run_isaac_gym_validation(
             check=False,
         )
         if not result_path.is_file():
-            return {
+            result = {
                 "name": "isaac_gym_physics",
                 "status": "error",
                 "passed": False,
                 "returncode": int(process.returncode),
                 "output": "" if process.stdout is None else process.stdout[-12000:],
             }
+            if collision_sdf_report is not None:
+                result["collision_mesh_penetration"] = collision_sdf_report
+            if alignment_report is not None:
+                result["hand_collision_geometry_alignment"] = alignment_report
+            return result
         with result_path.open("r", encoding="utf-8") as stream:
             result = json.load(stream)
         result["returncode"] = int(process.returncode)
@@ -1732,6 +2570,10 @@ def run_isaac_gym_validation(
         result["passed"] = bool(result.get("passed", False) and process.returncode == 0)
         if not result["passed"] and result.get("status") == "passed":
             result["status"] = "error"
+        if collision_sdf_report is not None:
+            result["collision_mesh_penetration"] = collision_sdf_report
+        if alignment_report is not None:
+            result["hand_collision_geometry_alignment"] = alignment_report
         return result
 
 
@@ -1754,6 +2596,22 @@ def _physics_failure_score(report: Mapping[str, object]) -> float:
         + max(0.0, force / max_force - 1.0)
         + max(0.0, overlap / max_overlap - 1.0)
     )
+
+
+def _sdf_penetration_objective(report: Mapping[str, object]) -> float:
+    """Aggregate sampled violations while retaining pressure on the worst frame."""
+
+    try:
+        depth = np.asarray(report["penetration_depth_frame"], dtype=np.float64)
+        threshold = float(report["maximum_penetration_threshold"])
+    except (KeyError, TypeError, ValueError):
+        return float("inf")
+    if depth.ndim != 1 or not np.isfinite(depth).all() or not np.isfinite(threshold):
+        return float("inf")
+    excess = np.maximum(depth - threshold, 0.0)
+    if not len(excess):
+        return 0.0
+    return float(excess.max(initial=0.0) + np.sqrt(np.mean(excess**2)))
 
 
 def _finger_name(body_name: Optional[str]) -> Optional[str]:
@@ -1792,16 +2650,17 @@ def _interpolate_sample_correction(
     return result
 
 
-def _contact_normal_ik_delta(
+def _sdf_gradient_ik_delta(
     kinematics: URDFCollisionKinematics,
     body_name: str,
     dof_position: np.ndarray,
     wrist_rotvec: np.ndarray,
     active_indices: np.ndarray,
+    contact_point_link: np.ndarray,
     escape_normal_world: np.ndarray,
     escape_distance: float,
 ) -> np.ndarray:
-    """Solve a damped positional IK step for one colliding finger link."""
+    """Move the exact SDF collision point along its hand escape gradient."""
 
     dof_position = np.asarray(dof_position, dtype=np.float64)
     active_indices = np.asarray(active_indices, dtype=np.int64)
@@ -1816,15 +2675,13 @@ def _contact_normal_ik_delta(
     root_rotation = Rotation.from_rotvec(
         np.asarray(wrist_rotvec, dtype=np.float64)
     ).as_matrix()
-    link_samples = kinematics.link_points[body_name]
-    base_samples = _transform_points(link_samples, transforms[body_name])
+    contact_point_link = np.asarray(contact_point_link, dtype=np.float64)
+    if contact_point_link.shape != (3,) or not np.isfinite(contact_point_link).all():
+        return result
+    base_local = _transform_points(
+        contact_point_link[None], transforms[body_name]
+    )[0]
     normal_unit = normal / normal_norm
-    world_samples = base_samples @ root_rotation.T
-    # The object-facing side is opposite the force/escape direction. Tracking
-    # a collision-surface sample (instead of the link origin) lets proximal
-    # joints resolve contact by rotation even when two joint origins coincide.
-    contact_sample_index = int(np.argmin(world_samples @ normal_unit))
-    base_local = base_samples[contact_sample_index]
     jacobian = np.zeros((3, len(active_indices)), dtype=np.float64)
     epsilon = 1e-4
     for column, dof_index in enumerate(active_indices):
@@ -1832,7 +2689,7 @@ def _contact_normal_ik_delta(
         perturbed[dof_index] += epsilon
         moved_transform = kinematics.link_transforms(perturbed)[body_name]
         moved_local = _transform_points(
-            link_samples[contact_sample_index : contact_sample_index + 1],
+            contact_point_link[None],
             moved_transform,
         )[0]
         jacobian[:, column] = root_rotation @ ((moved_local - base_local) / epsilon)
@@ -1847,6 +2704,108 @@ def _contact_normal_ik_delta(
     active_delta = np.clip(active_delta, -np.deg2rad(3.0), np.deg2rad(3.0))
     result[active_indices] = active_delta
     return result
+
+
+def _sdf_multi_constraint_ik_delta(
+    kinematics: URDFCollisionKinematics,
+    dof_position: np.ndarray,
+    wrist_rotvec: np.ndarray,
+    constraints: Sequence[Mapping[str, object]],
+    maximum_penetration: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Jointly solve directional IK residuals at multiple collision points."""
+
+    dof_position = np.asarray(dof_position, dtype=np.float64)
+    result = np.zeros_like(dof_position)
+    transforms = kinematics.link_transforms(dof_position)
+    root_rotation = Rotation.from_rotvec(
+        np.asarray(wrist_rotvec, dtype=np.float64)
+    ).as_matrix()
+    rows = []
+    targets = []
+    weights = []
+    active_union = set()
+    epsilon = 1e-4
+    for constraint in constraints:
+        link_name = str(constraint.get("link_name", ""))
+        if link_name not in transforms:
+            continue
+        active_indices = kinematics.actuated_ancestor_dof_indices(link_name)
+        if not len(active_indices):
+            continue
+        contact_point = np.asarray(
+            constraint.get("hand_contact_point_link"), dtype=np.float64
+        )
+        escape = np.asarray(
+            constraint.get("hand_escape_direction_world"), dtype=np.float64
+        )
+        escape_norm = float(np.linalg.norm(escape))
+        if (
+            contact_point.shape != (3,)
+            or not np.isfinite(contact_point).all()
+            or escape_norm <= 1e-9
+        ):
+            continue
+        escape /= escape_norm
+        base_local = _transform_points(
+            contact_point[None], transforms[link_name]
+        )[0]
+        row = np.zeros(len(dof_position), dtype=np.float64)
+        for dof_index in active_indices:
+            perturbed = dof_position.copy()
+            perturbed[dof_index] += epsilon
+            moved_transform = kinematics.link_transforms(perturbed)[link_name]
+            moved_local = _transform_points(
+                contact_point[None], moved_transform
+            )[0]
+            point_jacobian_world = root_rotation @ (
+                (moved_local - base_local) / epsilon
+            )
+            row[dof_index] = float(escape @ point_jacobian_world)
+        if np.linalg.norm(row) <= 1e-9:
+            continue
+        depth = float(constraint.get("depth", 0.0))
+        target = min(
+            0.003,
+            max(0.00025, depth - float(maximum_penetration) + 0.0005),
+        )
+        rows.append(row)
+        targets.append(target)
+        weights.append(
+            np.sqrt(
+                np.clip(
+                    depth / max(float(maximum_penetration), 0.00025),
+                    1.0,
+                    10.0,
+                )
+            )
+        )
+        active_union.update(int(index) for index in active_indices)
+    if not rows:
+        return result, np.empty(0, dtype=np.int64)
+    jacobian = np.stack(rows)
+    target = np.asarray(targets, dtype=np.float64)
+    weight = np.asarray(weights, dtype=np.float64)
+    weighted_jacobian = jacobian * weight[:, None]
+    weighted_target = target * weight
+    damping = 2e-4
+    normal_matrix = weighted_jacobian.T @ weighted_jacobian
+    rhs = weighted_jacobian.T @ weighted_target
+    try:
+        delta = np.linalg.solve(
+            normal_matrix + damping * np.eye(len(dof_position)), rhs
+        )
+    except np.linalg.LinAlgError:
+        delta = np.linalg.lstsq(
+            normal_matrix + damping * np.eye(len(dof_position)),
+            rhs,
+            rcond=None,
+        )[0]
+    active_indices = np.asarray(sorted(active_union), dtype=np.int64)
+    result[active_indices] = np.clip(
+        delta[active_indices], -np.deg2rad(3.0), np.deg2rad(3.0)
+    )
+    return result, active_indices
 
 
 def _physical_invariant_report(
@@ -1947,7 +2906,7 @@ def _build_corrected_mano_body_targets(
     return targets.astype(np.float32), report
 
 
-def run_physical_correction(
+def _legacy_single_step_physical_correction(
     semantic: Mapping,
     initial_physics: Mapping[str, object],
     hand: "OfflineHandSpec",
@@ -1958,13 +2917,27 @@ def run_physical_correction(
     tool: SemanticTool,
     settings: GeometrySettings,
     args: argparse.Namespace,
+    collision_sdf_validator: Optional[CollisionMeshSDFValidator] = None,
+    collision_sdf_initialization_error: Optional[Exception] = None,
 ) -> Tuple[Dict, Dict[str, object], Dict[str, object], Dict[str, object]]:
-    """Repair a failed PhysX gate with local finger-chain and palm translations."""
+    """Repair SDF penetrations by local IK, then retain PhysX as the final gate."""
 
     baseline = copy.deepcopy(semantic)
     current = copy.deepcopy(semantic)
     current_physics = dict(initial_physics)
-    history = [{"round": 0, "score": _physics_failure_score(current_physics)}]
+    initial_sdf = current_physics.get("collision_mesh_penetration")
+    last_sdf = dict(initial_sdf) if isinstance(initial_sdf, Mapping) else None
+    history = [
+        {
+            "round": 0,
+            "physics_score": _physics_failure_score(current_physics),
+            "sdf_maximum_penetration": (
+                None
+                if last_sdf is None
+                else last_sdf.get("maximum_penetration")
+            ),
+        }
+    ]
     active_dofs = set()
     active_links = set()
     total_wrist_delta = np.zeros_like(np.asarray(current["opt_wrist_pos"], dtype=np.float64))
@@ -1980,6 +2953,47 @@ def run_physical_correction(
         sample_frames = np.asarray(current_physics.get("frame_ids", ()), dtype=np.int64)
         if len(per_frame) != len(sample_frames) or len(sample_frames) == 0:
             break
+        current_sdf = _collision_mesh_penetration_report(
+            collision_sdf_validator,
+            collision_sdf_initialization_error,
+            current,
+            context.object_trajectory,
+            sample_frames,
+            args.collision_sdf_max_penetration,
+            collect_constraints=True,
+        )
+        last_sdf = current_sdf
+        if current_sdf.get("status") == "error":
+            history.append(
+                {
+                    "round": round_index,
+                    "accepted": False,
+                    "reason": "collision_sdf_unavailable",
+                    "error": current_sdf.get("error"),
+                }
+            )
+            break
+        sdf_frame_ids = np.asarray(current_sdf["frame_ids"], dtype=np.int64)
+        sdf_depth = np.asarray(
+            current_sdf["penetration_depth_frame"], dtype=np.float64
+        )
+        sdf_constraints = list(current_sdf["penetration_constraints_frame"])
+        if not (
+            np.array_equal(sdf_frame_ids, sample_frames)
+            and sdf_depth.shape == (len(sample_frames),)
+            and len(sdf_constraints) == len(sample_frames)
+        ):
+            history.append(
+                {
+                    "round": round_index,
+                    "accepted": False,
+                    "reason": "collision_sdf_constraint_shape_mismatch",
+                }
+            )
+            break
+        sdf_lookup = {
+            int(frame): local for local, frame in enumerate(sdf_frame_ids)
+        }
         thresholds = current_physics.get("thresholds", {})
         max_force = float(thresholds.get("max_contact_force", args.physics_max_contact_force))
         max_overlap = float(thresholds.get("max_initial_overlap", args.physics_max_initial_overlap))
@@ -1987,101 +3001,226 @@ def run_physical_correction(
         sparse_wrist = np.zeros((len(sample_frames), 3), dtype=np.float64)
         current_dof = np.asarray(current["opt_dof_pos"], dtype=np.float64)
         candidate_found = False
-        for local_index, record in enumerate(per_frame):
+        for record in per_frame:
+            frame = int(record["frame"])
+            sdf_index = sdf_lookup.get(frame)
+            sdf_failed = bool(
+                sdf_index is not None
+                and sdf_depth[sdf_index]
+                > float(args.collision_sdf_max_penetration)
+            )
             force_failed = float(record.get("maximum_contact_force", 0.0)) > max_force
             overlap_failed = float(record.get("maximum_initial_overlap", 0.0)) > max_overlap
-            if not (force_failed or overlap_failed):
+            if not (force_failed or overlap_failed or sdf_failed):
                 continue
-            frame = int(record["frame"])
-            body_name = record.get("worst_hand_body_name")
-            if body_name is not None:
-                active_links.add(str(body_name))
-            finger = _finger_name(body_name)
-            if finger is not None:
-                mask = np.asarray([finger in name.lower() for name in hand.dof_names])
-                escape = np.asarray(
-                    record.get("hand_escape_normal", (0.0, 0.0, 0.0)),
-                    dtype=np.float64,
+            if sdf_index is None or sdf_depth[sdf_index] <= 1e-7:
+                continue
+            constraints = [
+                constraint
+                for constraint in sdf_constraints[sdf_index]
+                if float(constraint.get("depth", 0.0)) > 1e-7
+                and (
+                    not sdf_failed
+                    or float(constraint.get("depth", 0.0))
+                    > float(args.collision_sdf_max_penetration)
                 )
-                severity = max(
-                    1.0,
-                    float(record.get("maximum_initial_overlap", 0.0))
-                    / max(max_overlap, 1e-9),
-                    float(record.get("maximum_contact_force", 0.0))
-                    / max(max_force, 1e-9),
+            ]
+            if not constraints:
+                continue
+            finger_constraints = [
+                constraint
+                for constraint in constraints
+                if len(
+                    kinematics.actuated_ancestor_dof_indices(
+                        str(constraint.get("link_name", ""))
+                    )
                 )
-                raw_delta = _contact_normal_ik_delta(
-                    kinematics,
-                    str(body_name),
-                    current_dof[frame],
-                    np.asarray(current["opt_wrist_rot"], dtype=np.float64)[frame],
-                    np.flatnonzero(mask),
-                    escape,
-                    min(0.003, 0.0015 * severity),
-                )
-                if np.max(np.abs(raw_delta)) < 1e-6:
-                    continue
-                sparse_dof[local_index] = raw_delta
+            ]
+            raw_delta, frame_active_indices = _sdf_multi_constraint_ik_delta(
+                kinematics,
+                current_dof[frame],
+                np.asarray(current["opt_wrist_rot"], dtype=np.float64)[frame],
+                finger_constraints,
+                args.collision_sdf_max_penetration,
+            )
+            if np.max(np.abs(raw_delta), initial=0.0) >= 1e-6:
+                sparse_dof[sdf_index] = raw_delta
                 active_dofs.update(
-                    name
-                    for name, delta in zip(hand.dof_names, raw_delta)
-                    if abs(float(delta)) >= 1e-8
+                    hand.dof_names[index]
+                    for index in frame_active_indices
+                    if abs(float(raw_delta[index])) >= 1e-8
                 )
                 candidate_found = True
-            elif body_name is not None and "palm" in str(body_name).lower():
-                escape = np.asarray(record.get("hand_escape_normal", (0.0, 0.0, 0.0)), dtype=np.float64)
-                norm = float(np.linalg.norm(escape))
-                if norm > 1e-9:
-                    severity = max(
-                        1.0,
-                        float(record.get("maximum_initial_overlap", 0.0)) / max(max_overlap, 1e-9),
-                        float(record.get("maximum_contact_force", 0.0)) / max(max_force, 1e-9),
+            palm_steps = []
+            palm_weights = []
+            for constraint in constraints:
+                link_name = str(constraint.get("link_name", ""))
+                if not (
+                    link_name == kinematics.root_link
+                    or any(
+                        token in link_name.lower()
+                        for token in ("palm", "base", "wrist")
                     )
-                    sparse_wrist[local_index] = escape / norm * min(0.002, 0.001 * severity)
-                    candidate_found = True
+                ):
+                    continue
+                escape = np.asarray(
+                    constraint.get("hand_escape_direction_world"),
+                    dtype=np.float64,
+                )
+                escape_norm = float(np.linalg.norm(escape))
+                if escape_norm <= 1e-9:
+                    continue
+                depth = float(constraint.get("depth", 0.0))
+                distance = min(
+                    0.002,
+                    max(
+                        0.00025,
+                        depth
+                        - float(args.collision_sdf_max_penetration)
+                        + 0.0005,
+                    ),
+                )
+                palm_steps.append(escape / escape_norm * distance)
+                palm_weights.append(
+                    np.clip(
+                        depth
+                        / max(float(args.collision_sdf_max_penetration), 0.00025),
+                        1.0,
+                        10.0,
+                    )
+                )
+            if palm_steps:
+                wrist_delta = np.average(
+                    np.stack(palm_steps),
+                    axis=0,
+                    weights=np.asarray(palm_weights),
+                )
+                wrist_norm = float(np.linalg.norm(wrist_delta))
+                if wrist_norm > 0.002:
+                    wrist_delta *= 0.002 / wrist_norm
+                sparse_wrist[sdf_index] = wrist_delta
+                candidate_found = True
+            active_links.update(
+                str(constraint.get("link_name", ""))
+                for constraint in constraints
+                if constraint.get("link_name")
+            )
         if not candidate_found:
-            break
-
-        dof_step = _interpolate_sample_correction(len(current_dof), sample_frames, sparse_dof)
-        wrist_step = _interpolate_sample_correction(len(current_dof), sample_frames, sparse_wrist)
-        proposed_total_dof = np.clip(
-            total_dof_delta + dof_step, -np.deg2rad(15.0), np.deg2rad(15.0)
-        )
-        proposed_total_wrist = total_wrist_delta + wrist_step
-        wrist_norm = np.linalg.norm(proposed_total_wrist, axis=1)
-        too_large = wrist_norm > 0.01
-        if too_large.any():
-            proposed_total_wrist[too_large] *= (0.01 / wrist_norm[too_large])[:, None]
-
-        proposal = copy.deepcopy(baseline)
-        proposal["opt_dof_pos"] = np.clip(
-            np.asarray(baseline["opt_dof_pos"], dtype=np.float64) + proposed_total_dof,
-            limits_lower[None],
-            limits_upper[None],
-        ).astype(np.asarray(baseline["opt_dof_pos"]).dtype)
-        proposal["opt_wrist_pos"] = (
-            np.asarray(baseline["opt_wrist_pos"], dtype=np.float64) + proposed_total_wrist
-        ).astype(np.asarray(baseline["opt_wrist_pos"]).dtype)
-        proposal["opt_wrist_rot"] = np.asarray(baseline["opt_wrist_rot"]).copy()
-
-        world_points = kinematics.world_surface_trajectory(
-            proposal["opt_wrist_pos"], proposal["opt_wrist_rot"], proposal["opt_dof_pos"]
-        )
-        tool_points = world_to_tool_points(world_points, context.object_trajectory)
-        semantic_metrics = contact_geometry_metrics(
-            tool_points[hold_frame_ids],
-            kinematics.point_link_ids_array,
-            _contact_link_ids(kinematics, contact_names),
-            tool,
-            settings,
-        )
-        if not _is_feasible(semantic_metrics, settings):
             history.append(
                 {
                     "round": round_index,
                     "accepted": False,
-                    "reason": "semantic_geometry_regressed",
-                    "semantic": _summary_metrics(semantic_metrics),
+                    "reason": "no_failed_frame_with_reachable_sdf_constraints",
+                    "sdf_maximum_penetration": current_sdf.get(
+                        "maximum_penetration"
+                    ),
+                }
+            )
+            break
+
+        dof_step = _interpolate_sample_correction(len(current_dof), sample_frames, sparse_dof)
+        wrist_step = _interpolate_sample_correction(len(current_dof), sample_frames, sparse_wrist)
+        sdf_candidates = []
+        sdf_candidate_errors = []
+        for step_scale in (1.0, 0.5, 0.25, 0.125):
+            proposed_total_dof = np.clip(
+                total_dof_delta + step_scale * dof_step,
+                -np.deg2rad(15.0),
+                np.deg2rad(15.0),
+            )
+            proposed_total_wrist = total_wrist_delta + step_scale * wrist_step
+            wrist_norm = np.linalg.norm(proposed_total_wrist, axis=1)
+            too_large = wrist_norm > 0.01
+            if too_large.any():
+                proposed_total_wrist[too_large] *= (
+                    0.01 / wrist_norm[too_large]
+                )[:, None]
+
+            candidate = copy.deepcopy(baseline)
+            candidate["opt_dof_pos"] = np.clip(
+                np.asarray(baseline["opt_dof_pos"], dtype=np.float64)
+                + proposed_total_dof,
+                limits_lower[None],
+                limits_upper[None],
+            ).astype(np.asarray(baseline["opt_dof_pos"]).dtype)
+            candidate["opt_wrist_pos"] = (
+                np.asarray(baseline["opt_wrist_pos"], dtype=np.float64)
+                + proposed_total_wrist
+            ).astype(np.asarray(baseline["opt_wrist_pos"]).dtype)
+            candidate["opt_wrist_rot"] = np.asarray(
+                baseline["opt_wrist_rot"]
+            ).copy()
+            candidate_sdf = _collision_mesh_penetration_report(
+                collision_sdf_validator,
+                collision_sdf_initialization_error,
+                candidate,
+                context.object_trajectory,
+                sample_frames,
+                args.collision_sdf_max_penetration,
+            )
+            if candidate_sdf.get("status") == "error":
+                sdf_candidate_errors.append(candidate_sdf.get("error"))
+                continue
+            sdf_candidates.append(
+                (
+                    float(candidate_sdf["maximum_penetration"]),
+                    step_scale,
+                    candidate,
+                    candidate_sdf,
+                )
+            )
+        if not sdf_candidates:
+            history.append(
+                {
+                    "round": round_index,
+                    "accepted": False,
+                    "reason": "proposal_collision_sdf_unavailable",
+                    "errors": sdf_candidate_errors,
+                }
+            )
+            break
+        semantic_rejections = []
+        proposal = None
+        proposal_sdf = None
+        selected_step_scale = None
+        semantic_metrics = None
+        for _, step_scale, candidate, candidate_sdf in sorted(
+            sdf_candidates, key=lambda item: item[0]
+        ):
+            world_points = kinematics.world_surface_trajectory(
+                candidate["opt_wrist_pos"],
+                candidate["opt_wrist_rot"],
+                candidate["opt_dof_pos"],
+            )
+            tool_points = world_to_tool_points(
+                world_points, context.object_trajectory
+            )
+            candidate_semantic = contact_geometry_metrics(
+                tool_points[hold_frame_ids],
+                kinematics.point_link_ids_array,
+                _contact_link_ids(kinematics, contact_names),
+                tool,
+                settings,
+            )
+            if _is_feasible(candidate_semantic, settings):
+                proposal = candidate
+                proposal_sdf = candidate_sdf
+                selected_step_scale = step_scale
+                semantic_metrics = candidate_semantic
+                break
+            semantic_rejections.append(
+                {
+                    "step_scale": step_scale,
+                    "semantic": _summary_metrics(candidate_semantic),
+                }
+            )
+        if proposal is None or proposal_sdf is None or semantic_metrics is None:
+            history.append(
+                {
+                    "round": round_index,
+                    "accepted": False,
+                    "reason": "semantic_geometry_regressed_for_all_sdf_steps",
+                    "candidates": semantic_rejections,
                 }
             )
             break
@@ -2098,16 +3237,49 @@ def run_physical_correction(
             max_contact_force=args.physics_max_contact_force,
             max_initial_overlap=args.physics_max_initial_overlap,
             timeout=args.physics_timeout,
+            collision_sdf_report=proposal_sdf,
+            collision_sdf_validator=collision_sdf_validator,
         )
         old_score = _physics_failure_score(current_physics)
         new_score = _physics_failure_score(proposal_physics)
-        accepted = bool(new_score + 1e-9 < old_score or proposal_physics.get("passed", False))
+        old_sdf_depth = float(current_sdf.get("maximum_penetration", float("inf")))
+        new_sdf_depth = float(proposal_sdf.get("maximum_penetration", float("inf")))
+        physics_improved = bool(new_score + 1e-9 < old_score)
+        physics_not_worse = bool(new_score <= old_score + 1e-9)
+        sdf_improved = bool(new_sdf_depth + 1e-7 < old_sdf_depth)
+        sdf_not_worse = bool(new_sdf_depth <= old_sdf_depth + 1e-7)
+        final_gates_passed = bool(
+            proposal_physics.get("passed", False)
+            and proposal_sdf.get("passed", False)
+        )
+        # SDF is the inner repair objective. PhysX is deliberately not required
+        # to improve monotonically at every bounded step; it remains mandatory
+        # in ``final_gates_passed`` and in the final physical tier verdict.
+        accepted = bool(
+            final_gates_passed
+            or sdf_improved
+            or (physics_improved and sdf_not_worse)
+        )
         history.append(
             {
                 "round": round_index,
                 "accepted": accepted,
                 "score_before": old_score,
                 "score_after": new_score,
+                "sdf_maximum_penetration_before": old_sdf_depth,
+                "sdf_maximum_penetration_after": new_sdf_depth,
+                "physics_improved": physics_improved,
+                "physics_not_worse": physics_not_worse,
+                "sdf_improved": sdf_improved,
+                "final_gates_passed": final_gates_passed,
+                "selected_sdf_step_scale": selected_step_scale,
+                "sdf_line_search": [
+                    {
+                        "step_scale": step_scale,
+                        "maximum_penetration": maximum_penetration,
+                    }
+                    for maximum_penetration, step_scale, _, _ in sdf_candidates
+                ],
                 "semantic": _summary_metrics(semantic_metrics),
             }
         )
@@ -2115,6 +3287,7 @@ def run_physical_correction(
             break
         current = proposal
         current_physics = proposal_physics
+        last_sdf = proposal_sdf
         total_dof_delta = (
             np.asarray(current["opt_dof_pos"], dtype=np.float64)
             - np.asarray(baseline["opt_dof_pos"], dtype=np.float64)
@@ -2123,23 +3296,544 @@ def run_physical_correction(
             np.asarray(current["opt_wrist_pos"], dtype=np.float64)
             - np.asarray(baseline["opt_wrist_pos"], dtype=np.float64)
         )
-        if bool(current_physics.get("passed", False)):
+        if bool(
+            current_physics.get("passed", False)
+            and proposal_sdf.get("passed", False)
+        ):
             break
 
     invariants = _physical_invariant_report(
         baseline, current, limits_lower, limits_upper, sorted(active_dofs), hand
     )
-    passed = bool(current_physics.get("passed", False)) and invariants["passed"]
+    sdf_passed = bool(
+        isinstance(last_sdf, Mapping) and last_sdf.get("passed", False)
+    )
+    passed = bool(
+        current_physics.get("passed", False)
+        and sdf_passed
+        and invariants["passed"]
+    )
     report = {
         "name": "physical_optimization",
         "status": "passed" if passed else "failed",
         "passed": passed,
         "attempted": True,
-        "method": "contact_normal_damped_ik_physx_outer_loop",
+        "method": "collision_sdf_multi_point_ancestor_chain_ik_physx_final_gate",
+        "sdf_penetration_passed_on_physx_frames": sdf_passed,
+        "sdf_maximum_penetration_on_physx_frames": (
+            None if last_sdf is None else last_sdf.get("maximum_penetration")
+        ),
+        "sdf_objective_on_physx_frames": (
+            None
+            if not isinstance(last_sdf, Mapping)
+            else _sdf_penetration_objective(last_sdf)
+        ),
         "round_count": len(history) - 1,
         "active_link_names": sorted(active_links),
         "active_dof_names": sorted(active_dofs),
         "history": history,
+        "invariants": invariants,
+    }
+    return current, current_physics, report, invariants
+
+
+def run_physical_correction(
+    semantic: Mapping,
+    initial_physics: Mapping[str, object],
+    hand: "OfflineHandSpec",
+    context: OakInkContext,
+    contact_names: Sequence[str],
+    hold_frame_ids: np.ndarray,
+    kinematics: URDFCollisionKinematics,
+    tool: SemanticTool,
+    settings: GeometrySettings,
+    args: argparse.Namespace,
+    collision_sdf_validator: Optional[CollisionMeshSDFValidator] = None,
+    collision_sdf_initialization_error: Optional[Exception] = None,
+) -> Tuple[Dict, Dict[str, object], Dict[str, object], Dict[str, object]]:
+    """Run several SDF-only IK steps before each final PhysX outer check."""
+
+    baseline = copy.deepcopy(semantic)
+    current = copy.deepcopy(semantic)
+    current_physics = dict(initial_physics)
+    active_dofs = set()
+    active_links = set()
+    outer_history = []
+    total_inner_iterations = 0
+    last_sdf = None
+    trust_scale = 1.0
+    stopped_reason = None
+    best_physx_state = copy.deepcopy(current) if current_physics.get("passed", False) else None
+    best_physx_report = dict(current_physics) if current_physics.get("passed", False) else None
+    best_physx_sdf = (
+        current_physics.get("collision_mesh_penetration")
+        if current_physics.get("passed", False)
+        else None
+    )
+    limits_lower = np.asarray(
+        current_physics.get("dof_lower_limits"), dtype=np.float64
+    )
+    limits_upper = np.asarray(
+        current_physics.get("dof_upper_limits"), dtype=np.float64
+    )
+    if (
+        limits_lower.shape != (len(hand.dof_names),)
+        or limits_upper.shape != (len(hand.dof_names),)
+    ):
+        limits_lower = np.full(len(hand.dof_names), -np.inf, dtype=np.float64)
+        limits_upper = np.full(len(hand.dof_names), np.inf, dtype=np.float64)
+
+    for outer_round in range(1, args.physics_max_outer_rounds + 1):
+        sample_frames = np.asarray(
+            current_physics.get("frame_ids", ()), dtype=np.int64
+        )
+        per_frame = list(current_physics.get("per_frame", ()))
+        if len(sample_frames) == 0 or len(per_frame) != len(sample_frames):
+            outer_history.append(
+                {
+                    "outer_round": outer_round,
+                    "status": "stopped",
+                    "reason": "missing_physx_frame_diagnostics",
+                }
+            )
+            break
+        physics_by_frame = {
+            int(record["frame"]): record for record in per_frame
+        }
+        thresholds = current_physics.get("thresholds", {})
+        max_force = float(
+            thresholds.get("max_contact_force", args.physics_max_contact_force)
+        )
+        max_overlap = float(
+            thresholds.get(
+                "max_initial_overlap", args.physics_max_initial_overlap
+            )
+        )
+        inner_history = []
+        accepted_inner_steps = 0
+        stalled_iterations = 0
+
+        for inner_iteration in range(1, args.sdf_max_inner_iterations + 1):
+            total_inner_iterations += 1
+            current_sdf = _collision_mesh_penetration_report(
+                collision_sdf_validator,
+                collision_sdf_initialization_error,
+                current,
+                context.object_trajectory,
+                sample_frames,
+                args.collision_sdf_max_penetration,
+                collect_constraints=True,
+            )
+            last_sdf = current_sdf
+            if current_sdf.get("status") == "error":
+                inner_history.append(
+                    {
+                        "inner_iteration": inner_iteration,
+                        "accepted": False,
+                        "reason": "collision_sdf_unavailable",
+                        "error": current_sdf.get("error"),
+                    }
+                )
+                break
+            constraints_frame = list(
+                current_sdf.get("penetration_constraints_frame", ())
+            )
+            depth_frame = np.asarray(
+                current_sdf.get("penetration_depth_frame", ()),
+                dtype=np.float64,
+            )
+            if (
+                len(constraints_frame) != len(sample_frames)
+                or depth_frame.shape != (len(sample_frames),)
+            ):
+                inner_history.append(
+                    {
+                        "inner_iteration": inner_iteration,
+                        "accepted": False,
+                        "reason": "collision_sdf_constraint_shape_mismatch",
+                    }
+                )
+                break
+            if current_sdf.get("passed", False) and current_physics.get(
+                "passed", False
+            ):
+                break
+
+            current_dof = np.asarray(current["opt_dof_pos"], dtype=np.float64)
+            sparse_dof = np.zeros(
+                (len(sample_frames), len(hand.dof_names)), dtype=np.float64
+            )
+            sparse_wrist = np.zeros((len(sample_frames), 3), dtype=np.float64)
+            step_active_indices = set()
+            step_active_links = set()
+            constraint_count = 0
+            for sample_index, frame in enumerate(sample_frames):
+                record = physics_by_frame.get(int(frame), {})
+                force_failed = (
+                    float(record.get("maximum_contact_force", 0.0)) > max_force
+                )
+                overlap_failed = (
+                    float(record.get("maximum_initial_overlap", 0.0))
+                    > max_overlap
+                )
+                sdf_failed = (
+                    depth_frame[sample_index]
+                    > float(args.collision_sdf_max_penetration)
+                )
+                if not (force_failed or overlap_failed or sdf_failed):
+                    continue
+                constraints = [
+                    constraint
+                    for constraint in constraints_frame[sample_index]
+                    if float(constraint.get("depth", 0.0)) > 1e-7
+                    and (
+                        not sdf_failed
+                        or float(constraint.get("depth", 0.0))
+                        > float(args.collision_sdf_max_penetration)
+                    )
+                ]
+                if not constraints:
+                    continue
+                constraint_count += len(constraints)
+                finger_constraints = [
+                    constraint
+                    for constraint in constraints
+                    if len(
+                        kinematics.actuated_ancestor_dof_indices(
+                            str(constraint.get("link_name", ""))
+                        )
+                    )
+                ]
+                frame_delta, frame_active = _sdf_multi_constraint_ik_delta(
+                    kinematics,
+                    current_dof[int(frame)],
+                    np.asarray(current["opt_wrist_rot"], dtype=np.float64)[
+                        int(frame)
+                    ],
+                    finger_constraints,
+                    args.collision_sdf_max_penetration,
+                )
+                if np.max(np.abs(frame_delta), initial=0.0) >= 1e-7:
+                    sparse_dof[sample_index] = frame_delta
+                    step_active_indices.update(int(index) for index in frame_active)
+
+                palm_steps = []
+                palm_weights = []
+                for constraint in constraints:
+                    link_name = str(constraint.get("link_name", ""))
+                    if not (
+                        link_name == kinematics.root_link
+                        or any(
+                            token in link_name.lower()
+                            for token in ("palm", "base", "wrist")
+                        )
+                    ):
+                        continue
+                    escape = np.asarray(
+                        constraint.get("hand_escape_direction_world"),
+                        dtype=np.float64,
+                    )
+                    norm = float(np.linalg.norm(escape))
+                    if norm <= 1e-9:
+                        continue
+                    depth = float(constraint.get("depth", 0.0))
+                    distance = min(
+                        0.002,
+                        max(
+                            0.00025,
+                            depth
+                            - float(args.collision_sdf_max_penetration)
+                            + 0.0005,
+                        ),
+                    )
+                    palm_steps.append(escape / norm * distance)
+                    palm_weights.append(
+                        np.clip(
+                            depth
+                            / max(
+                                float(args.collision_sdf_max_penetration),
+                                0.00025,
+                            ),
+                            1.0,
+                            10.0,
+                        )
+                    )
+                if palm_steps:
+                    wrist_delta = np.average(
+                        np.stack(palm_steps),
+                        axis=0,
+                        weights=np.asarray(palm_weights),
+                    )
+                    norm = float(np.linalg.norm(wrist_delta))
+                    if norm > 0.002:
+                        wrist_delta *= 0.002 / norm
+                    sparse_wrist[sample_index] = wrist_delta
+                step_active_links.update(
+                    str(constraint.get("link_name", ""))
+                    for constraint in constraints
+                    if constraint.get("link_name")
+                )
+
+            if constraint_count == 0 or not (
+                np.max(np.abs(sparse_dof), initial=0.0) >= 1e-7
+                or np.max(np.abs(sparse_wrist), initial=0.0) >= 1e-7
+            ):
+                inner_history.append(
+                    {
+                        "inner_iteration": inner_iteration,
+                        "accepted": False,
+                        "reason": "no_reachable_sdf_constraints",
+                    }
+                )
+                break
+
+            dof_step = _interpolate_sample_correction(
+                len(current_dof), sample_frames, sparse_dof
+            )
+            wrist_step = _interpolate_sample_correction(
+                len(current_dof), sample_frames, sparse_wrist
+            )
+            total_dof = current_dof - np.asarray(
+                baseline["opt_dof_pos"], dtype=np.float64
+            )
+            total_wrist = np.asarray(
+                current["opt_wrist_pos"], dtype=np.float64
+            ) - np.asarray(baseline["opt_wrist_pos"], dtype=np.float64)
+            candidates = []
+            for base_step_scale in (1.0, 0.5, 0.25, 0.125):
+                step_scale = trust_scale * base_step_scale
+                candidate_total_dof = np.clip(
+                    total_dof + step_scale * dof_step,
+                    -np.deg2rad(15.0),
+                    np.deg2rad(15.0),
+                )
+                candidate_total_wrist = total_wrist + step_scale * wrist_step
+                wrist_norm = np.linalg.norm(candidate_total_wrist, axis=1)
+                too_large = wrist_norm > 0.01
+                if too_large.any():
+                    candidate_total_wrist[too_large] *= (
+                        0.01 / wrist_norm[too_large]
+                    )[:, None]
+                candidate = copy.deepcopy(baseline)
+                candidate["opt_dof_pos"] = np.clip(
+                    np.asarray(baseline["opt_dof_pos"], dtype=np.float64)
+                    + candidate_total_dof,
+                    limits_lower[None],
+                    limits_upper[None],
+                ).astype(np.asarray(baseline["opt_dof_pos"]).dtype)
+                candidate["opt_wrist_pos"] = (
+                    np.asarray(baseline["opt_wrist_pos"], dtype=np.float64)
+                    + candidate_total_wrist
+                ).astype(np.asarray(baseline["opt_wrist_pos"]).dtype)
+                candidate["opt_wrist_rot"] = np.asarray(
+                    baseline["opt_wrist_rot"]
+                ).copy()
+                candidate_sdf = _collision_mesh_penetration_report(
+                    collision_sdf_validator,
+                    collision_sdf_initialization_error,
+                    candidate,
+                    context.object_trajectory,
+                    sample_frames,
+                    args.collision_sdf_max_penetration,
+                )
+                if candidate_sdf.get("status") != "error":
+                    candidates.append(
+                        (
+                            _sdf_penetration_objective(candidate_sdf),
+                            float(candidate_sdf["maximum_penetration"]),
+                            step_scale,
+                            candidate,
+                            candidate_sdf,
+                        )
+                    )
+            selected = None
+            semantic_rejections = []
+            for _, _, step_scale, candidate, candidate_sdf in sorted(
+                candidates, key=lambda item: item[0]
+            ):
+                world_points = kinematics.world_surface_trajectory(
+                    candidate["opt_wrist_pos"],
+                    candidate["opt_wrist_rot"],
+                    candidate["opt_dof_pos"],
+                )
+                tool_points = world_to_tool_points(
+                    world_points, context.object_trajectory
+                )
+                semantic_metrics = contact_geometry_metrics(
+                    tool_points[hold_frame_ids],
+                    kinematics.point_link_ids_array,
+                    _contact_link_ids(kinematics, contact_names),
+                    tool,
+                    settings,
+                )
+                if _is_feasible(semantic_metrics, settings):
+                    selected = (
+                        step_scale,
+                        candidate,
+                        candidate_sdf,
+                        semantic_metrics,
+                    )
+                    break
+                semantic_rejections.append(step_scale)
+            if selected is None:
+                stopped_reason = "semantic_constraint_conflict"
+                inner_history.append(
+                    {
+                        "inner_iteration": inner_iteration,
+                        "accepted": False,
+                        "reason": "no_semantic_feasible_sdf_step",
+                        "rejected_step_scales": semantic_rejections,
+                    }
+                )
+                break
+            step_scale, proposal, proposal_sdf, semantic_metrics = selected
+            old_depth = float(current_sdf["maximum_penetration"])
+            new_depth = float(proposal_sdf["maximum_penetration"])
+            old_objective = _sdf_penetration_objective(current_sdf)
+            new_objective = _sdf_penetration_objective(proposal_sdf)
+            improvement = old_objective - new_objective
+            accepted = bool(
+                proposal_sdf.get("passed", False)
+                or improvement > float(args.sdf_improvement_tolerance)
+            )
+            inner_history.append(
+                {
+                    "inner_iteration": inner_iteration,
+                    "accepted": accepted,
+                    "constraint_count": constraint_count,
+                    "selected_step_scale": step_scale,
+                    "maximum_penetration_before": old_depth,
+                    "maximum_penetration_after": new_depth,
+                    "objective_before": old_objective,
+                    "objective_after": new_objective,
+                    "objective_improvement": improvement,
+                    "semantic": _summary_metrics(semantic_metrics),
+                }
+            )
+            if not accepted:
+                stalled_iterations += 1
+                trust_scale *= 0.5
+                if stalled_iterations >= args.sdf_stall_patience:
+                    stopped_reason = "local_sdf_minimum_or_conflicting_constraints"
+                    break
+                continue
+            stalled_iterations = 0
+            trust_scale = min(1.0, trust_scale * 1.25)
+            current = proposal
+            last_sdf = proposal_sdf
+            accepted_inner_steps += 1
+            active_links.update(step_active_links)
+            active_dofs.update(hand.dof_names[index] for index in step_active_indices)
+            if proposal_sdf.get("passed", False):
+                break
+
+        physics_before = _physics_failure_score(current_physics)
+        if accepted_inner_steps == 0:
+            if stopped_reason is None:
+                stopped_reason = "no_accepted_sdf_inner_step"
+            outer_history.append(
+                {
+                    "outer_round": outer_round,
+                    "status": "stalled",
+                    "physics_score_before": physics_before,
+                    "inner_history": inner_history,
+                }
+            )
+            break
+        proposal_physics = run_isaac_gym_validation(
+            current,
+            hand,
+            context,
+            contact_names,
+            hold_frame_ids,
+            headless=args.headless,
+            maximum_frames=args.physics_max_frames,
+            settle_steps=args.physics_settle_steps,
+            min_contact_frame_ratio=args.physics_min_contact_frame_ratio,
+            max_contact_force=args.physics_max_contact_force,
+            max_initial_overlap=args.physics_max_initial_overlap,
+            timeout=args.physics_timeout,
+            collision_sdf_report=last_sdf,
+            collision_sdf_validator=collision_sdf_validator,
+        )
+        physics_after = _physics_failure_score(proposal_physics)
+        current_physics = proposal_physics
+        if current_physics.get("passed", False):
+            previous_best_objective = (
+                float("inf")
+                if not isinstance(best_physx_sdf, Mapping)
+                else _sdf_penetration_objective(best_physx_sdf)
+            )
+            current_objective = (
+                float("inf")
+                if not isinstance(last_sdf, Mapping)
+                else _sdf_penetration_objective(last_sdf)
+            )
+            if current_objective < previous_best_objective:
+                best_physx_state = copy.deepcopy(current)
+                best_physx_report = dict(current_physics)
+                best_physx_sdf = dict(last_sdf)
+        outer_history.append(
+            {
+                "outer_round": outer_round,
+                "status": "accepted",
+                "accepted_inner_steps": accepted_inner_steps,
+                "physics_score_before": physics_before,
+                "physics_score_after": physics_after,
+                "physics_passed": bool(current_physics.get("passed", False)),
+                "sdf_passed": bool(last_sdf and last_sdf.get("passed", False)),
+                "inner_history": inner_history,
+            }
+        )
+        if bool(
+            current_physics.get("passed", False)
+            and last_sdf
+            and last_sdf.get("passed", False)
+        ):
+            break
+
+    if (
+        not current_physics.get("passed", False)
+        and best_physx_state is not None
+        and best_physx_report is not None
+    ):
+        current = best_physx_state
+        current_physics = best_physx_report
+        last_sdf = best_physx_sdf
+        stopped_reason = stopped_reason or "restored_best_physx_passing_candidate"
+
+    invariants = _physical_invariant_report(
+        baseline, current, limits_lower, limits_upper, sorted(active_dofs), hand
+    )
+    sdf_passed = bool(last_sdf and last_sdf.get("passed", False))
+    passed = bool(
+        current_physics.get("passed", False)
+        and sdf_passed
+        and invariants["passed"]
+    )
+    report = {
+        "name": "physical_optimization",
+        "status": "passed" if passed else "failed",
+        "passed": passed,
+        "attempted": True,
+        "method": "adaptive_multi_point_sdf_inner_loop_physx_outer_gate",
+        "round_count": len(outer_history),
+        "sdf_inner_iteration_count": total_inner_iterations,
+        "final_trust_scale": trust_scale,
+        "stopped_reason": stopped_reason,
+        "best_physx_candidate_available": best_physx_state is not None,
+        "active_link_names": sorted(active_links),
+        "active_dof_names": sorted(active_dofs),
+        "sdf_penetration_passed_on_physx_frames": sdf_passed,
+        "sdf_maximum_penetration_on_physx_frames": (
+            None if last_sdf is None else last_sdf.get("maximum_penetration")
+        ),
+        "sdf_objective_on_physx_frames": (
+            None
+            if not isinstance(last_sdf, Mapping)
+            else _sdf_penetration_objective(last_sdf)
+        ),
+        "history": outer_history,
         "invariants": invariants,
     }
     return current, current_physics, report, invariants
@@ -2267,6 +3961,10 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         raise ValueError("--bank currently requires --translation-mode contact-translation")
     if args.bank and args.output_pkl:
         raise ValueError("--bank cannot be combined with --output-pkl; use the canonical bank-backed path")
+    if args.physics_max_outer_rounds < 1 or args.sdf_max_inner_iterations < 1:
+        raise ValueError("Physical outer rounds and SDF inner iterations must be positive")
+    if args.sdf_stall_patience < 1 or args.sdf_improvement_tolerance < 0.0:
+        raise ValueError("SDF stall patience must be positive and tolerance non-negative")
     if args.physx and not args.headless and not os.environ.get("DISPLAY"):
         raise RuntimeError(
             "Isaac Gym Viewer was requested because --headless was omitted, but DISPLAY is empty. "
@@ -2339,6 +4037,20 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
     kinematics = URDFCollisionKinematics(
         Path(hand.urdf_path), hand.dof_names, points_per_link=args.points_per_link
     )
+    collision_sdf_validator = None
+    collision_sdf_initialization_error = None
+    try:
+        collision_sdf_validator = CollisionMeshSDFValidator(
+            kinematics,
+            context.collision_urdf_path,
+            surface_samples_per_link=args.collision_sdf_surface_samples,
+            penetration_points_per_link=args.collision_sdf_points_per_link,
+            maximum_points_per_frame=args.collision_sdf_max_points_per_frame,
+            cluster_radius=args.collision_sdf_cluster_radius,
+            cluster_normal_degrees=args.collision_sdf_cluster_normal_degrees,
+        )
+    except Exception as error:
+        collision_sdf_initialization_error = error
     contact_names = list(hand.contact_body_names)
     if args.contact_links:
         contact_names = [name.strip() for name in args.contact_links.split(",") if name.strip()]
@@ -2368,10 +4080,21 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         "ramp_out_frames": args.ramp_out_frames,
         "physics_required": bool(args.physx),
         "physics_max_frames": args.physics_max_frames,
+        "physics_max_outer_rounds": args.physics_max_outer_rounds,
+        "sdf_max_inner_iterations": args.sdf_max_inner_iterations,
+        "sdf_stall_patience": args.sdf_stall_patience,
+        "sdf_improvement_tolerance": args.sdf_improvement_tolerance,
         "physics_settle_steps": args.physics_settle_steps,
         "physics_min_contact_frame_ratio": args.physics_min_contact_frame_ratio,
         "physics_max_contact_force": args.physics_max_contact_force,
         "physics_max_initial_overlap": args.physics_max_initial_overlap,
+        "collision_mesh_penetration_required": True,
+        "collision_sdf_max_penetration": args.collision_sdf_max_penetration,
+        "collision_sdf_surface_samples": args.collision_sdf_surface_samples,
+        "collision_sdf_points_per_link": args.collision_sdf_points_per_link,
+        "collision_sdf_max_points_per_frame": args.collision_sdf_max_points_per_frame,
+        "collision_sdf_cluster_radius": args.collision_sdf_cluster_radius,
+        "collision_sdf_cluster_normal_degrees": args.collision_sdf_cluster_normal_degrees,
     }
     validation_settings_hash = stable_mapping_hash(validation_settings)
     if (args.start_frame is None) != (args.end_frame is None):
@@ -2735,6 +4458,34 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
             float(np.linalg.norm(delta_tool)) * 1000.0,
         )
     )
+    collision_sdf_tier = _collision_mesh_penetration_report(
+        collision_sdf_validator,
+        collision_sdf_initialization_error,
+        corrected,
+        context.object_trajectory,
+        hold_frame_ids,
+        args.collision_sdf_max_penetration,
+    )
+    if collision_sdf_tier["status"] == "error":
+        _log(
+            "[collision mesh/SDF 验收] 无法计算：{}（本次必需验收失败）".format(
+                collision_sdf_tier.get("error", "unknown error")
+            )
+        )
+    else:
+        _log(
+            "[collision mesh/SDF 验收] {}：最大穿透={:.3f} mm，超阈值帧={}/{}，"
+            "worst frame={}，link={}，凸包代理组件={}"
+            "（启用 PhysX 时可驱动局部修正）".format(
+                "通过" if collision_sdf_tier["passed"] else "失败",
+                float(collision_sdf_tier["maximum_penetration"]) * 1000.0,
+                int(collision_sdf_tier["threshold_exceeding_frame_count"]),
+                len(collision_sdf_tier["frame_ids"]),
+                collision_sdf_tier["worst_frame"],
+                collision_sdf_tier["worst_link"],
+                collision_sdf_tier["convex_hull_proxy_count"],
+            )
+        )
     physical_optimization_tier = {
         "name": "physical_optimization",
         "status": "not_requested",
@@ -2793,6 +4544,8 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
                 max_contact_force=args.physics_max_contact_force,
                 max_initial_overlap=args.physics_max_initial_overlap,
                 timeout=args.physics_timeout,
+                collision_sdf_report=collision_sdf_tier,
+                collision_sdf_validator=collision_sdf_validator,
             )
         except Exception as error:
             initial_physics_tier = {
@@ -2804,14 +4557,16 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
             }
         initial_physics_tier.setdefault("required", True)
         physics_tier = initial_physics_tier
-        if bool(initial_physics_tier.get("passed", False)):
+        initial_physics_passed = bool(initial_physics_tier.get("passed", False))
+        initial_sdf_passed = bool(collision_sdf_tier.get("passed", False))
+        if initial_physics_passed and initial_sdf_passed:
             physical_optimization_tier = {
                 "name": "physical_optimization",
                 "status": "not_needed",
                 "passed": True,
                 "required": True,
                 "attempted": False,
-                "reason": "initial PhysX validation passed",
+                "reason": "initial collision SDF and PhysX validation passed",
             }
             mano_target_sync_tier = {
                 "name": "mano_target_sync",
@@ -2820,8 +4575,19 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
                 "required": True,
                 "reason": "no physical trajectory change was required",
             }
-        elif initial_physics_tier.get("status") == "failed":
-            _log("[2/3] 初次 PhysX 验收失败；开始局部手指链/掌部物理修正")
+        elif (
+            initial_physics_tier.get("status") in ("passed", "failed")
+            and collision_sdf_tier.get("status") in ("passed", "failed")
+        ):
+            failed_gates = []
+            if not initial_sdf_passed:
+                failed_gates.append("collision mesh/SDF")
+            if not initial_physics_passed:
+                failed_gates.append("PhysX")
+            _log(
+                "[2/3] 初次 {} 验收失败；开始 SDF 穿透点/梯度驱动的"
+                "局部手指链或掌部修正".format(" + ".join(failed_gates))
+            )
             try:
                 corrected, physics_tier, physical_optimization_tier, invariant_report = (
                     run_physical_correction(
@@ -2835,6 +4601,8 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
                         tool,
                         settings,
                         args,
+                        collision_sdf_validator,
+                        collision_sdf_initialization_error,
                     )
                 )
             except Exception as error:
@@ -2894,7 +4662,21 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
                 "reason": "physical optimization was not run",
             }
 
+    # The SDF payload attached to a proposal Viewer may cover only the PhysX
+    # sample frames. Keep it out of the PhysX tier and produce one complete
+    # final report below if physical correction changed the trajectory.
+    physics_tier.pop("collision_mesh_penetration", None)
+    if isinstance(initial_physics_tier, dict):
+        initial_physics_tier.pop("collision_mesh_penetration", None)
     if physical_optimization_tier.get("attempted", False):
+        collision_sdf_tier = _collision_mesh_penetration_report(
+            collision_sdf_validator,
+            collision_sdf_initialization_error,
+            corrected,
+            context.object_trajectory,
+            hold_frame_ids,
+            args.collision_sdf_max_penetration,
+        )
         final_world = kinematics.world_surface_trajectory(
             np.asarray(corrected["opt_wrist_pos"], dtype=np.float64),
             np.asarray(corrected["opt_wrist_rot"], dtype=np.float64),
@@ -2945,12 +4727,14 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         _log(f"[2/2] PhysX 验证未通过：{physics_tier.get('error', physics_tier['status'])}")
     validation_tiers = {
         "semantic_geometry": semantic_geometry_tier,
+        "collision_mesh_penetration": collision_sdf_tier,
         "isaac_gym_physics": physics_tier,
         "physical_optimization": physical_optimization_tier,
         "mano_target_sync": mano_target_sync_tier,
     }
     overall_passed = bool(
         semantic_geometry_tier["passed"]
+        and collision_sdf_tier["passed"]
         and (
             not args.physx
             or (
@@ -3037,12 +4821,14 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         "validation_tiers": validation_tiers,
         "initial_physics_validation": initial_physics_tier,
         "physical_correction": physical_correction_metadata,
+        "collision_mesh_penetration_required": True,
         "physics_validation_required": bool(args.physx),
         "physics_validation_note": (
             "When enabled, PhysX first validates the semantic trajectory, then drives bounded "
-            "contact-normal finger IK (or palm-only wrist translation) if that gate fails, and "
-            "validates every accepted candidate again. Whole-task dynamic grasp stability is "
-            "still validated by the Stage-1 simulator."
+            "collision-SDF point/gradient finger IK (or palm-only wrist translation) if that "
+            "gate fails. Multiple SDF-only inner steps run before each PhysX outer check. PhysX "
+            "remains the final contact-force gate; whole-task stability is still validated by "
+            "Stage 1."
         ),
     }
     corrected["contact_retarget"] = {
@@ -3069,8 +4855,14 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         "alpha": alpha.astype(np.float32),
         "grasp_interval": np.asarray([start_frame, end_frame], dtype=np.int64),
         "geometry_feasible": geometry_feasible,
+        "collision_mesh_penetration_required": True,
         "physics_validation_required": bool(args.physx),
-        "validation_tiers": validation_tiers,
+        "validation_tiers": {
+            **validation_tiers,
+            "collision_mesh_penetration": _compact_collision_mesh_penetration_report(
+                collision_sdf_tier
+            ),
+        },
         "physical_correction": physical_correction_metadata,
         "settings": asdict(settings),
         "memory_retrieval": memory_retrieval_report,
@@ -3136,6 +4928,12 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
                 "validation": {
                     "overall_passed": True,
                     "semantic_geometry_passed": bool(semantic_geometry_tier["passed"]),
+                    "collision_mesh_penetration_passed": bool(
+                        collision_sdf_tier["passed"]
+                    ),
+                    "collision_mesh_maximum_penetration": float(
+                        collision_sdf_tier["maximum_penetration"]
+                    ),
                     "physics_required": bool(args.physx),
                     "physics_passed": bool(physics_tier["passed"]),
                     "red_frame_pass_ratio": float(after_hold["red_frame_pass_ratio"]),
@@ -3145,6 +4943,9 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
                 },
                 "capabilities": {
                     "semantic_geometry": bool(semantic_geometry_tier["passed"]),
+                    "collision_mesh_penetration": bool(
+                        collision_sdf_tier["passed"]
+                    ),
                     "physics_validated": bool(args.physx and physics_tier["passed"]),
                     "physical_joint_correction": bool(
                         physical_optimization_tier.get("attempted", False)
@@ -3172,9 +4973,9 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         _log(f"预览图已写入：{preview_path}")
         if overall_passed:
             _log(
-                "几何轨迹修正完成，语义几何与 PhysX 验收全部通过"
+                "几何轨迹修正完成，语义几何、collision mesh/SDF 与 PhysX 验收全部通过"
                 if args.physx
-                else "几何轨迹修正完成，语义几何验收通过（未启用 PhysX）"
+                else "几何轨迹修正完成，语义几何与 collision mesh/SDF 验收通过（未启用 PhysX）"
             )
         else:
             _log("已写入诊断 PKL（未通过全部已配置验证）")
@@ -3256,6 +5057,71 @@ def run_verification(args: argparse.Namespace) -> Dict[str, object]:
     points_corrected = world_to_tool_points(world_corrected, context.object_trajectory)
     start_frame, end_frame = (int(v) for v in metadata["grasp_interval"])
     frame_ids = np.arange(start_frame, end_frame + 1, dtype=np.int64)
+    stored_tiers = metadata.get("validation_tiers")
+    stored_collision_tier = (
+        stored_tiers.get("collision_mesh_penetration")
+        if isinstance(stored_tiers, Mapping)
+        else None
+    )
+    if not isinstance(stored_collision_tier, Mapping):
+        stored_collision_tier = {}
+    verification_sdf_samples = int(
+        args.collision_sdf_surface_samples
+        if args.collision_sdf_surface_samples is not None
+        else stored_collision_tier.get("surface_samples_per_link", 64)
+    )
+    verification_sdf_threshold = float(
+        args.collision_sdf_max_penetration
+        if args.collision_sdf_max_penetration is not None
+        else stored_collision_tier.get("maximum_penetration_threshold", 0.001)
+    )
+    verification_sdf_points_per_link = int(
+        args.collision_sdf_points_per_link
+        if args.collision_sdf_points_per_link is not None
+        else stored_collision_tier.get("penetration_points_per_link", 2)
+    )
+    verification_sdf_max_points = int(
+        args.collision_sdf_max_points_per_frame
+        if args.collision_sdf_max_points_per_frame is not None
+        else stored_collision_tier.get("maximum_points_per_frame", 16)
+    )
+    verification_sdf_cluster_radius = float(
+        args.collision_sdf_cluster_radius
+        if args.collision_sdf_cluster_radius is not None
+        else stored_collision_tier.get("cluster_radius", 0.0015)
+    )
+    verification_sdf_cluster_normal_degrees = float(
+        args.collision_sdf_cluster_normal_degrees
+        if args.collision_sdf_cluster_normal_degrees is not None
+        else stored_collision_tier.get("cluster_normal_degrees", 20.0)
+    )
+    verification_sdf_validator = None
+    verification_sdf_error = None
+    try:
+        verification_sdf_validator = CollisionMeshSDFValidator(
+            model,
+            collision_urdf_path,
+            surface_samples_per_link=verification_sdf_samples,
+            penetration_points_per_link=verification_sdf_points_per_link,
+            maximum_points_per_frame=verification_sdf_max_points,
+            cluster_radius=verification_sdf_cluster_radius,
+            cluster_normal_degrees=verification_sdf_cluster_normal_degrees,
+        )
+    except Exception as error:
+        verification_sdf_error = error
+    collision_sdf_tier = _collision_mesh_penetration_report(
+        verification_sdf_validator,
+        verification_sdf_error,
+        corrected,
+        context.object_trajectory,
+        frame_ids,
+        verification_sdf_threshold,
+    )
+    collision_penetration_required = int(metadata.get("schema_version", 0)) >= 9
+    collision_sdf_tier["required"] = collision_penetration_required
+    collision_sdf_tier["affects_overall_acceptance"] = (
+        collision_penetration_required
+    )
     metrics = contact_geometry_metrics(
         points_corrected[frame_ids],
         model.point_link_ids_array,
@@ -3447,6 +5313,10 @@ def run_verification(args: argparse.Namespace) -> Dict[str, object]:
             and source_mesh_matches
             and collision_bundle_matches
             and stored_tiers_passed
+            and (
+                not collision_penetration_required
+                or collision_sdf_tier["passed"]
+            )
             and semantic_invariants["passed"]
             and physical_delta_consistency["passed"]
             and mano_target_consistency["passed"]
@@ -3471,6 +5341,8 @@ def run_verification(args: argparse.Namespace) -> Dict[str, object]:
         "semantic_axis": metadata.get("semantic_axis"),
         "axis_constraint": axis_constraint,
         "geometry": _summary_metrics(metrics),
+        "collision_mesh_penetration": collision_sdf_tier,
+        "collision_mesh_penetration_required": collision_penetration_required,
         "invariants": invariants,
         "semantic_invariants": semantic_invariants,
         "physical_delta_consistency": physical_delta_consistency,
@@ -3488,7 +5360,9 @@ def run_verification(args: argparse.Namespace) -> Dict[str, object]:
     return report
 
 
-def _add_common_geometry_arguments(parser: argparse.ArgumentParser) -> None:
+def _add_common_geometry_arguments(
+    parser: argparse.ArgumentParser, *, verification: bool = False
+) -> None:
     parser.add_argument("--data-root", default=DEFAULT_OAKINK_ROOT)
     parser.add_argument("--skip", type=int, default=2)
     parser.add_argument("--points-per-link", type=int, default=32)
@@ -3500,6 +5374,49 @@ def _add_common_geometry_arguments(parser: argparse.ArgumentParser) -> None:
     # parser.add_argument("--max-black-violation-fraction", type=float, default=0.0)
     parser.add_argument("--max-black-violation-fraction", type=float, default=0.2)
     parser.add_argument("--max-optimization-frames", type=int, default=48)
+    parser.add_argument(
+        "--collision-sdf-max-penetration",
+        type=float,
+        default=None if verification else 0.001,
+        help=(
+            "required collision-mesh signed-penetration threshold in meters; failure blocks "
+            "normal PKL saving and schema-v9 Stage-1 loading (correction default: 0.001; "
+            "verification default: stored value)"
+        ),
+    )
+    parser.add_argument(
+        "--collision-sdf-surface-samples",
+        type=int,
+        default=None if verification else 64,
+        help=(
+            "deterministic bidirectional collision-surface samples per URDF link "
+            "(correction default: 64; verification default: stored value)"
+        ),
+    )
+    parser.add_argument(
+        "--collision-sdf-points-per-link",
+        type=int,
+        default=None if verification else 2,
+        help="deep SDF constraints retained per collision link and direction",
+    )
+    parser.add_argument(
+        "--collision-sdf-max-points-per-frame",
+        type=int,
+        default=None if verification else 16,
+        help="maximum clustered SDF constraints jointly optimized per frame",
+    )
+    parser.add_argument(
+        "--collision-sdf-cluster-radius",
+        type=float,
+        default=None if verification else 0.0015,
+        help="world-space radius in meters for deduplicating nearby SDF constraints",
+    )
+    parser.add_argument(
+        "--collision-sdf-cluster-normal-degrees",
+        type=float,
+        default=None if verification else 20.0,
+        help="maximum escape-normal angle for clustering nearby SDF constraints",
+    )
     parser.add_argument("--report")
 
 
@@ -3533,7 +5450,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--new-obj",
         help=(
             "replacement mesh identifier under "
-            "/workspace/PhysGraph/data/OakInk-v2/new_obj; selects its mesh and URDF"
+            "/home/ps/data/ylj/PhysGraph/data/OakInk-v2/new_obj; selects its mesh and URDF"
         ),
     )
     correct.add_argument(
@@ -3584,7 +5501,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="when --physx is enabled, run validation without opening a viewer",
     )
-    correct.add_argument("--physics-max-frames", type=int, default=24)
+    correct.add_argument("--physics-max-frames", type=int, default=48)
+    correct.add_argument("--physics-max-outer-rounds", type=int, default=8)
+    correct.add_argument("--sdf-max-inner-iterations", type=int, default=20)
+    correct.add_argument("--sdf-stall-patience", type=int, default=4)
+    correct.add_argument(
+        "--sdf-improvement-tolerance",
+        type=float,
+        default=1e-6,
+        help="minimum maximum-penetration decrease accepted by an SDF inner step",
+    )
     correct.add_argument("--physics-settle-steps", type=int, default=8)
     correct.add_argument("--physics-min-contact-frame-ratio", type=float, default=0.5)
     correct.add_argument(
@@ -3600,8 +5526,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--physx",
         action="store_true",
         help=(
-            "run PhysX validation, repair failed penetrations with bounded local IK, and require "
-            "the final physical/Stage-1 target checks to pass before saving"
+            "run PhysX validation, repair failed penetrations with collision-SDF gradient IK, "
+            "and require the final SDF/physical/Stage-1 target checks to pass before saving"
         ),
     )
     physics_group.add_argument(
@@ -3628,7 +5554,7 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--mesh")
     verify.add_argument("--collision-urdf")
     verify.add_argument("--new-obj")
-    _add_common_geometry_arguments(verify)
+    _add_common_geometry_arguments(verify, verification=True)
     return parser
 
 

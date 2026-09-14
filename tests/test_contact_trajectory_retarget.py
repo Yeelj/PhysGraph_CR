@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import numpy as np
@@ -73,6 +74,184 @@ class SquaredChamfer:
 
 
 class ContactTrajectoryRetargetTest(unittest.TestCase):
+    def test_collision_sdf_gradient_points_toward_increasing_penetration(self):
+        mesh = trimesh.creation.box(extents=[1.0, 1.0, 1.0])
+        signed, gradient, closest = MODULE["_union_signed_distance_gradient"](
+            (mesh,), np.asarray([[0.25, 0.0, 0.0]])
+        )
+        self.assertAlmostEqual(float(signed[0]), 0.25, places=6)
+        self.assertTrue(np.allclose(closest[0], [0.5, 0.0, 0.0]))
+        self.assertTrue(np.allclose(gradient[0], [-1.0, 0.0, 0.0]))
+
+    def test_sdf_objective_accounts_for_worst_and_distributed_penetration(self):
+        report = {
+            "penetration_depth_frame": np.asarray([0.0, 0.002, 0.003]),
+            "maximum_penetration_threshold": 0.001,
+        }
+        expected = 0.002 + np.sqrt((0.0 + 0.001**2 + 0.002**2) / 3.0)
+        self.assertAlmostEqual(
+            MODULE["_sdf_penetration_objective"](report), expected
+        )
+
+    def test_collision_sdf_is_bidirectional_required_gate(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            hand_urdf = root / "hand.urdf"
+            object_urdf = root / "object.urdf"
+            urdf = (
+                '<robot name="box"><link name="base"><collision><geometry>'
+                '<box size="1 1 1"/></geometry></collision></link></robot>'
+            )
+            hand_urdf.write_text(urdf, encoding="utf-8")
+            object_urdf.write_text(urdf, encoding="utf-8")
+            hand = MODULE["URDFCollisionKinematics"](
+                hand_urdf, (), points_per_link=64
+            )
+            validator = MODULE["CollisionMeshSDFValidator"](
+                hand, object_urdf, surface_samples_per_link=128
+            )
+            corrected = {
+                "opt_wrist_pos": np.zeros((2, 3), dtype=np.float64),
+                "opt_wrist_rot": np.zeros((2, 3), dtype=np.float64),
+                "opt_dof_pos": np.empty((2, 0), dtype=np.float64),
+            }
+            object_trajectory = np.repeat(np.eye(4)[None], 2, axis=0)
+            object_trajectory[0, 0, 3] = 0.25
+            object_trajectory[1, 0, 3] = 2.0
+
+            report = validator.validate(
+                corrected,
+                object_trajectory,
+                np.asarray([0, 1]),
+                maximum_penetration=0.01,
+            )
+            clear_report = validator.validate(
+                corrected,
+                object_trajectory,
+                np.asarray([1]),
+                maximum_penetration=0.01,
+            )
+            constraint_report = validator.validate(
+                corrected,
+                object_trajectory,
+                np.asarray([0]),
+                maximum_penetration=0.01,
+                collect_constraints=True,
+            )
+            aligned_urdf, alignment = validator.write_physx_aligned_hand_urdf(
+                root / "aligned"
+            )
+            aligned_model = MODULE["URDFCollisionKinematics"](
+                aligned_urdf, (), points_per_link=16
+            )
+            aligned_root = ET.fromstring(aligned_urdf.read_text(encoding="utf-8"))
+            aligned_mesh_name = aligned_root.find(
+                "./link/collision/geometry/mesh"
+            ).attrib["filename"]
+            self.assertTrue((aligned_urdf.parent / aligned_mesh_name).is_file())
+            self.assertEqual(len(aligned_model.link_collision_meshes["base"]), 1)
+
+        self.assertFalse(report["read_only"])
+        self.assertTrue(report["required"])
+        self.assertTrue(report["affects_correction"])
+        self.assertTrue(report["affects_overall_acceptance"])
+        self.assertEqual(report["name"], "collision_mesh_penetration")
+        self.assertGreater(report["penetration_depth_frame"][0], 0.1)
+        self.assertEqual(report["penetration_depth_frame"][1], 0.0)
+        self.assertEqual(report["threshold_exceeding_frame_count"], 1)
+        self.assertFalse(report["uses_proxy_geometry"])
+        self.assertTrue(clear_report["passed"])
+        self.assertTrue(constraint_report["constraints_collected"])
+        self.assertGreater(
+            len(constraint_report["penetration_constraints_frame"][0]), 1
+        )
+        self.assertEqual(alignment["mode"], "shared_watertight_sdf_proxy_urdf")
+        self.assertEqual(alignment["geometry_sha256"], validator.hand_proxy_geometry_sha256)
+        self.assertTrue(report["gradient_valid_frame"][0])
+        gradient = report["sdf_gradient_world_frame"][0]
+        escape = report["hand_escape_direction_world_frame"][0]
+        self.assertAlmostEqual(float(np.linalg.norm(gradient)), 1.0, places=6)
+        if report["worst_direction_frame"][0] == "hand_surface_inside_object":
+            self.assertTrue(np.allclose(escape, -gradient))
+        else:
+            self.assertTrue(np.allclose(escape, gradient))
+        point = report["worst_point_world_frame"][0]
+        closest = report["closest_surface_point_world_frame"][0]
+        self.assertAlmostEqual(
+            float(np.linalg.norm(point - closest)),
+            float(report["penetration_depth_frame"][0]),
+            places=6,
+        )
+        compact = MODULE["_compact_collision_mesh_penetration_report"](report)
+        self.assertNotIn("penetration_depth_frame", compact)
+        self.assertNotIn("sdf_gradient_world_frame", compact)
+        self.assertIn("maximum_penetration", compact)
+        self.assertIn("worst_sdf_gradient_world", compact)
+        self.assertTrue(compact["worst_gradient_valid"])
+
+    def test_sdf_gradient_ik_moves_the_reported_collision_point(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            urdf_path = Path(temp_dir) / "hinge.urdf"
+            urdf_path.write_text(
+                '<robot name="hinge">'
+                '<link name="palm"/>'
+                '<link name="index3"><collision><geometry>'
+                '<box size="0.02 0.02 0.02"/>'
+                '</geometry></collision></link>'
+                '<joint name="index_joint" type="revolute">'
+                '<parent link="palm"/><child link="index3"/>'
+                '<axis xyz="0 0 1"/>'
+                '</joint></robot>',
+                encoding="utf-8",
+            )
+            kinematics = MODULE["URDFCollisionKinematics"](
+                urdf_path, ("index_joint",), points_per_link=16
+            )
+            point_link = np.asarray([0.1, 0.0, 0.0])
+            escape = np.asarray([0.0, 1.0, 0.0])
+            delta = MODULE["_sdf_gradient_ik_delta"](
+                kinematics,
+                "index3",
+                np.zeros(1),
+                np.zeros(3),
+                np.asarray([0]),
+                point_link,
+                escape,
+                0.002,
+            )
+            multi_delta, active_indices = MODULE[
+                "_sdf_multi_constraint_ik_delta"
+            ](
+                kinematics,
+                np.zeros(1),
+                np.zeros(3),
+                (
+                    {
+                        "link_name": "index3",
+                        "hand_contact_point_link": point_link,
+                        "hand_escape_direction_world": escape,
+                        "depth": 0.003,
+                    },
+                ),
+                0.001,
+            )
+            before = MODULE["_transform_points"](
+                point_link[None],
+                kinematics.link_transforms(np.zeros(1))["index3"],
+            )[0]
+            after = MODULE["_transform_points"](
+                point_link[None],
+                kinematics.link_transforms(delta)["index3"],
+            )[0]
+
+        self.assertGreater(delta[0], 0.0)
+        self.assertGreater(float((after - before) @ escape), 0.0)
+        self.assertEqual(active_indices.tolist(), [0])
+        self.assertGreater(multi_delta[0], 0.0)
+        self.assertEqual(
+            kinematics.actuated_ancestor_dof_indices("index3").tolist(), [0]
+        )
+
     def test_stage1_rejects_swapped_original_and_corrected_trajectories(self):
         base_module = load_base_module_without_training_dependencies()
         validate_source = base_module["_validate_retargeting_source"]
@@ -445,6 +624,12 @@ class ContactTrajectoryRetargetTest(unittest.TestCase):
         self.assertFalse(hasattr(args, "max_residual_rotation_deg"))
         self.assertFalse(hasattr(args, "precise_max_frames"))
         self.assertEqual(args.physics_max_contact_force, 50000.0)
+        self.assertEqual(args.physics_max_outer_rounds, 8)
+        self.assertEqual(args.sdf_max_inner_iterations, 20)
+        self.assertEqual(args.collision_sdf_max_penetration, 0.001)
+        self.assertEqual(args.collision_sdf_surface_samples, 64)
+        self.assertEqual(args.collision_sdf_points_per_link, 2)
+        self.assertEqual(args.collision_sdf_max_points_per_frame, 16)
         self.assertFalse(args.physx)
         self.assertFalse(hasattr(args, "show_original_hand"))
 
@@ -464,6 +649,13 @@ class ContactTrajectoryRetargetTest(unittest.TestCase):
             ]
         )
         self.assertTrue(bank_args.bank)
+
+        verify_args = MODULE["build_parser"]().parse_args(
+            ["verify", "--input-pkl", "corrected.pkl"]
+        )
+        self.assertIsNone(verify_args.collision_sdf_max_penetration)
+        self.assertIsNone(verify_args.collision_sdf_surface_samples)
+        self.assertIsNone(verify_args.collision_sdf_points_per_link)
 
     def test_optional_physx_is_not_part_of_configured_acceptance_gate(self):
         tiers = {
@@ -521,6 +713,29 @@ class ContactTrajectoryRetargetTest(unittest.TestCase):
         self.assertTrue(
             base_module["_contact_retarget_validation_tiers_passed"](metadata)
         )
+
+    def test_schema9_always_requires_collision_mesh_penetration(self):
+        metadata = {
+            "schema_version": 9,
+            "physics_validation_required": False,
+            "validation_tiers": {
+                "semantic_geometry": {"passed": True},
+            },
+        }
+        base_module = load_base_module_without_training_dependencies()
+        stage1_gate = base_module["_contact_retarget_validation_tiers_passed"]
+
+        self.assertFalse(MODULE["_stored_validation_tiers_passed"](metadata))
+        self.assertFalse(stage1_gate(metadata))
+        metadata["validation_tiers"]["collision_mesh_penetration"] = {
+            "passed": False,
+            "required": True,
+        }
+        self.assertFalse(MODULE["_stored_validation_tiers_passed"](metadata))
+        self.assertFalse(stage1_gate(metadata))
+        metadata["validation_tiers"]["collision_mesh_penetration"]["passed"] = True
+        self.assertTrue(MODULE["_stored_validation_tiers_passed"](metadata))
+        self.assertTrue(stage1_gate(metadata))
 
     def test_removed_show_original_hand_option_is_rejected(self):
         with self.assertRaises(SystemExit):
@@ -777,7 +992,7 @@ class ContactTrajectoryRetargetTest(unittest.TestCase):
             data["obj_mesh_path"] = str(mesh_file)
             data["obj_urdf_path"] = str(collision_urdf)
             metadata = {
-                "schema_version": 8,
+                "schema_version": 9,
                 "geometry_feasible": True,
                 "side": "right",
                 "semantic_precheck": {"passed": True},
@@ -790,7 +1005,8 @@ class ContactTrajectoryRetargetTest(unittest.TestCase):
                 "validation_tiers": {
                     name: {"passed": True}
                     for name in (
-                        "semantic_geometry", "isaac_gym_physics",
+                        "semantic_geometry", "collision_mesh_penetration",
+                        "isaac_gym_physics",
                         "physical_optimization", "mano_target_sync",
                     )
                 },
