@@ -18,6 +18,7 @@ import argparse
 import ast
 import copy
 import hashlib
+import importlib.util
 import json
 import os
 import pickle
@@ -65,7 +66,8 @@ def _stored_validation_tiers_passed(
     )
 
 
-DEFAULT_OAKINK_ROOT = "/workspace/PhysGraph/data/OakInk-v2"
+DEFAULT_OAKINK_ROOT = "data/OakInk-v2"
+DEFAULT_TACO_ROOT = "data/TACO"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -82,7 +84,23 @@ from main.contact_retarget_memory import (
 )
 
 
-DEFAULT_BANK_ROOT = PROJECT_ROOT / "data" / "retargeting_bank" / "OakInk-v2"
+DEFAULT_BANK_ROOT = PROJECT_ROOT / "data" / "retargeting_bank"
+
+
+def _load_taco_utils():
+    """Load lightweight TACO helpers without triggering dataset auto-registration."""
+
+    module_name = "physgraph_contact_taco_utils"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+    module_path = Path(__file__).with_name("taco_dataset_utils.py")
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load TACO utilities from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _log(message: str) -> None:
@@ -430,7 +448,8 @@ class URDFCollisionKinematics:
 
 
 @dataclass
-class OakInkContext:
+class RetargetContext:
+    dataset_name: str
     data_idx: str
     annotation_path: Path
     source_mesh_path: Path
@@ -458,7 +477,7 @@ def load_oakink_context(
     collision_urdf_override: Optional[Path] = None,
     skip: int = 2,
     new_obj: Optional[str] = None,
-) -> OakInkContext:
+) -> RetargetContext:
     if "@" not in data_idx:
         raise ValueError("Contact trajectory retargeting currently requires an OakInk2 index such as 083f7@0")
     sequence_hash, stage_text = data_idx.rsplit("@", 1)
@@ -528,7 +547,8 @@ def load_oakink_context(
             else collision_urdf_override.resolve()
         )
     _urdf_bundle_sha256(collision_urdf_path)
-    return OakInkContext(
+    return RetargetContext(
+        dataset_name="OakInk-v2",
         data_idx=data_idx,
         annotation_path=annotation_path,
         source_mesh_path=dataset_mesh_path,
@@ -537,6 +557,161 @@ def load_oakink_context(
         object_id=object_id,
         object_trajectory=object_trajectory.astype(np.float64),
         frame_ids=frame_ids,
+    )
+
+
+def _taco_source_to_gym_correction() -> np.ndarray:
+    correction = np.eye(4, dtype=np.float64)
+    correction[:3, :3] = _mujoco_to_gym_transform()[:3, :3].T
+    return correction
+
+
+def load_taco_context(
+    data_idx: str,
+    side: str,
+    data_root: Path,
+    mesh_override: Optional[Path] = None,
+    collision_urdf_override: Optional[Path] = None,
+    new_obj: Optional[str] = None,
+) -> RetargetContext:
+    """Rebuild the exact meter-scale, 60 Hz TACO tool trajectory used by Stage 1."""
+
+    if side != "right":
+        raise ValueError("TACO contact trajectory correction currently supports the right hand only")
+    taco = _load_taco_utils()
+    records = taco.build_taco_sequence_index(str(data_root))
+    if data_idx not in records:
+        raise KeyError(f"Unknown TACO sequence ID {data_idx!r}")
+    record = records[data_idx]
+    tool_trajectory = np.load(record.tool_pose_path).astype(np.float64)
+    target_trajectory = np.load(record.target_pose_path).astype(np.float64)
+    _validate_taco_rigid_trajectory("tool trajectory", tool_trajectory)
+    _validate_taco_rigid_trajectory("target trajectory", target_trajectory)
+    if tool_trajectory.shape != target_trajectory.shape:
+        raise ValueError(
+            f"TACO tool/target frame mismatch for {data_idx}: "
+            f"{tool_trajectory.shape} vs {target_trajectory.shape}"
+        )
+    source_tool_mesh = taco.load_taco_source_mesh(record.tool_mesh_path)
+    source_target_mesh = taco.load_taco_source_mesh(record.target_mesh_path)
+    normalization = taco.taco_normalization_transform(
+        tool_trajectory,
+        target_trajectory,
+        source_tool_mesh,
+        source_target_mesh,
+    )
+    resampled_trajectory = taco.resample_taco_pose_trajectory(tool_trajectory)
+    world_transform = (
+        _mujoco_to_gym_transform()
+        @ _taco_source_to_gym_correction()
+        @ normalization
+    )
+    object_trajectory = world_transform[None] @ resampled_trajectory
+
+    source_assets = taco.resolve_taco_object_assets(str(data_root), record.tool_id)
+    if new_obj is not None:
+        if mesh_override is not None or collision_urdf_override is not None:
+            raise ValueError("--new-obj cannot be combined with --mesh or --collision-urdf")
+        target_assets = taco.resolve_taco_object_assets(str(data_root), new_obj)
+        mesh_path = Path(target_assets.semantic_mesh_path)
+        collision_urdf_path = Path(target_assets.urdf_path)
+    else:
+        mesh_path = (
+            Path(source_assets.semantic_mesh_path)
+            if mesh_override is None
+            else mesh_override.resolve()
+        )
+        collision_urdf_path = (
+            Path(source_assets.urdf_path)
+            if collision_urdf_override is None
+            else collision_urdf_override.resolve()
+        )
+    _urdf_bundle_sha256(collision_urdf_path)
+    return RetargetContext(
+        dataset_name="TACO",
+        data_idx=data_idx,
+        annotation_path=Path(record.tool_pose_path).resolve(),
+        source_mesh_path=Path(source_assets.semantic_mesh_path).resolve(),
+        mesh_path=mesh_path.resolve(),
+        collision_urdf_path=collision_urdf_path.resolve(),
+        object_id=record.tool_id,
+        object_trajectory=object_trajectory.astype(np.float64),
+        frame_ids=list(range(len(object_trajectory))),
+    )
+
+
+def _validate_taco_rigid_trajectory(name: str, trajectory: np.ndarray) -> None:
+    if trajectory.ndim != 3 or trajectory.shape[1:] != (4, 4) or len(trajectory) < 2:
+        raise ValueError(f"TACO {name} must have shape [T,4,4], got {trajectory.shape}")
+    if not np.isfinite(trajectory).all():
+        raise ValueError(f"TACO {name} contains NaN or Inf")
+    rotations = trajectory[:, :3, :3]
+    if not np.allclose(
+        rotations @ rotations.transpose(0, 2, 1),
+        np.eye(3)[None],
+        atol=1e-4,
+    ):
+        raise ValueError(f"TACO {name} contains non-orthonormal rotations")
+    if not np.allclose(trajectory[:, 3], [0.0, 0.0, 0.0, 1.0], atol=1e-6):
+        raise ValueError(f"TACO {name} contains invalid homogeneous transforms")
+
+
+def _dataset_name_for_index(data_idx: str, requested: Optional[str] = None) -> str:
+    aliases = {
+        None: None,
+        "auto": None,
+        "oakink": "OakInk-v2",
+        "oakink2": "OakInk-v2",
+        "OakInk-v2": "OakInk-v2",
+        "taco": "TACO",
+        "TACO": "TACO",
+    }
+    if requested not in aliases:
+        raise ValueError(f"Unsupported dataset {requested!r}")
+    selected = aliases[requested]
+    if selected is not None:
+        return selected
+    if "@" in data_idx:
+        return "OakInk-v2"
+    if _load_taco_utils().is_taco_sequence_id(data_idx):
+        return "TACO"
+    raise ValueError(f"Cannot infer dataset from data index {data_idx!r}")
+
+
+def _data_root_for_dataset(dataset_name: str, override: Optional[str]) -> Path:
+    if override:
+        return Path(override)
+    return Path(DEFAULT_TACO_ROOT if dataset_name == "TACO" else DEFAULT_OAKINK_ROOT)
+
+
+def load_retarget_context(
+    dataset_name: str,
+    data_idx: str,
+    side: str,
+    data_root: Path,
+    mesh_override: Optional[Path] = None,
+    collision_urdf_override: Optional[Path] = None,
+    *,
+    skip: int = 2,
+    new_obj: Optional[str] = None,
+) -> RetargetContext:
+    if dataset_name == "TACO":
+        return load_taco_context(
+            data_idx,
+            side,
+            data_root,
+            mesh_override,
+            collision_urdf_override,
+            new_obj,
+        )
+    return load_oakink_context(
+        data_idx,
+        side,
+        data_root,
+        mesh_override,
+        collision_urdf_override,
+        skip=skip,
+        new_obj=new_obj,
     )
 
 
@@ -1488,9 +1663,25 @@ def _resolve_dexhand(name: str, side: str) -> OfflineHandSpec:
     )
 
 
-def _resolve_source_pkl(data_idx: str, dexhand_name: str, side: str) -> Path:
+def _resolve_source_pkl(
+    data_idx: str,
+    dexhand_name: str,
+    side: str,
+    dataset_name: str = "OakInk-v2",
+) -> Path:
     suffix = "rh" if side == "right" else "lh"
-    directory = PROJECT_ROOT / "data" / "retargeting" / "OakInk-v2" / f"mano2{dexhand_name}_{suffix}"
+    directory = (
+        PROJECT_ROOT
+        / "data"
+        / "retargeting"
+        / dataset_name
+        / f"mano2{dexhand_name}_{suffix}"
+    )
+    if dataset_name == "TACO":
+        path = directory / f"{data_idx}.pkl"
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing TACO source retarget PKL: {path}")
+        return path
     sequence_hash, stage = data_idx.rsplit("@", 1)
     matches = sorted(directory.glob(f"*{sequence_hash}*@{stage}.pkl"))
     if len(matches) != 1:
@@ -1613,7 +1804,7 @@ def _invariant_report(
 def run_isaac_gym_validation(
     corrected: Mapping,
     hand: "OfflineHandSpec",
-    context: OakInkContext,
+    context: RetargetContext,
     contact_names: Sequence[str],
     hold_frame_ids: np.ndarray,
     headless: bool,
@@ -1821,7 +2012,14 @@ def _write_preview(
 
 
 def run_correction(args: argparse.Namespace) -> Dict[str, object]:
-    _log(f"开始修正 data_idx={args.data_idx}, dexhand={args.dexhand}, side={args.side}")
+    dataset_name = _dataset_name_for_index(args.data_idx, args.dataset)
+    data_root = _data_root_for_dataset(dataset_name, args.data_root)
+    if dataset_name == "TACO" and args.new_obj is not None:
+        args.new_obj = _load_taco_utils().normalize_taco_object_id(args.new_obj)
+    _log(
+        f"开始修正 dataset={dataset_name}, data_idx={args.data_idx}, "
+        f"dexhand={args.dexhand}, side={args.side}"
+    )
     if args.side != "right":
         raise ValueError("Contact trajectory correction and its memory bank are right-hand only")
     if args.new_obj is None:
@@ -1837,7 +2035,7 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         )
     hand = _resolve_dexhand(args.dexhand, args.side)
     input_path = Path(args.input_pkl).resolve() if args.input_pkl else _resolve_source_pkl(
-        args.data_idx, args.dexhand, args.side
+        args.data_idx, args.dexhand, args.side, dataset_name
     )
     output_root = Path(args.output_root)
     output_path = (
@@ -1849,6 +2047,7 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
             args.data_idx,
             args.new_obj,
             input_path.name,
+            dataset_name=dataset_name,
         )
     )
     if output_path == input_path:
@@ -1859,10 +2058,11 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
     else:
         _log(f"本次将生成新的修正 PKL：{output_path}")
     _log("读取原始 retarget、新旧工具语义 mesh、collision URDF 和工具轨迹")
-    context = load_oakink_context(
+    context = load_retarget_context(
+        dataset_name,
         args.data_idx,
         args.side,
-        Path(args.data_root),
+        data_root,
         None if args.mesh is None else Path(args.mesh),
         None if args.collision_urdf is None else Path(args.collision_urdf),
         skip=args.skip,
@@ -1972,6 +2172,14 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         settings,
     )
     memory_sequence_directory = bank_sequence_dir(DEFAULT_BANK_ROOT, args.data_idx)
+    legacy_memory_directory = bank_sequence_dir(
+        DEFAULT_BANK_ROOT / "OakInk-v2", args.data_idx
+    )
+    memory_lookup_directory = (
+        memory_sequence_directory
+        if memory_sequence_directory.exists()
+        else legacy_memory_directory
+    )
     memory_descriptor = build_mesh_descriptor(tool) if args.bank else None
     memory_sequence_metadata = {
         "data_id": args.data_idx,
@@ -1981,13 +2189,14 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         "source_tool_mesh_sha256": _sha256(context.source_mesh_path),
         "annotation_sha256": _sha256(context.annotation_path),
         "trajectory_length": int(length),
-        "skip": int(args.skip),
+        "skip": None if dataset_name == "TACO" else int(args.skip),
         "hand_urdf_bundle_sha256": _urdf_bundle_sha256(Path(hand.urdf_path)),
         "contact_links": contact_names,
     }
     memory_retrieval_report = {
         "enabled": bool(args.bank),
         "bank_sequence_directory": memory_sequence_directory,
+        "bank_lookup_directory": memory_lookup_directory,
         "sequence_found": False,
         "candidates": [],
         "selected_tool_mesh_name": None,
@@ -2000,11 +2209,11 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         )
         ranked_entries = []
         if args.bank and require_compatible_sequence(
-            memory_sequence_directory, memory_sequence_metadata
+            memory_lookup_directory, memory_sequence_metadata
         ):
             memory_retrieval_report["sequence_found"] = True
             ranked_entries = load_ranked_entries(
-                memory_sequence_directory, memory_descriptor, top_k=3
+                memory_lookup_directory, memory_descriptor, top_k=3
             )
 
         evaluated_candidates = []
@@ -2365,6 +2574,7 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         "geometry_feasible": geometry_feasible,
         "input_pkl": input_path,
         "output_pkl": output_path,
+        "dataset_name": dataset_name,
         "data_idx": args.data_idx,
         "side": args.side,
         "dexhand": args.dexhand,
@@ -2415,6 +2625,7 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
     corrected["contact_retarget"] = {
         "schema_version": SCHEMA_VERSION,
         "source_pkl": str(input_path),
+        "dataset_name": dataset_name,
         "data_idx": args.data_idx,
         "side": args.side,
         "dexhand": args.dexhand,
@@ -2549,23 +2760,36 @@ def run_verification(args: argparse.Namespace) -> Dict[str, object]:
     data_idx = args.data_idx or metadata["data_idx"]
     side = args.side or metadata["side"]
     dexhand_name = args.dexhand or metadata["dexhand"]
-    if args.new_obj is not None:
-        if args.mesh is not None or args.collision_urdf is not None:
-            raise ValueError("--new-obj cannot be combined with --mesh or --collision-urdf")
-        replacement = resolve_new_object_assets(args.new_obj)
-        mesh_path = replacement.mesh_path
-        collision_urdf_path = replacement.urdf_path
-    else:
-        mesh_path = Path(args.mesh or metadata["tool_mesh"])
-        collision_urdf_path = Path(args.collision_urdf or metadata["collision_urdf"])
-    context = load_oakink_context(
+    dataset_name = _dataset_name_for_index(
+        data_idx,
+        args.dataset or metadata.get("dataset_name"),
+    )
+    data_root = _data_root_for_dataset(dataset_name, args.data_root)
+    selected_new_obj = args.new_obj or metadata.get("new_obj")
+    if dataset_name == "TACO" and selected_new_obj is not None:
+        selected_new_obj = _load_taco_utils().normalize_taco_object_id(
+            selected_new_obj
+        )
+    mesh_override = None if selected_new_obj else Path(args.mesh or metadata["tool_mesh"])
+    collision_override = (
+        None
+        if selected_new_obj
+        else Path(args.collision_urdf or metadata["collision_urdf"])
+    )
+    if selected_new_obj and (args.mesh is not None or args.collision_urdf is not None):
+        raise ValueError("--new-obj cannot be combined with --mesh or --collision-urdf")
+    context = load_retarget_context(
+        dataset_name,
         data_idx,
         side,
-        Path(args.data_root),
-        mesh_path,
-        collision_urdf_path,
+        data_root,
+        mesh_override,
+        collision_override,
         skip=args.skip,
+        new_obj=selected_new_obj,
     )
+    mesh_path = context.mesh_path
+    collision_urdf_path = context.collision_urdf_path
     hand = _resolve_dexhand(dexhand_name, side)
     model = URDFCollisionKinematics(Path(hand.urdf_path), hand.dof_names, args.points_per_link)
     source_tool = load_semantic_tool(context.source_mesh_path, label="old/source")
@@ -2676,7 +2900,8 @@ def run_verification(args: argparse.Namespace) -> Dict[str, object]:
         ),
         "corrected_pkl": corrected_path,
         "source_pkl": source_path,
-        "new_obj": args.new_obj or metadata.get("new_obj"),
+        "dataset_name": dataset_name,
+        "new_obj": selected_new_obj,
         "tool_mesh": mesh_path,
         "source_tool_mesh": context.source_mesh_path,
         "semantic_precheck": semantic_precheck,
@@ -2707,7 +2932,16 @@ def run_verification(args: argparse.Namespace) -> Dict[str, object]:
 
 
 def _add_common_geometry_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--data-root", default=DEFAULT_OAKINK_ROOT)
+    parser.add_argument(
+        "--dataset",
+        choices=("auto", "oakink", "taco"),
+        default="auto",
+        help="dataset context; auto infers it from data-idx",
+    )
+    parser.add_argument(
+        "--data-root",
+        help="dataset root; defaults to the built-in OakInk-v2 or TACO root",
+    )
     parser.add_argument("--skip", type=int, default=2)
     parser.add_argument("--points-per-link", type=int, default=32)
     parser.add_argument("--contact-distance", type=float, default=0.006)
@@ -2727,7 +2961,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     correct = subparsers.add_parser("correct", help="solve, validate, and save a corrected retarget PKL")
-    correct.add_argument("--data-idx", required=True, help="OakInk2 index, e.g. 083f7@0")
+    correct.add_argument(
+        "--data-idx",
+        required=True,
+        help="OakInk2 or TACO sequence index, e.g. 083f7@0 or bb_bowl_0919036",
+    )
     correct.add_argument("--dexhand", default="inspire")
     correct.add_argument("--side", choices=("right", "left"), default="right")
     correct.add_argument("--input-pkl")
@@ -2737,7 +2975,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--bank",
         action="store_true",
         help=(
-            "retrieve verified corrections from data/retargeting_bank/OakInk-v2 "
+            "retrieve verified corrections from data/retargeting_bank/<sequence-id> "
             "and update the bank after successful validation"
         ),
     )
@@ -2750,8 +2988,7 @@ def build_parser() -> argparse.ArgumentParser:
     correct.add_argument(
         "--new-obj",
         help=(
-            "replacement mesh identifier under "
-            "/workspace/PhysGraph/data/OakInk-v2/new_obj; selects its mesh and URDF"
+            "replacement identifier: OakInk new_obj name or existing three-digit TACO object ID"
         ),
     )
     correct.add_argument(

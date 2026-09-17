@@ -40,7 +40,6 @@ from main.dataset.transform import aa_to_quat, aa_to_rotmat, quat_to_rotmat, rot
 from main.new_object_paths import (
     object_asset_cache_key,
     replacement_object_for_side,
-    resolve_new_object_assets,
 )
 from torch import Tensor
 from tqdm import tqdm
@@ -640,25 +639,30 @@ class DexHandManipBiHEnv(VecTask):
                 )
 
         if self.new_obj is not None:
-            replacement = resolve_new_object_assets(self.new_obj)
-            expected_mesh = os.path.realpath(replacement.mesh_path)
-            expected_urdf = os.path.realpath(replacement.urdf_path)
-            for actual_path in self.demo_data_rh["obj_mesh_path"]:
-                if os.path.realpath(actual_path) != expected_mesh:
-                    raise RuntimeError(
-                        f"RH tool mesh does not match new_obj={self.new_obj}: {actual_path}"
-                    )
-            for actual_path in self.demo_data_rh["obj_urdf_path"]:
-                if os.path.realpath(actual_path) != expected_urdf:
-                    raise RuntimeError(
-                        f"RH tool URDF does not match new_obj={self.new_obj}: {actual_path}"
-                    )
-            if any(
-                os.path.realpath(path) in {expected_mesh, expected_urdf}
-                for key in ("obj_mesh_path", "obj_urdf_path")
-                for path in self.demo_data_lh[key]
+            replacements = self.demo_data_rh.get("replacement_obj_id")
+            dataset_names = self.demo_data_rh.get("dataset_name")
+            if (
+                replacements is None
+                or dataset_names is None
+                or len(replacements) != len(dataset_names)
             ):
-                raise RuntimeError("LH task object unexpectedly reuses the RH replacement tool asset")
+                raise RuntimeError(
+                    f"RH dataset did not apply new_obj={self.new_obj} consistently"
+                )
+            for dataset_name, value in zip(dataset_names, replacements):
+                expected = str(self.new_obj)
+                if dataset_name == "TACO" and expected.isdigit():
+                    expected = expected.zfill(3)
+                if value != expected:
+                    raise RuntimeError(
+                        f"RH {dataset_name} dataset did not apply "
+                        f"new_obj={expected}; got {value!r}"
+                    )
+            left_replacements = self.demo_data_lh.get("replacement_obj_id")
+            if left_replacements is not None and any(
+                value is not None for value in left_replacements
+            ):
+                raise RuntimeError("LH task object unexpectedly applies the RH replacement")
 
         print(
             "[Stage1 data] "

@@ -61,6 +61,7 @@ class ManipData(Dataset, ABC):
         max_seq_len=int(1e10),
         dexhand=None,
         verbose=True,
+        output_fps=None,
         **kwargs,
     ):
         self.data_dir = data_dir
@@ -72,6 +73,10 @@ class ManipData(Dataset, ABC):
         self.device = device
 
         self.verbose = verbose
+
+        # Preserve the original 120 / skip convention unless a dataset has
+        # already been resampled to an explicit output frequency.
+        self.output_fps = float(output_fps) if output_fps is not None else 120.0 / self.skip
 
         # ? modify this depending on the origin point
         self.transf_offset = torch.eye(4, dtype=torch.float32, device=mujoco2gym_transf.device)
@@ -367,26 +372,27 @@ class ManipData(Dataset, ABC):
         self._update_hand_object_distances(data)
 
         data["obj_velocity"] = self.compute_velocity(
-            data["obj_trajectory"][:, None, :3, 3], 1 / (120 / self.skip), guassian_filter=True
+            data["obj_trajectory"][:, None, :3, 3], 1 / self.output_fps, guassian_filter=True
         ).squeeze(1)
         data["obj_angular_velocity"] = self.compute_angular_velocity(
-            data["obj_trajectory"][:, None, :3, :3], 1 / (120 / self.skip), guassian_filter=True
+            data["obj_trajectory"][:, None, :3, :3], 1 / self.output_fps, guassian_filter=True
         ).squeeze(1)
         data["wrist_velocity"] = self.compute_velocity(
-            data["wrist_pos"][:, None], 1 / (120 / self.skip), guassian_filter=True
+            data["wrist_pos"][:, None], 1 / self.output_fps, guassian_filter=True
         ).squeeze(1)
         data["wrist_angular_velocity"] = self.compute_angular_velocity(
-            aa_to_rotmat(data["wrist_rot"][:, None]), 1 / (120 / self.skip), guassian_filter=True
+            aa_to_rotmat(data["wrist_rot"][:, None]), 1 / self.output_fps, guassian_filter=True
         ).squeeze(1)
         data["mano_joints_velocity"] = {}
         for k in data["mano_joints"].keys():
             data["mano_joints_velocity"][k] = self.compute_velocity(
-                data["mano_joints"][k], 1 / (120 / self.skip), guassian_filter=True
+                data["mano_joints"][k], 1 / self.output_fps, guassian_filter=True
             )
 
         if len(data["obj_trajectory"]) > self.max_seq_len:
+            data_path = data.get("data_path", str(idx))
             cprint(
-                f"WARN: {self.data_pathes[idx]} is too long : {len(data['obj_trajectory'])}, cut to {self.max_seq_len}",
+                f"WARN: {data_path} is too long : {len(data['obj_trajectory'])}, cut to {self.max_seq_len}",
                 "yellow",
             )
             data["obj_trajectory"] = data["obj_trajectory"][: self.max_seq_len]
@@ -445,16 +451,16 @@ class ManipData(Dataset, ABC):
                     data, contact_metadata, retargeted_data_path
                 )
         data["opt_wrist_velocity"] = self.compute_velocity(
-            data["opt_wrist_pos"][:, None], 1 / (120 / self.skip), guassian_filter=True
+            data["opt_wrist_pos"][:, None], 1 / self.output_fps, guassian_filter=True
         ).squeeze(1)
         data["opt_wrist_angular_velocity"] = self.compute_angular_velocity(
-            aa_to_rotmat(data["opt_wrist_rot"][:, None]), 1 / (120 / self.skip), guassian_filter=True
+            aa_to_rotmat(data["opt_wrist_rot"][:, None]), 1 / self.output_fps, guassian_filter=True
         ).squeeze(1)
         data["opt_dof_velocity"] = self.compute_dof_velocity(
-            data["opt_dof_pos"], 1 / (120 / self.skip), guassian_filter=True
+            data["opt_dof_pos"], 1 / self.output_fps, guassian_filter=True
         )
         # data["opt_joints_velocity"] = self.compute_velocity(
-        #     data["opt_joints_pos"], 1 / (120 / self.skip), guassian_filter=True
+        #     data["opt_joints_pos"], 1 / self.output_fps, guassian_filter=True
         # ) # ? only used for ablation study
         if len(data["opt_wrist_pos"]) > self.max_seq_len:
             data["opt_wrist_pos"] = data["opt_wrist_pos"][: self.max_seq_len]

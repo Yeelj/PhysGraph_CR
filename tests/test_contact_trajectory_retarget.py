@@ -13,6 +13,7 @@ import torch
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 from main.new_object_paths import object_asset_cache_key, replacement_object_for_side
+from main.contact_retarget_memory import corrected_retarget_path, right_hand_retarget_path
 
 
 MODULE = runpy.run_path(
@@ -73,6 +74,74 @@ class SquaredChamfer:
 
 
 class ContactTrajectoryRetargetTest(unittest.TestCase):
+    def test_corrected_paths_are_dataset_aware_but_bank_is_sequence_only(self):
+        corrected = corrected_retarget_path(
+            Path("data/retargeting_contact"),
+            "mano2artimano_rh",
+            "bb_bowl_0919036",
+            "058",
+            "bb_bowl_0919036.pkl",
+            dataset_name="TACO",
+        )
+        self.assertEqual(
+            corrected,
+            Path("data/retargeting_contact/TACO/mano2artimano_rh/")
+            / "bb_bowl_0919036/058/bb_bowl_0919036.pkl",
+        )
+        selected, kind = right_hand_retarget_path(
+            Path("data/retargeting"),
+            Path("data/retargeting_contact"),
+            "mano2artimano_rh",
+            "bb_bowl_0919036",
+            "058",
+            "bb_bowl_0919036.pkl",
+            correct=False,
+            dataset_name="TACO",
+        )
+        self.assertEqual(
+            selected,
+            Path("data/retargeting/TACO/mano2artimano_rh/bb_bowl_0919036.pkl"),
+        )
+        self.assertEqual(kind, "original")
+        self.assertEqual(
+            MODULE["bank_sequence_dir"](
+                Path("data/retargeting_bank"), "bb_bowl_0919036"
+            ),
+            Path("data/retargeting_bank/bb_bowl_0919036"),
+        )
+
+    def test_taco_semantics_are_independent_and_match_stage1_contract(self):
+        taco = MODULE["_load_taco_utils"]()
+        mesh = trimesh.creation.box()
+        colors = np.zeros((len(mesh.vertices), 4), dtype=np.uint8)
+        colors[:, 3] = 255
+        colors[np.asarray(mesh.vertices)[:, 0] >= 0, 0] = 255
+        mesh.visual.vertex_colors = colors
+        semantic = taco.extract_taco_red_black_regions(mesh)
+        self.assertEqual(semantic["tool_red_points"].shape, (512, 3))
+        self.assertEqual(semantic["tool_black_points"].shape, (512, 3))
+        self.assertGreater(semantic["tool_red_vertex_count"], 0)
+        self.assertGreater(semantic["tool_black_vertex_count"], 0)
+
+    def test_taco_parser_and_context_dispatch(self):
+        args = MODULE["build_parser"]().parse_args(
+            [
+                "correct",
+                "--data-idx",
+                "bb_bowl_0919036",
+                "--dexhand",
+                "artimano",
+                "--new-obj",
+                "058",
+                "--headless",
+            ]
+        )
+        self.assertEqual(
+            MODULE["_dataset_name_for_index"](args.data_idx, args.dataset),
+            "TACO",
+        )
+        self.assertIsNone(args.data_root)
+
     def test_stage1_rejects_swapped_original_and_corrected_trajectories(self):
         base_module = load_base_module_without_training_dependencies()
         validate_source = base_module["_validate_retargeting_source"]

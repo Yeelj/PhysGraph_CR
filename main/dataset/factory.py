@@ -1,6 +1,7 @@
 import os
 import importlib
 from .base import ManipData
+from .taco_dataset_utils import is_taco_sequence_id
 
 
 class ManipDataFactory:
@@ -40,7 +41,9 @@ class ManipDataFactory:
         else:
             is_mirrored = False
 
-        if type(index) == str and "@" in index:
+        if is_taco_sequence_id(index):
+            dtype = "taco"
+        elif type(index) == str and "@" in index:
             dtype = "oakink2"
         elif type(index) == str and index.startswith("g"):
             dtype = "grabdemo"

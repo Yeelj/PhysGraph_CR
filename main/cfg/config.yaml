@@ -30,10 +30,11 @@ usePIDControl: False
 
 dataIndices: [7]
 
-# Optional right-hand tool replacement under OakInk-v2/new_obj. Null keeps the
-# original tool; the left-hand task object always keeps its original assets.
+# Optional right-hand tool replacement. OakInk resolves a new_obj asset name;
+# TACO resolves an existing three-digit object ID. The left-hand task object
+# always keeps its original assets.
 new_obj: null
-# Load the right-hand contact-corrected PKL selected by data_id/new_obj.
+# Load the right-hand contact-corrected PKL selected by dataset/data_id/new_obj.
 # False keeps the original right-hand retarget PKL even when new_obj is set.
 correct: false
 

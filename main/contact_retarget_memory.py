@@ -33,10 +33,12 @@ def corrected_retarget_path(
     data_id: str,
     tool_mesh_name: str,
     filename: str,
+    *,
+    dataset_name: str = "OakInk-v2",
 ) -> Path:
     return (
         Path(output_root)
-        / "OakInk-v2"
+        / safe_path_component(dataset_name, "dataset name")
         / safe_path_component(hand_directory, "hand directory")
         / safe_path_component(data_id, "data_id")
         / safe_path_component(tool_mesh_name, "tool mesh name")
@@ -53,6 +55,7 @@ def right_hand_retarget_path(
     filename: str,
     *,
     correct: bool,
+    dataset_name: str = "OakInk-v2",
 ) -> tuple[Path, str]:
     if correct:
         if tool_mesh_name is None:
@@ -64,12 +67,13 @@ def right_hand_retarget_path(
                 data_id,
                 tool_mesh_name,
                 filename,
+                dataset_name=dataset_name,
             ),
             "contact_corrected",
         )
     return (
         Path(original_root)
-        / "OakInk-v2"
+        / safe_path_component(dataset_name, "dataset name")
         / safe_path_component(hand_directory, "hand directory")
         / safe_path_component(filename, "retarget PKL filename"),
         "original",

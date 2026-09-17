@@ -34,7 +34,7 @@ class OakInk2DatasetDexHandLH(ManipData):
     def __init__(
         self,
         *,
-        data_dir: str = "/workspace/PhysGraph/data/OakInk-v2",
+        data_dir: str = "data/OakInk-v2",
         split: str = "all",
         skip: int = 2,  # OakInk2 120Hz, while DEXHAND 60Hz
         device="cuda:0",
@@ -67,12 +67,12 @@ class OakInk2DatasetDexHandLH(ManipData):
         SMPLX_DIM_SHAPE_ALL = 300
 
         self.smplx_layer = SMPLXLayer(
-            "/workspace/PhysGraph/data/body_utils/body_models/smplx",
+            "data/body_utils/body_models/smplx",
             dtype=torch.float32,
             rot_mode=SMPLX_ROT_MODE,
             num_betas=SMPLX_DIM_SHAPE_ALL,
             gender="neutral",
-            use_body_upper_asset="/workspace/PhysGraph/data/smplx_extra/body_upper_idx.pt",
+            use_body_upper_asset="data/smplx_extra/body_upper_idx.pt",
         ).to(self.device)
         self.smplx_faces_np = self.smplx_layer.body_upper_faces.detach().clone().cpu().numpy()
         self.smplx_body_upper_idx = self.smplx_layer.body_upper_vert_idx.detach().clone().cpu().numpy()
@@ -217,10 +217,14 @@ class OakInk2DatasetDexHandLH(ManipData):
             "wrist_pos": wrist_pos,
             "wrist_rot": wrist_rot,
             "mano_joints": mano_joints,
+            "dataset_name": "OakInk-v2",
+            "source_obj_id": obj_id,
+            "selected_obj_id": obj_id,
+            "replacement_obj_id": None,
         }
         obj_mesh_path_dir, obj_mesh_path_file = os.path.split(obj_mesh_path)
         obj_urdf_path_dir = obj_mesh_path_dir.replace(
-            "/workspace/PhysGraph/data/OakInk-v2/object_preview", "/workspace/PhysGraph/data/OakInk-v2/coacd_object_preview"
+            "data/OakInk-v2/object_preview", "data/OakInk-v2/coacd_object_preview"
         )
         obj_urdf_path_file = obj_mesh_path_file.replace(".obj", ".urdf").replace(".ply", ".urdf")
         data["obj_urdf_path"] = os.path.join(obj_urdf_path_dir, obj_urdf_path_file)
@@ -252,5 +256,5 @@ class OakInk2DatasetDexHandLH(ManipData):
 
 
 if __name__ == "__main__":
-    fdata = OakInk2DatasetDexHandLH(data_dir="/workspace/PhysGraph/data/OakInk-v2", mujoco2gym_transf=torch.eye(4, device="cuda:0"))
+    fdata = OakInk2DatasetDexHandLH(data_dir="data/OakInk-v2", mujoco2gym_transf=torch.eye(4, device="cuda:0"))
     print(fdata[34])

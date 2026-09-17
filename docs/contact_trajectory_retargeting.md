@@ -42,9 +42,17 @@ data/retargeting/OakInk-v2/mano2artimano_rh/<sequence>@0.pkl
 /home/ps/data/ylj/PhysGraph/data/OakInk-v2/new_obj
 ```
 
-支持 `<编号>.ply + <编号>.urdf`，或 `<编号>/` 目录内恰好一个mesh和一个URDF。
-新mesh必须包含逐顶点红/黑语义颜色。只有命令显式传入 `--new-obj <编号>`
-时，几何修正和Stage1才读取这对新资产；不传参数时仍读取旧路径。
+新资产保持与 OakInk 原资产相同的用途分离：
+
+```text
+new_obj/object_preview/<编号>/<编号>.ply
+new_obj/coacd_object_preview/<编号>/<编号>.ply
+new_obj/coacd_object_preview/<编号>/<编号>.urdf
+```
+
+`object_preview` 中的表面mesh必须包含逐顶点红/黑语义颜色；
+`coacd_object_preview` 中放凸分解后的碰撞mesh及其URDF。只有命令显式传入
+`--new-obj <编号>` 时，几何修正和Stage1才读取这组新资产；不传参数时仍读取旧路径。
 
 ## 2. 生成修正 PKL
 
@@ -158,7 +166,7 @@ data/retargeting_contact/.../<data_id>/<new_obj>/<sequence>@0/<sequence>@0.verif
 
 不要把 `--allow-infeasible` 生成的诊断 PKL 用于 Stage1。正常模式下约束未通过时不会写出 PKL。
 默认每次 `correct` 都从原始 `data/retargeting` PKL 重新计算。添加 `--bank` 后，程序从
-`data/retargeting_bank/OakInk-v2/<data_id>` 检索最相似的已验收 tool mesh：先尝试迁移其
+`data/retargeting_bank/<sequence-id>` 检索最相似的已验收 tool mesh：先尝试迁移其
 工具局部修正残差并直接执行完整语义几何验收；候选失败时再将最佳残差作为现有优化器
 的初值。全部已配置验证通过后，修正 PKL 和对应 bank entry 都采用原子写入。bank 只保存
 通过验收的结果，不保存算法或 schema 版本字段。
@@ -255,3 +263,52 @@ Stage1 的训练和测试使用同一入口。`new_obj=spoon_01` 选择右手新
 `correct=true new_obj=spoon_01` 会读取该 tool 对应的修正右手轨迹。
 
 该项目的完整执行流程到 Stage1 训练结束，不再包含后续残差修正阶段。
+
+## 5. TACO 数据
+
+TACO 使用现有三位 object ID 作为 `new_obj`。表面语义 mesh 和物理资产分别解析为：
+
+```text
+data/TACO/object_models/<id>/<id>.ply
+data/TACO/coacd_object_models/<id>/<id>.ply
+data/TACO/coacd_object_models/<id>/<id>.urdf
+```
+
+右手 tool 从标注 mesh 独立读取红/黑逐顶点语义，并向 Stage1 提供与 OakInk 相同的
+`tool_red_points`、`tool_black_points` 和计数字段；TACO mesh 已经是米制，语义 scale
+固定为 1。左手 target、原始 tool trajectory 和原始序列归一化不因 `new_obj` 改变。
+
+生成 TACO 修正轨迹：
+
+```bash
+python main/dataset/contact_trajectory_retarget.py correct \
+  --dataset taco \
+  --data-idx bb_bowl_0919036 \
+  --dexhand artimano \
+  --new-obj 058 \
+  --headless
+```
+
+输出路径为：
+
+```text
+data/retargeting_contact/TACO/mano2artimano_rh/
+  bb_bowl_0919036/058/bb_bowl_0919036.pkl
+```
+
+Stage1 使用相同参数选择替换资产和修正 PKL：
+
+```bash
+python main/rl/train.py \
+  task=ResDexHand dexhand=artimano side=BiH \
+  dataIndices=[bb_bowl_0919036] new_obj=058 correct=true \
+  headless=true num_envs=4 max_iterations=1
+```
+
+`correct=false` 时仍替换右手资产，但读取原始 TACO retarget PKL；`correct=true` 时读取
+对应 `<sequence-id>/<new_obj>` 下的 contact-corrected PKL。两种情况下左手始终读取原始
+target 资产和原始左手 PKL。Memory bank 不按数据集分层，只使用全局唯一的 sequence ID：
+
+```text
+data/retargeting_bank/<sequence-id>/<tool-id>/
+```
