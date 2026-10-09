@@ -1,8 +1,9 @@
 """Contact-aware geometric post-retargeting for dexterous-hand trajectories.
 
-This module deliberately runs before Stage 1.  It keeps wrist orientation and
-all finger DOFs unchanged, maps the old red-region center to the new one, and
-locally refines only a tool-local translation.  Corrected right-hand PKLs are
+This module deliberately runs before Stage 1.  It preserves all finger DOFs,
+extracts sequence-specific source contacts, and maps them into a preferred band
+inside the target red region.  The default solver refines tool-local translation;
+contact-se3 may additionally use a tightly bounded wrist rotation.  Corrected right-hand PKLs are
 stored by data id and replacement-tool name below ``data/retargeting_contact``
 and remain compatible with ``load_retargeted_data``.
 
@@ -37,7 +38,7 @@ from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 11
 
 
 def _physics_validation_required(metadata: Mapping[str, object]) -> bool:
@@ -985,11 +986,72 @@ class GeometrySettings:
     black_clearance: float = 0.006
     influence_distance: float = 0.02
     grasp_distance: float = 0.025
-    min_red_link_ratio: float = 0.1 # 接触link的红色点比例阈值
+    # Replaced per sequence after extracting the source contact intent.  It
+    # remains configurable for legacy callers and independently loaded PKLs.
+    min_red_link_ratio: float = 0.1
     min_red_frame_ratio: float = 0.8
     max_shift: float = 0.05
-    max_black_violation_fraction: float = 0.0
+    max_black_violation_fraction: float = 0.00001
     semantic_tie_epsilon: float = 1e-6
+    source_active_frame_ratio: float = 0.3
+    # min_contact_retention_ratio: float = 0.8
+    min_contact_retention_ratio: float = 0.4
+    front_band_min: float = 0.15
+    front_band_max: float = 0.35
+    front_semantic_margin: float = 0.002
+    min_preferred_frame_ratio: float = 0.7
+    front_loss_weight: float = 0.25
+    contact_drop_weight: float = 2.0
+
+    def __post_init__(self):
+        unit_interval = {
+            "min_red_link_ratio": self.min_red_link_ratio,
+            "min_red_frame_ratio": self.min_red_frame_ratio,
+            "max_black_violation_fraction": self.max_black_violation_fraction,
+            "source_active_frame_ratio": self.source_active_frame_ratio,
+            "min_contact_retention_ratio": self.min_contact_retention_ratio,
+            "front_band_min": self.front_band_min,
+            "front_band_max": self.front_band_max,
+            "min_preferred_frame_ratio": self.min_preferred_frame_ratio,
+        }
+        invalid = {name: value for name, value in unit_interval.items() if not 0.0 <= value <= 1.0}
+        if invalid:
+            raise ValueError(f"Geometry ratios must lie in [0, 1], got {invalid}")
+        if self.front_band_min >= self.front_band_max:
+            raise ValueError("front_band_min must be smaller than front_band_max")
+        positive = {
+            "contact_distance": self.contact_distance,
+            "black_clearance": self.black_clearance,
+            "grasp_distance": self.grasp_distance,
+            "max_shift": self.max_shift,
+        }
+        invalid_positive = {name: value for name, value in positive.items() if value <= 0.0}
+        if invalid_positive:
+            raise ValueError(f"Geometry distances must be positive, got {invalid_positive}")
+        if self.front_semantic_margin < 0.0:
+            raise ValueError("front_semantic_margin must be non-negative")
+        if self.front_loss_weight < 0.0 or self.contact_drop_weight < 0.0:
+            raise ValueError("Geometry loss weights must be non-negative")
+
+
+@dataclass
+class PreferredRedRegion:
+    points: np.ndarray
+    tree: cKDTree
+    center: np.ndarray
+    report: Dict[str, object]
+
+
+def _relaxed_required_link_count(active_count: int, retention_ratio: float) -> int:
+    """Return the allowed relaxed link count using the requested floor rule.
+
+    For example, four source-contact links at 80% require three retained links;
+    five source-contact links require four.  At least one link is always kept.
+    """
+
+    if active_count <= 0:
+        raise ValueError("active_count must be positive")
+    return max(1, int(np.floor(retention_ratio * active_count + 1e-12)))
 
 
 def _nearest_semantics(points: np.ndarray, tool: SemanticTool, tie_epsilon: float):
@@ -1013,6 +1075,9 @@ def contact_geometry_metrics(
     contact_link_ids: np.ndarray,
     tool: SemanticTool,
     settings: GeometrySettings,
+    source_active_link_mask: Optional[np.ndarray] = None,
+    source_contact_frame_mask: Optional[np.ndarray] = None,
+    preferred_region: Optional[PreferredRedRegion] = None,
 ) -> Dict[str, object]:
     red_distance, black_distance, black_nearest, _, _ = _nearest_semantics(
         points_tool, tool, settings.semantic_tie_epsilon
@@ -1020,10 +1085,15 @@ def contact_geometry_metrics(
     surface_distance = np.minimum(red_distance, black_distance)
     black_near = black_nearest & (surface_distance < settings.influence_distance)
     black_violation = black_nearest & (black_distance < settings.black_clearance)
-    contact_link_set = set(int(value) for value in np.asarray(contact_link_ids).tolist())
-    link_red_contact = np.zeros((len(points_tool), len(contact_link_set)), dtype=bool)
-    link_red_distance = np.full((len(points_tool), len(contact_link_set)), np.inf, dtype=np.float64)
-    for output_index, link_id in enumerate(sorted(contact_link_set)):
+    ordered_contact_ids = np.asarray(
+        sorted(set(int(value) for value in np.asarray(contact_link_ids).tolist())),
+        dtype=np.int64,
+    )
+    link_red_contact = np.zeros((len(points_tool), len(ordered_contact_ids)), dtype=bool)
+    link_red_distance = np.full_like(link_red_contact, np.inf, dtype=np.float64)
+    link_preferred_contact = np.zeros_like(link_red_contact)
+    link_preferred_distance = np.full_like(link_red_contact, np.inf, dtype=np.float64)
+    for output_index, link_id in enumerate(ordered_contact_ids):
         link_mask = point_link_ids == link_id
         if not link_mask.any():
             continue
@@ -1035,13 +1105,27 @@ def contact_geometry_metrics(
             0.0,
         )
         link_red_distance[:, output_index] = semantic_red_distance.min(axis=1)
-    red_link_ratio_frame = link_red_contact.mean(axis=1) if link_red_contact.shape[1] else np.zeros(len(points_tool))
+        if preferred_region is not None:
+            preferred_distance, _ = preferred_region.tree.query(
+                points_tool[:, link_mask].reshape(-1, 3), workers=1
+            )
+            preferred_distance = preferred_distance.reshape(len(points_tool), -1)
+            link_preferred_distance[:, output_index] = preferred_distance.min(axis=1)
+            link_preferred_contact[:, output_index] = (
+                preferred_distance <= settings.contact_distance
+            ).any(axis=1)
+
+    red_link_ratio_frame = (
+        link_red_contact.mean(axis=1) if link_red_contact.shape[1] else np.zeros(len(points_tool))
+    )
     black_count_frame = black_violation.sum(axis=1)
     black_near_count_frame = black_near.sum(axis=1)
     black_distances = black_distance[black_nearest]
-    return {
+    result = {
         "red_link_ratio_frame": red_link_ratio_frame,
         "red_link_distance_frame": link_red_distance,
+        "red_link_contact_frame": link_red_contact,
+        "preferred_link_contact_frame": link_preferred_contact,
         "black_violation_count_frame": black_count_frame,
         "black_near_count_frame": black_near_count_frame,
         "surface_min_distance_frame": surface_distance.min(axis=1),
@@ -1053,6 +1137,122 @@ def contact_geometry_metrics(
         "black_min_distance": float(black_distances.min()) if black_distances.size else None,
         "min_surface_distance": float(surface_distance.min()),
     }
+    if source_active_link_mask is not None:
+        active_mask = np.asarray(source_active_link_mask, dtype=bool)
+        if active_mask.shape != (len(ordered_contact_ids),):
+            raise ValueError(
+                f"Expected source active-link mask {(len(ordered_contact_ids),)}, got {active_mask.shape}"
+            )
+        active_count = int(active_mask.sum())
+        if active_count <= 0:
+            raise ValueError("Source contact intent must contain at least one active link")
+        required_count = _relaxed_required_link_count(
+            active_count, settings.min_contact_retention_ratio
+        )
+        active_contacts = link_red_contact[:, active_mask]
+        active_preferred = link_preferred_contact[:, active_mask]
+        per_link_ratio = link_red_contact.mean(axis=0)
+
+        if source_contact_frame_mask is not None:
+            source_mask = np.asarray(source_contact_frame_mask, dtype=bool)
+            expected_shape = (len(points_tool), len(ordered_contact_ids))
+            if source_mask.shape != expected_shape:
+                raise ValueError(
+                    f"Expected source contact-frame mask {expected_shape}, got {source_mask.shape}"
+                )
+            source_active_contacts = source_mask[:, active_mask]
+            overlap_contacts = source_active_contacts & active_contacts
+            source_per_link_count = source_mask.sum(axis=0)
+            overlap_per_link_count = (source_mask & link_red_contact).sum(axis=0)
+            per_link_retention_ratio = np.divide(
+                overlap_per_link_count,
+                source_per_link_count,
+                out=np.zeros(len(ordered_contact_ids), dtype=np.float64),
+                where=source_per_link_count > 0,
+            )
+            retained_mask = active_mask & (
+                per_link_retention_ratio >= settings.min_contact_retention_ratio
+            )
+            source_counts = source_active_contacts.sum(axis=1)
+            overlap_counts = overlap_contacts.sum(axis=1)
+            valid_source_frames = source_counts > 0
+            required_per_frame = np.floor(
+                settings.min_contact_retention_ratio * source_counts + 1e-12
+            ).astype(np.int64)
+            required_per_frame[valid_source_frames] = np.maximum(
+                required_per_frame[valid_source_frames], 1
+            )
+            source_frame_pass = overlap_counts >= required_per_frame
+            full_frame_pass = overlap_counts >= source_counts
+            preferred_overlap = source_active_contacts & active_contacts & active_preferred
+            preferred_frame_pass = preferred_overlap.sum(axis=1) >= required_per_frame
+            denominator = np.maximum(source_counts, 1)
+            source_red_ratio_frame = overlap_counts / denominator
+            preferred_ratio_frame = preferred_overlap.sum(axis=1) / denominator
+            source_frame_pass_ratio = float(source_frame_pass[valid_source_frames].mean())
+            full_frame_pass_ratio = float(full_frame_pass[valid_source_frames].mean())
+            preferred_frame_pass_ratio = (
+                float(preferred_frame_pass[valid_source_frames].mean())
+                if preferred_region is not None
+                else source_frame_pass_ratio
+            )
+            per_link_source_ratio = source_mask.mean(axis=0)
+        else:
+            # Compatibility path for callers that only provide a source link set.
+            per_link_retention_ratio = per_link_ratio.copy()
+            retained_mask = active_mask & (per_link_ratio >= settings.min_red_frame_ratio)
+            active_counts = active_contacts.sum(axis=1)
+            source_frame_pass = active_counts >= required_count
+            full_frame_pass = active_counts >= active_count
+            preferred_counts = active_preferred.sum(axis=1)
+            source_red_ratio_frame = active_contacts.mean(axis=1)
+            preferred_ratio_frame = active_preferred.mean(axis=1)
+            source_frame_pass_ratio = float(source_frame_pass.mean())
+            full_frame_pass_ratio = float(full_frame_pass.mean())
+            preferred_frame_pass_ratio = (
+                float((preferred_counts >= required_count).mean())
+                if preferred_region is not None
+                else source_frame_pass_ratio
+            )
+            per_link_source_ratio = np.zeros(len(ordered_contact_ids), dtype=np.float64)
+
+        retained_count = int(retained_mask.sum())
+        result.update(
+            {
+                "source_active_link_count": active_count,
+                "required_retained_link_count": required_count,
+                "dynamic_min_red_link_ratio": float(required_count / max(1, len(ordered_contact_ids))),
+                "per_link_source_contact_frame_ratio_summary": per_link_source_ratio.tolist(),
+                "per_link_red_contact_frame_ratio": per_link_ratio,
+                "per_link_red_contact_frame_ratio_summary": per_link_ratio.tolist(),
+                "per_link_contact_retention_ratio": per_link_retention_ratio,
+                "per_link_contact_retention_ratio_summary": per_link_retention_ratio.tolist(),
+                "retained_source_link_mask": retained_mask,
+                "retained_source_link_mask_summary": retained_mask.tolist(),
+                "retained_source_link_count": retained_count,
+                "source_link_retention_ratio": float(retained_count / active_count),
+                "full_contact_retention_passed": bool(retained_count == active_count),
+                "relaxed_contact_retention_passed": bool(retained_count >= required_count),
+                "source_red_link_ratio_frame": source_red_ratio_frame,
+                "source_red_frame_pass_ratio": source_frame_pass_ratio,
+                "full_red_frame_pass_ratio": full_frame_pass_ratio,
+                "preferred_link_distance_frame": link_preferred_distance,
+                "source_preferred_link_ratio_frame": preferred_ratio_frame,
+                "preferred_link_ratio_mean": float(preferred_ratio_frame.mean())
+                if preferred_region is not None
+                else float(source_red_ratio_frame.mean()),
+                "preferred_frame_pass_ratio": preferred_frame_pass_ratio,
+                "contact_retention_level": (
+                    "full"
+                    if retained_count == active_count
+                    and full_frame_pass_ratio >= settings.min_red_frame_ratio
+                    else "relaxed_80"
+                    if retained_count >= required_count
+                    else "failed"
+                ),
+            }
+        )
+    return result
 
 
 def _summary_metrics(metrics: Mapping[str, object]) -> Dict[str, object]:
@@ -1366,19 +1566,93 @@ def optimize_tool_translation(
     }
 
 
+def build_preferred_red_region(
+    tool: SemanticTool,
+    settings: GeometrySettings,
+    roi_distance: float = 0.03,
+) -> PreferredRedRegion:
+    """Build a safe front band; silently fall back to the complete red region."""
+
+    red_points = np.asarray(tool.red_points, dtype=np.float64)
+    fallback_reason = None
+    axis_report = None
+    try:
+        if not 0.0 <= settings.front_band_min < settings.front_band_max <= 1.0:
+            raise ValueError("front band must satisfy 0 <= min < max <= 1")
+        axis, axis_report = estimate_semantic_axis(tool, roi_distance=roi_distance)
+        projections = red_points @ axis
+        projection_span = float(np.ptp(projections))
+        if projection_span <= 1e-8:
+            raise ValueError("red-region projection span is degenerate")
+        if float(axis_report["pca_alignment"]) < 0.5:
+            raise ValueError("semantic-axis alignment is below 0.5")
+        normalized = (projections - projections.min()) / projection_span
+        black_distance, _ = tool.black_tree.query(red_points, workers=1)
+        preferred_mask = (
+            (normalized >= settings.front_band_min)
+            & (normalized <= settings.front_band_max)
+            & (black_distance >= settings.front_semantic_margin)
+        )
+        if int(preferred_mask.sum()) < 3:
+            raise ValueError("safe preferred band contains fewer than three surface samples")
+        preferred_points = red_points[preferred_mask]
+        method = "semantic_axis_front_band"
+        reliable = True
+    except (ValueError, FloatingPointError, np.linalg.LinAlgError) as error:
+        preferred_points = red_points
+        method = "red_center_fallback"
+        reliable = False
+        fallback_reason = str(error)
+
+    center = np.median(preferred_points, axis=0)
+    report = {
+        "method": method,
+        "reliable_direction": reliable,
+        "fallback_reason": fallback_reason,
+        "preferred_center_tool": center,
+        "preferred_point_count": int(len(preferred_points)),
+        "red_point_count": int(len(red_points)),
+        "front_band_min": float(settings.front_band_min),
+        "front_band_max": float(settings.front_band_max),
+        "semantic_margin": float(settings.front_semantic_margin),
+        "semantic_axis": axis_report,
+    }
+    return PreferredRedRegion(
+        points=preferred_points,
+        tree=cKDTree(preferred_points),
+        center=center,
+        report=report,
+    )
+
+
 def contact_translation_transfer(
     source_tool: SemanticTool,
     target_tool: SemanticTool,
+    source_contact_intent: Optional[Mapping[str, object]] = None,
+    preferred_region: Optional[PreferredRedRegion] = None,
 ) -> Tuple[np.ndarray, Dict[str, object]]:
-    """Map the robust old red-region center to the new one with translation only."""
+    """Map the source contact center to the preferred target band."""
 
-    source_center = np.median(np.asarray(source_tool.red_points, dtype=np.float64), axis=0)
-    target_center = np.median(np.asarray(target_tool.red_points, dtype=np.float64), axis=0)
+    source_red_center = np.median(np.asarray(source_tool.red_points, dtype=np.float64), axis=0)
+    target_red_center = np.median(np.asarray(target_tool.red_points, dtype=np.float64), axis=0)
+    source_center = source_red_center
+    target_center = target_red_center
+    method = "red_center_translation"
+    if source_contact_intent is not None:
+        candidate = source_contact_intent.get("contact_anchor_center_tool")
+        if candidate is not None:
+            source_center = np.asarray(candidate, dtype=np.float64)
+            method = "source_contact_to_red_center_translation"
+    if preferred_region is not None:
+        target_center = np.asarray(preferred_region.center, dtype=np.float64)
+        method = "source_contact_to_preferred_band_translation"
     delta = target_center - source_center
     return delta, {
-        "method": "red_center_translation",
-        "source_red_center_tool": source_center,
-        "target_red_center_tool": target_center,
+        "method": method,
+        "source_red_center_tool": source_red_center,
+        "target_red_center_tool": target_red_center,
+        "source_contact_center_tool": source_center,
+        "target_preferred_center_tool": target_center,
         "initial_delta_tool": delta,
         "initial_delta_norm": float(np.linalg.norm(delta)),
         "rotation_degrees": 0.0,
@@ -1392,48 +1666,91 @@ def extract_source_contact_intent(
     source_tool: SemanticTool,
     settings: GeometrySettings,
 ) -> Dict[str, object]:
-    """Summarize which configured links actually approach the old red patch.
-
-    The summary informs and documents contact-region transfer, but acceptance is
-    intentionally still performed with the configured fixed contact-link ratio.
-    """
+    """Extract sequence-specific source contacts and the adaptive 80% gate."""
 
     red_distance, _, black_nearest, red_index, _ = _nearest_semantics(
         points_tool, source_tool, settings.semantic_tie_epsilon
     )
-    per_link = []
-    anchors = []
-    for link_id in sorted(set(int(value) for value in np.asarray(contact_link_ids).tolist())):
+    ordered_ids = np.asarray(
+        sorted(set(int(value) for value in np.asarray(contact_link_ids).tolist())),
+        dtype=np.int64,
+    )
+    raw = []
+    for link_id in ordered_ids:
         link_mask = point_link_ids == link_id
         if not link_mask.any():
-            continue
+            raise ValueError(f"Contact link id {link_id} has no collision-surface samples")
         link_red_distance = red_distance[:, link_mask]
         link_black_nearest = black_nearest[:, link_mask]
         best_local = np.argmin(link_red_distance, axis=1)
         frame_index = np.arange(len(points_tool), dtype=np.int64)
         best_distance = link_red_distance[frame_index, best_local]
         best_is_red = ~link_black_nearest[frame_index, best_local]
-        active = best_is_red & (best_distance <= settings.grasp_distance)
+        strict = best_is_red & (best_distance <= settings.contact_distance)
+        near = best_is_red & (best_distance <= settings.grasp_distance)
         link_red_indices = red_index[:, link_mask][frame_index, best_local]
-        if active.any():
-            link_anchors = source_tool.red_points[link_red_indices[active]]
-            anchor = np.median(link_anchors, axis=0)
+        raw.append((int(link_id), best_distance, strict, near, link_red_indices))
+
+    strict_ratios = np.asarray([item[2].mean() for item in raw], dtype=np.float64)
+    near_ratios = np.asarray([item[3].mean() for item in raw], dtype=np.float64)
+    active_mask = strict_ratios >= settings.source_active_frame_ratio
+    selection_basis = "contact_distance"
+    if not active_mask.any():
+        active_mask = near_ratios >= settings.source_active_frame_ratio
+        selection_basis = "grasp_distance_fallback"
+    if not active_mask.any():
+        active_mask[int(np.argmin([np.median(item[1]) for item in raw]))] = True
+        selection_basis = "nearest_link_fallback"
+
+    source_contact_frame_mask = np.stack(
+        [item[2] if selection_basis == "contact_distance" else item[3] for item in raw],
+        axis=1,
+    )
+    if selection_basis == "nearest_link_fallback":
+        for link_index in np.flatnonzero(active_mask):
+            if not source_contact_frame_mask[:, link_index].any():
+                closest_frame = int(np.argmin(raw[link_index][1]))
+                source_contact_frame_mask[closest_frame, link_index] = True
+
+    per_link = []
+    anchors = []
+    for output_index, (link_id, best_distance, strict, near, link_red_indices) in enumerate(raw):
+        active_frames = source_contact_frame_mask[:, output_index]
+        anchor = None
+        if active_mask[output_index]:
+            if active_frames.any():
+                anchor_indices = link_red_indices[active_frames]
+            else:
+                anchor_indices = link_red_indices[[int(np.argmin(best_distance))]]
+            anchor = np.median(source_tool.red_points[anchor_indices], axis=0)
             anchors.append(anchor)
-        else:
-            anchor = None
         per_link.append(
             {
-                "link_id": int(link_id),
-                "active_frame_ratio": float(active.mean()),
+                "link_id": link_id,
+                "active": bool(active_mask[output_index]),
+                "contact_frame_ratio": float(strict.mean()),
+                "near_frame_ratio": float(near.mean()),
                 "minimum_red_distance": float(best_distance.min()),
                 "anchor_tool": anchor,
             }
         )
+
+    active_count = int(active_mask.sum())
+    configured_count = int(len(ordered_ids))
+    required_count = _relaxed_required_link_count(
+        active_count, settings.min_contact_retention_ratio
+    )
     return {
-        "method": "old_red_nearest_collision_surface",
-        "configured_link_count": int(len(set(int(v) for v in contact_link_ids.tolist()))),
-        "active_link_count": int(sum(item["anchor_tool"] is not None for item in per_link)),
-        "contact_anchor_center_tool": None if not anchors else np.median(np.stack(anchors), axis=0),
+        "method": "source_red_collision_contact",
+        "selection_basis": selection_basis,
+        "configured_link_count": configured_count,
+        "active_link_count": active_count,
+        "required_retained_link_count": required_count,
+        "full_min_red_link_ratio": float(active_count / configured_count),
+        "dynamic_min_red_link_ratio": float(required_count / configured_count),
+        "active_link_mask": active_mask,
+        "contact_frame_mask": source_contact_frame_mask,
+        "contact_anchor_center_tool": np.median(np.stack(anchors), axis=0),
         "per_link": per_link,
     }
 
@@ -1444,12 +1761,16 @@ def _transformed_geometry_objective(
     contact_link_ids: np.ndarray,
     tool: SemanticTool,
     settings: GeometrySettings,
+    source_active_link_mask: Optional[np.ndarray] = None,
+    preferred_region: Optional[PreferredRedRegion] = None,
 ) -> float:
     red_distance, black_distance, black_nearest, _, _ = _nearest_semantics(
         transformed, tool, settings.semantic_tie_epsilon
     )
+    ordered_ids = sorted(set(int(value) for value in np.asarray(contact_link_ids).tolist()))
     link_distances = []
-    for link_id in sorted(set(int(value) for value in np.asarray(contact_link_ids).tolist())):
+    preferred_distances = []
+    for link_id in ordered_ids:
         link_mask = point_link_ids == link_id
         semantic_red_distance = red_distance[:, link_mask] + np.maximum(
             red_distance[:, link_mask]
@@ -1458,21 +1779,324 @@ def _transformed_geometry_objective(
             0.0,
         )
         link_distances.append(semantic_red_distance.min(axis=1))
+        if preferred_region is not None:
+            preferred_distance, _ = preferred_region.tree.query(
+                transformed[:, link_mask].reshape(-1, 3), workers=1
+            )
+            preferred_distances.append(
+                preferred_distance.reshape(len(transformed), -1).min(axis=1)
+            )
     link_distances = np.stack(link_distances, axis=1)
-    required = max(1, int(np.ceil(settings.min_red_link_ratio * link_distances.shape[1])))
-    best_required = np.partition(link_distances, required - 1, axis=1)[:, :required]
-    red_loss = np.mean(
-        np.square(np.clip(best_required / settings.contact_distance, 0.0, 10.0))
+
+    if source_active_link_mask is None:
+        required = max(1, int(np.ceil(settings.min_red_link_ratio * link_distances.shape[1])))
+        selected = np.partition(link_distances, required - 1, axis=1)[:, :required]
+    else:
+        active_mask = np.asarray(source_active_link_mask, dtype=bool)
+        if active_mask.shape != (link_distances.shape[1],) or not active_mask.any():
+            raise ValueError("Invalid source active-link mask for geometry objective")
+        selected = link_distances[:, active_mask]
+    normalized_red = np.square(
+        np.clip(selected / max(settings.contact_distance, 1e-12), 0.0, 10.0)
     )
+    red_loss = float(0.7 * normalized_red.mean() + 0.3 * np.quantile(normalized_red, 0.9))
+    drop_depth = np.maximum(
+        selected - settings.contact_distance, 0.0
+    ) / max(settings.contact_distance, 1e-12)
+    drop_loss = float(np.mean(np.square(np.clip(drop_depth, 0.0, 10.0))))
+
+    front_loss = 0.0
+    if preferred_region is not None:
+        preferred_distances = np.stack(preferred_distances, axis=1)
+        if source_active_link_mask is not None:
+            preferred_distances = preferred_distances[:, active_mask]
+        else:
+            required = min(required, preferred_distances.shape[1])
+            preferred_distances = np.partition(
+                preferred_distances, required - 1, axis=1
+            )[:, :required]
+        normalized_front = np.square(
+            np.clip(
+                preferred_distances / max(settings.contact_distance, 1e-12),
+                0.0,
+                10.0,
+            )
+        )
+        front_loss = float(
+            0.7 * normalized_front.mean() + 0.3 * np.quantile(normalized_front, 0.9)
+        )
+
     black_depth = np.where(
         black_nearest,
-        np.maximum(settings.black_clearance - black_distance, 0.0) / settings.black_clearance,
+        np.maximum(settings.black_clearance - black_distance, 0.0)
+        / max(settings.black_clearance, 1e-12),
         0.0,
     )
     black_loss = float(
         np.mean(black_depth**2) + np.mean(np.max(black_depth, axis=1) ** 2)
     )
-    return float(red_loss + 80.0 * black_loss)
+    return float(
+        red_loss
+        + settings.front_loss_weight * front_loss
+        + settings.contact_drop_weight * drop_loss
+        + 80.0 * black_loss
+    )
+
+
+def _parse_center_candidate_alphas(value: str) -> Tuple[float, ...]:
+    values = []
+    for item in str(value).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        alpha = float(item)
+        if not 0.0 <= alpha <= 1.0:
+            raise ValueError(f"Center-candidate alpha must lie in [0, 1], got {alpha}")
+        if not any(abs(alpha - existing) <= 1e-12 for existing in values):
+            values.append(alpha)
+    if not values:
+        raise ValueError("At least one center-candidate alpha is required")
+    return tuple(values)
+
+
+def _contact_level_score(level: str) -> int:
+    return {"failed": 0, "relaxed_80": 1, "full": 2}.get(str(level), 0)
+
+
+def _center_candidate_rank(candidate: Mapping[str, object]) -> Tuple[object, ...]:
+    """Lexicographic preference for feasible, balanced multi-finger contact."""
+
+    return (
+        int(bool(candidate["passed"])),
+        _contact_level_score(candidate["contact_retention_level"]),
+        int(candidate["retained_source_link_count"]),
+        float(candidate["minimum_active_finger_retention"]),
+        -float(candidate["active_finger_retention_variance"]),
+        max(
+            float(candidate["source_red_frame_pass_ratio"]),
+            float(candidate["red_frame_pass_ratio"]),
+        ),
+        float(candidate["source_red_frame_pass_ratio"]),
+        float(candidate["red_frame_pass_ratio"]),
+        -float(candidate["black_violation_fraction"]),
+        -float(candidate["translation_norm"]),
+    )
+
+
+def _evaluate_center_translation_candidate(
+    points_tool: np.ndarray,
+    point_link_ids: np.ndarray,
+    contact_link_ids: np.ndarray,
+    tool: SemanticTool,
+    settings: GeometrySettings,
+    delta_tool: np.ndarray,
+    source_active_link_mask: np.ndarray,
+    source_contact_frame_mask: np.ndarray,
+    alpha: Optional[float],
+    source_center_tool: np.ndarray,
+    stage: str,
+    preferred_region: Optional[PreferredRedRegion] = None,
+) -> Dict[str, object]:
+    delta_tool = np.asarray(delta_tool, dtype=np.float64)
+    shifted = points_tool + delta_tool[None, None]
+    metrics = contact_geometry_metrics(
+        shifted,
+        point_link_ids,
+        contact_link_ids,
+        tool,
+        settings,
+        source_active_link_mask=source_active_link_mask,
+        source_contact_frame_mask=source_contact_frame_mask,
+        preferred_region=preferred_region,
+    )
+    active_mask = np.asarray(source_active_link_mask, dtype=bool)
+    per_link_retention = np.asarray(
+        metrics["per_link_contact_retention_ratio_summary"], dtype=np.float64
+    )
+    active_retention = per_link_retention[active_mask]
+    frame_acceptance = _red_frame_acceptance(metrics, settings)
+    record = {
+        "stage": stage,
+        "alpha": None if alpha is None else float(alpha),
+        "source_center_tool": np.asarray(source_center_tool, dtype=np.float64),
+        "delta_tool": delta_tool,
+        "translation_norm": float(np.linalg.norm(delta_tool)),
+        "passed": _is_feasible(metrics, settings),
+        "frame_acceptance": frame_acceptance,
+        "contact_retention_level": metrics["contact_retention_level"],
+        "retained_source_link_count": int(metrics["retained_source_link_count"]),
+        "minimum_active_finger_retention": float(active_retention.min()),
+        "active_finger_retention_variance": float(active_retention.var()),
+        "per_link_contact_retention_ratio": per_link_retention,
+        "source_red_frame_pass_ratio": float(metrics["source_red_frame_pass_ratio"]),
+        "red_frame_pass_ratio": float(metrics["red_frame_pass_ratio"]),
+        "black_violation_fraction": float(metrics["black_violation_fraction"]),
+        "preferred_frame_pass_ratio": float(metrics["preferred_frame_pass_ratio"]),
+    }
+    record["rank"] = list(_center_candidate_rank(record))
+    return record
+
+
+def evaluate_center_difference_candidates(
+    points_tool: np.ndarray,
+    point_link_ids: np.ndarray,
+    contact_link_ids: np.ndarray,
+    tool: SemanticTool,
+    settings: GeometrySettings,
+    source_red_center: np.ndarray,
+    source_contact_center: np.ndarray,
+    target_preferred_center: np.ndarray,
+    source_active_link_mask: np.ndarray,
+    source_contact_frame_mask: np.ndarray,
+    alphas: Sequence[float],
+    preferred_region: Optional[PreferredRedRegion],
+    dedup_distance: float = 0.001,
+) -> Dict[str, object]:
+    """Evaluate interpolated source-center mappings to one target preferred center."""
+
+    source_red_center = np.asarray(source_red_center, dtype=np.float64)
+    source_contact_center = np.asarray(source_contact_center, dtype=np.float64)
+    target_preferred_center = np.asarray(target_preferred_center, dtype=np.float64)
+    candidates = []
+    for alpha in alphas:
+        alpha = float(alpha)
+        source_center = alpha * source_contact_center + (1.0 - alpha) * source_red_center
+        delta = target_preferred_center - source_center
+        duplicate = next(
+            (
+                item
+                for item in candidates
+                if np.linalg.norm(delta - np.asarray(item["delta_tool"])) < dedup_distance
+            ),
+            None,
+        )
+        if duplicate is not None:
+            duplicate.setdefault("equivalent_alphas", []).append(alpha)
+            continue
+        record = _evaluate_center_translation_candidate(
+            points_tool,
+            point_link_ids,
+            contact_link_ids,
+            tool,
+            settings,
+            delta,
+            source_active_link_mask,
+            source_contact_frame_mask,
+            alpha=alpha,
+            source_center_tool=source_center,
+            stage="center_difference",
+            preferred_region=preferred_region,
+        )
+        record["equivalent_alphas"] = [alpha]
+        candidates.append(record)
+    selected = max(candidates, key=_center_candidate_rank)
+    feasible = [item for item in candidates if item["passed"]]
+    return {
+        "source_red_center_tool": source_red_center,
+        "source_contact_center_tool": source_contact_center,
+        "target_preferred_center_tool": target_preferred_center,
+        "requested_alphas": [float(value) for value in alphas],
+        "dedup_distance": float(dedup_distance),
+        "candidates": candidates,
+        "selected_candidate": selected,
+        "direct_feasible_count": int(len(feasible)),
+        "direct_passed": bool(feasible),
+        "selection_policy": (
+            "feasible > full contact > retained count > minimum finger retention > "
+            "retention balance > frame coverage > black clearance > translation norm"
+        ),
+    }
+
+
+def search_contact_backoff_from_black(
+    points_tool: np.ndarray,
+    point_link_ids: np.ndarray,
+    contact_link_ids: np.ndarray,
+    tool: SemanticTool,
+    settings: GeometrySettings,
+    preferred_delta: np.ndarray,
+    away_from_black_direction: np.ndarray,
+    source_active_link_mask: np.ndarray,
+    source_contact_frame_mask: np.ndarray,
+    max_backoff_distance: float,
+    samples: int = 11,
+) -> Tuple[np.ndarray, Dict[str, object]]:
+    """Move away from black after the preferred initial candidate fails.
+
+    The preferred region is deliberately absent from both objective and
+    feasibility checks.  The first feasible coarse sample is selected so the
+    grasp stays as close as possible to the preferred initial placement.
+    """
+
+    direction = np.asarray(away_from_black_direction, dtype=np.float64)
+    direction_norm = float(np.linalg.norm(direction))
+    if direction.shape != (3,) or direction_norm <= 1e-10:
+        raise ValueError(f"Invalid black-backoff direction: {direction}")
+    if max_backoff_distance <= 0.0:
+        raise ValueError("max_backoff_distance must be positive")
+    if samples < 2:
+        raise ValueError("black-backoff samples must be at least two")
+    direction = direction / direction_norm
+    preferred_delta = np.asarray(preferred_delta, dtype=np.float64)
+    records = []
+    selected = None
+    for distance in np.linspace(0.0, max_backoff_distance, samples):
+        delta = preferred_delta + float(distance) * direction
+        shifted = points_tool + delta[None, None]
+        metrics = contact_geometry_metrics(
+            shifted,
+            point_link_ids,
+            contact_link_ids,
+            tool,
+            settings,
+            source_active_link_mask=source_active_link_mask,
+            source_contact_frame_mask=source_contact_frame_mask,
+            preferred_region=None,
+        )
+        objective = _transformed_geometry_objective(
+            shifted,
+            point_link_ids,
+            contact_link_ids,
+            tool,
+            settings,
+            source_active_link_mask=source_active_link_mask,
+            preferred_region=None,
+        )
+        record = {
+            "distance": float(distance),
+            "delta_tool": delta,
+            "objective": float(objective),
+            "passed": _is_feasible(metrics, settings),
+            "source_red_frame_pass_ratio": float(metrics["source_red_frame_pass_ratio"]),
+            "retained_source_link_count": int(metrics["retained_source_link_count"]),
+            "black_violation_fraction": float(metrics["black_violation_fraction"]),
+            "contact_retention_level": metrics["contact_retention_level"],
+        }
+        records.append(record)
+        if record["passed"]:
+            selected = record
+            break
+    if selected is None:
+        selected = min(records, key=lambda item: item["objective"])
+    return np.asarray(selected["delta_tool"], dtype=np.float64), {
+        "mode": "black_backoff_without_preferred",
+        "passed": bool(selected["passed"]),
+        "away_from_black_direction_tool": direction,
+        "selected_distance": float(selected["distance"]),
+        "selected_delta_tool": np.asarray(selected["delta_tool"], dtype=np.float64),
+        "max_backoff_distance": float(max_backoff_distance),
+        "samples": int(samples),
+        "selected_metrics": {
+            key: selected[key]
+            for key in (
+                "source_red_frame_pass_ratio",
+                "retained_source_link_count",
+                "black_violation_fraction",
+                "contact_retention_level",
+            )
+        },
+        "candidates": records,
+    }
 
 
 def optimize_contact_translation(
@@ -1485,8 +2109,10 @@ def optimize_contact_translation(
     max_residual_shift: float = 0.01,
     max_iterations: int = 30,
     initial_residual: Optional[np.ndarray] = None,
+    source_active_link_mask: Optional[np.ndarray] = None,
+    preferred_region: Optional[PreferredRedRegion] = None,
 ) -> Tuple[np.ndarray, Dict[str, object]]:
-    """Locally refine red-center translation without rotating the grasp."""
+    """Locally refine the contact-aware translation without rotating the grasp."""
 
     if max_residual_shift <= 0.0:
         raise ValueError("Contact-translation residual bound must be positive")
@@ -1499,7 +2125,13 @@ def optimize_contact_translation(
         delta = initial_delta + np.asarray(residual, dtype=np.float64)
         transformed = points_tool + delta[None, None]
         geometry_loss = _transformed_geometry_objective(
-            transformed, point_link_ids, contact_link_ids, tool, settings
+            transformed,
+            point_link_ids,
+            contact_link_ids,
+            tool,
+            settings,
+            source_active_link_mask=source_active_link_mask,
+            preferred_region=preferred_region,
         )
         translation_prior = float(np.dot(residual, residual)) / max(
             max_residual_shift**2, 1e-12
@@ -1538,6 +2170,120 @@ def optimize_contact_translation(
         "final_delta_tool": delta,
         "final_translation_norm": float(np.linalg.norm(delta)),
         "final_rotation_degrees": 0.0,
+        "powell_success": bool(polished.success),
+        "powell_message": str(polished.message),
+    }
+
+
+def _bounded_rotvec(rotvec: np.ndarray, maximum_radians: float) -> np.ndarray:
+    rotvec = np.asarray(rotvec, dtype=np.float64)
+    norm = float(np.linalg.norm(rotvec))
+    if norm > maximum_radians > 0.0:
+        rotvec = rotvec * (maximum_radians / norm)
+    return rotvec
+
+
+def _tool_transform_about_pivot(
+    delta: np.ndarray, rotvec: np.ndarray, pivot: np.ndarray
+) -> np.ndarray:
+    rotation = Rotation.from_rotvec(rotvec).as_matrix()
+    transform = np.eye(4, dtype=np.float64)
+    transform[:3, :3] = rotation
+    transform[:3, 3] = pivot + delta - rotation @ pivot
+    return transform
+
+
+def optimize_contact_se3(
+    points_tool: np.ndarray,
+    point_link_ids: np.ndarray,
+    contact_link_ids: np.ndarray,
+    tool: SemanticTool,
+    settings: GeometrySettings,
+    initial_delta: np.ndarray,
+    pivot_tool: np.ndarray,
+    max_residual_shift: float = 0.01,
+    max_rotation_degrees: float = 5.0,
+    max_iterations: int = 30,
+    initial_residual: Optional[np.ndarray] = None,
+    initial_rotvec: Optional[np.ndarray] = None,
+    source_active_link_mask: Optional[np.ndarray] = None,
+    preferred_region: Optional[PreferredRedRegion] = None,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, object]]:
+    """Refine translation plus a bounded wrist rotation; finger DOFs stay fixed."""
+
+    maximum_radians = float(np.deg2rad(max_rotation_degrees))
+    if maximum_radians <= 0.0:
+        raise ValueError("Maximum contact rotation must be positive")
+    initial_delta = np.asarray(initial_delta, dtype=np.float64)
+    pivot_tool = np.asarray(pivot_tool, dtype=np.float64)
+    translation_seed = (
+        np.zeros(3, dtype=np.float64)
+        if initial_residual is None
+        else np.asarray(initial_residual, dtype=np.float64)
+    )
+    rotation_seed = (
+        np.zeros(3, dtype=np.float64)
+        if initial_rotvec is None
+        else _bounded_rotvec(initial_rotvec, maximum_radians)
+    )
+    seed = np.concatenate(
+        [np.clip(translation_seed, -max_residual_shift, max_residual_shift), rotation_seed]
+    )
+    bounds = [(-max_residual_shift, max_residual_shift)] * 3 + [
+        (-maximum_radians, maximum_radians)
+    ] * 3
+
+    def decode(parameters: np.ndarray):
+        residual = np.asarray(parameters[:3], dtype=np.float64)
+        rotvec = _bounded_rotvec(parameters[3:], maximum_radians)
+        delta = initial_delta + residual
+        return residual, rotvec, delta, _tool_transform_about_pivot(delta, rotvec, pivot_tool)
+
+    def objective(parameters: np.ndarray) -> float:
+        residual, rotvec, _, transform = decode(parameters)
+        transformed = apply_tool_transform_points(
+            points_tool, np.repeat(transform[None], len(points_tool), axis=0)
+        )
+        geometry_loss = _transformed_geometry_objective(
+            transformed,
+            point_link_ids,
+            contact_link_ids,
+            tool,
+            settings,
+            source_active_link_mask=source_active_link_mask,
+            preferred_region=preferred_region,
+        )
+        translation_prior = float(np.dot(residual, residual)) / max(
+            max_residual_shift**2, 1e-12
+        )
+        rotation_prior = float(np.dot(rotvec, rotvec)) / max(maximum_radians**2, 1e-12)
+        return float(geometry_loss + 0.05 * translation_prior + 0.02 * rotation_prior)
+
+    candidates = [(seed, objective(seed))]
+    zero_rotation = seed.copy()
+    zero_rotation[3:] = 0.0
+    candidates.append((zero_rotation, objective(zero_rotation)))
+    polished = minimize(
+        objective,
+        seed,
+        method="Powell",
+        bounds=bounds,
+        options={"maxiter": max_iterations, "xtol": 1e-5, "ftol": 1e-6},
+    )
+    candidates.append((np.asarray(polished.x), float(polished.fun)))
+    parameters, score = min(candidates, key=lambda item: item[1])
+    residual, rotvec, delta, transform = decode(parameters)
+    return transform, delta, {
+        "mode": "contact_se3",
+        "objective": float(score),
+        "residual": residual,
+        "rotation_vector_tool": rotvec,
+        "residual_translation_norm": float(np.linalg.norm(residual)),
+        "initial_delta_tool": initial_delta,
+        "final_delta_tool": delta,
+        "final_translation_norm": float(np.linalg.norm(delta)),
+        "final_rotation_degrees": float(np.rad2deg(np.linalg.norm(rotvec))),
+        "pivot_tool": pivot_tool,
         "powell_success": bool(polished.success),
         "powell_message": str(polished.message),
     }
@@ -1729,10 +2475,66 @@ def _bounded_frame_sample(frame_ids: np.ndarray, maximum: int) -> np.ndarray:
     return frame_ids[indices]
 
 
+def _red_frame_acceptance(
+    metrics: Mapping[str, object], settings: GeometrySettings
+) -> Dict[str, object]:
+    """Accept when either source-preservation or ordinary red-frame coverage passes."""
+
+    red_ratio = float(metrics["red_frame_pass_ratio"])
+    source_value = metrics.get("source_red_frame_pass_ratio")
+    source_ratio = None if source_value is None else float(source_value)
+    red_passed = bool(red_ratio >= settings.min_red_frame_ratio)
+    source_passed = bool(
+        source_ratio is not None and source_ratio >= settings.min_red_frame_ratio
+    )
+    if red_passed and source_passed:
+        passed_by = "both"
+    elif source_passed:
+        passed_by = "source_contact_frames"
+    elif red_passed:
+        passed_by = "red_frames"
+    else:
+        passed_by = "neither"
+    return {
+        "passed": bool(red_passed or source_passed),
+        "passed_by": passed_by,
+        "threshold": float(settings.min_red_frame_ratio),
+        "red_frame_pass_ratio": red_ratio,
+        "red_frame_passed": red_passed,
+        "source_red_frame_pass_ratio": source_ratio,
+        "source_red_frame_passed": source_passed,
+    }
+
+
 def _is_feasible(metrics: Mapping[str, object], settings: GeometrySettings) -> bool:
-    return bool(
-        float(metrics["red_frame_pass_ratio"]) >= settings.min_red_frame_ratio
+    frame_acceptance = _red_frame_acceptance(metrics, settings)
+    feasible = bool(
+        frame_acceptance["passed"]
         and float(metrics["black_violation_fraction"]) <= settings.max_black_violation_fraction
+    )
+    if "relaxed_contact_retention_passed" in metrics:
+        feasible = bool(feasible and metrics["relaxed_contact_retention_passed"])
+    return feasible
+
+
+def _should_save_corrected_pkl(
+    semantic_geometry_passed: bool, allow_infeasible: bool
+) -> bool:
+    """PhysX is recorded as a gate, but never discards a geometrically valid PKL."""
+
+    return bool(semantic_geometry_passed or allow_infeasible)
+
+
+def _is_fully_contact_feasible(
+    metrics: Mapping[str, object], settings: GeometrySettings
+) -> bool:
+    return bool(
+        _is_feasible(metrics, settings)
+        and metrics.get("full_contact_retention_passed", True)
+        and float(
+            metrics.get("full_red_frame_pass_ratio", metrics["red_frame_pass_ratio"])
+        )
+        >= settings.min_red_frame_ratio
     )
 
 
@@ -1814,6 +2616,8 @@ def run_isaac_gym_validation(
     max_contact_force: float,
     max_initial_overlap: float,
     timeout: float,
+    required_contact_names: Optional[Sequence[str]] = None,
+    min_required_link_count: Optional[int] = None,
 ) -> Dict[str, object]:
     """Run tier-three PhysX contact replay in an isolated Isaac Gym process."""
 
@@ -1838,6 +2642,12 @@ def run_isaac_gym_validation(
         "hand_urdf": str(hand.urdf_path),
         "hand_dof_names": tuple(hand.dof_names),
         "contact_body_names": tuple(contact_names),
+        "required_contact_body_names": tuple(
+            contact_names if required_contact_names is None else required_contact_names
+        ),
+        "min_required_link_count": int(
+            1 if min_required_link_count is None else min_required_link_count
+        ),
         "collision_urdf": str(context.collision_urdf_path),
         "frame_ids": frame_ids,
         "wrist_pos": np.asarray(corrected["opt_wrist_pos"], dtype=np.float64)[frame_ids],
@@ -2028,6 +2838,13 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         raise ValueError("--bank currently requires --translation-mode contact-translation")
     if args.bank and args.output_pkl:
         raise ValueError("--bank cannot be combined with --output-pkl; use the canonical bank-backed path")
+    if args.center_candidate_dedup_distance < 0.0:
+        raise ValueError("--center-candidate-dedup-distance must be non-negative")
+    if args.center_backoff_candidates < 1:
+        raise ValueError("--center-backoff-candidates must be at least one")
+    if args.black_backoff_samples < 2:
+        raise ValueError("--black-backoff-samples must be at least two")
+    _parse_center_candidate_alphas(args.center_candidate_alphas)
     if args.physx and not args.headless and not os.environ.get("DISPLAY"):
         raise RuntimeError(
             "Isaac Gym Viewer was requested because --headless was omitted, but DISPLAY is empty. "
@@ -2122,11 +2939,23 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         min_red_frame_ratio=args.min_red_frame_ratio,
         max_shift=args.max_shift,
         max_black_violation_fraction=args.max_black_violation_fraction,
+        source_active_frame_ratio=args.source_active_frame_ratio,
+        min_contact_retention_ratio=args.min_contact_retention_ratio,
+        front_band_min=args.front_band_min,
+        front_band_max=args.front_band_max,
+        front_semantic_margin=args.front_semantic_margin,
+        min_preferred_frame_ratio=args.min_preferred_frame_ratio,
+        front_loss_weight=args.front_loss_weight,
+        contact_drop_weight=args.contact_drop_weight,
     )
     validation_settings = {
         "geometry": asdict(settings),
         "translation_mode": args.translation_mode,
         "max_residual_shift": args.max_residual_shift,
+        "black_backoff_samples": args.black_backoff_samples,
+        "center_candidate_alphas": args.center_candidate_alphas,
+        "center_candidate_dedup_distance": args.center_candidate_dedup_distance,
+        "center_backoff_candidates": args.center_backoff_candidates,
         "ramp_in_frames": args.ramp_in_frames,
         "ramp_out_frames": args.ramp_out_frames,
         "physics_required": bool(args.physx),
@@ -2171,6 +3000,30 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         source_tool,
         settings,
     )
+    source_active_link_mask = np.asarray(
+        source_contact_intent["active_link_mask"], dtype=bool
+    )
+    source_contact_frame_mask = np.asarray(
+        source_contact_intent["contact_frame_mask"], dtype=bool
+    )
+    settings.min_red_link_ratio = float(
+        source_contact_intent["dynamic_min_red_link_ratio"]
+    )
+    preferred_region = build_preferred_red_region(
+        tool, settings, roi_distance=args.axis_roi_distance
+    )
+    validation_settings["geometry"] = asdict(settings)
+    validation_settings["max_rotation_degrees"] = args.max_rotation_degrees
+    validation_settings_hash = stable_mapping_hash(validation_settings)
+    _log(
+        "源接触手指={}/{}，本序列至少保留={}（动态 min_red_link_ratio={:.3f}），优选区={}".format(
+            source_contact_intent["active_link_count"],
+            source_contact_intent["configured_link_count"],
+            source_contact_intent["required_retained_link_count"],
+            settings.min_red_link_ratio,
+            preferred_region.report["method"],
+        )
+    )
     memory_sequence_directory = bank_sequence_dir(DEFAULT_BANK_ROOT, args.data_idx)
     legacy_memory_directory = bank_sequence_dir(
         DEFAULT_BANK_ROOT / "OakInk-v2", args.data_idx
@@ -2203,104 +3056,390 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         "direct_validation_passed": False,
         "used_as_optimizer_warm_start": False,
     }
-    if args.translation_mode == "contact-translation":
-        contact_initial_delta, contact_transfer_report = contact_translation_transfer(
-            source_tool, tool
+    active_preferred_region = None
+    preferred_initial_validation = None
+    preferred_initial_passed = False
+    fallback_direct_passed = False
+    direct_geometry_passed = False
+    black_backoff_report = None
+    center_candidate_search = None
+    if args.translation_mode in ("contact-translation", "contact-se3"):
+        _, preferred_transfer = contact_translation_transfer(
+            source_tool,
+            tool,
+            source_contact_intent=source_contact_intent,
+            preferred_region=preferred_region,
         )
-        ranked_entries = []
-        if args.bank and require_compatible_sequence(
-            memory_lookup_directory, memory_sequence_metadata
-        ):
-            memory_retrieval_report["sequence_found"] = True
-            ranked_entries = load_ranked_entries(
-                memory_lookup_directory, memory_descriptor, top_k=3
+        center_candidate_alphas = _parse_center_candidate_alphas(
+            args.center_candidate_alphas
+        )
+        center_candidate_search = evaluate_center_difference_candidates(
+            points_before[hold_frame_ids],
+            kinematics.point_link_ids_array,
+            contact_ids,
+            tool,
+            settings,
+            np.asarray(preferred_transfer["source_red_center_tool"], dtype=np.float64),
+            np.asarray(
+                source_contact_intent["contact_anchor_center_tool"], dtype=np.float64
+            ),
+            np.asarray(preferred_region.center, dtype=np.float64),
+            source_active_link_mask,
+            source_contact_frame_mask,
+            center_candidate_alphas,
+            preferred_region,
+            dedup_distance=args.center_candidate_dedup_distance,
+        )
+        selected_center_candidate = center_candidate_search["selected_candidate"]
+        _log(
+            "中心差值候选：有效={}/{}，选中 alpha={}，保留级别={}，"
+            "最差手指保持率={:.2%}，黑区违规={:.6%}".format(
+                center_candidate_search["direct_feasible_count"],
+                len(center_candidate_search["candidates"]),
+                selected_center_candidate["alpha"],
+                selected_center_candidate["contact_retention_level"],
+                selected_center_candidate["minimum_active_finger_retention"],
+                selected_center_candidate["black_violation_fraction"],
             )
-
-        evaluated_candidates = []
-        for entry in ranked_entries:
-            residual = np.asarray(
-                entry.get("correction", {}).get("residual_tool"), dtype=np.float64
-            )
-            if residual.shape != (3,) or not np.isfinite(residual).all():
-                continue
-            residual = np.clip(
-                residual, -args.max_residual_shift, args.max_residual_shift
-            )
-            candidate_delta = contact_initial_delta + residual
-            candidate_metrics = contact_geometry_metrics(
-                points_before[hold_frame_ids] + candidate_delta[None, None],
-                kinematics.point_link_ids_array,
-                contact_ids,
-                tool,
-                settings,
-            )
-            candidate_objective = _transformed_geometry_objective(
-                points_before[optimization_frames] + candidate_delta[None, None],
-                kinematics.point_link_ids_array,
-                contact_ids,
-                tool,
-                settings,
-            )
-            candidate_record = {
-                "tool_mesh_name": entry.get("tool_mesh_name"),
-                "similarity": entry["similarity"],
-                "delta_tool": candidate_delta,
-                "residual_tool": residual,
-                "geometry_objective": float(candidate_objective),
-                "red_frame_pass_ratio": float(candidate_metrics["red_frame_pass_ratio"]),
-                "black_violation_fraction": float(candidate_metrics["black_violation_fraction"]),
-                "passed": _is_feasible(candidate_metrics, settings),
+        )
+        preferred_initial_delta = np.asarray(
+            selected_center_candidate["delta_tool"], dtype=np.float64
+        )
+        preferred_initial_validation = dict(selected_center_candidate)
+        preferred_initial_passed = bool(selected_center_candidate["passed"])
+        preferred_transfer = dict(preferred_transfer)
+        preferred_transfer.update(
+            {
+                "method": "center_difference_candidate_to_preferred",
+                "selected_alpha": selected_center_candidate["alpha"],
+                "selected_source_center_tool": selected_center_candidate[
+                    "source_center_tool"
+                ],
+                "initial_delta_tool": preferred_initial_delta,
+                "initial_delta_norm": float(np.linalg.norm(preferred_initial_delta)),
             }
-            evaluated_candidates.append(candidate_record)
+        )
 
-        memory_retrieval_report["candidates"] = evaluated_candidates
-        passing_candidates = [item for item in evaluated_candidates if item["passed"]]
-        if passing_candidates:
-            selected = min(passing_candidates, key=lambda item: item["geometry_objective"])
-            delta_tool = np.asarray(selected["delta_tool"], dtype=np.float64)
+        if preferred_initial_passed:
+            direct_geometry_passed = True
+            active_preferred_region = preferred_region
+            contact_initial_delta = preferred_initial_delta
+            delta_tool = preferred_initial_delta.copy()
+            contact_transfer_report = dict(preferred_transfer)
+            contact_transfer_report.update(
+                {
+                    "method": "preferred_initial_direct",
+                    "preferred_initial_passed": True,
+                    "preferred_initial_validation": preferred_initial_validation,
+                    "fallback_used": False,
+                }
+            )
+            contact_transform_tool = np.eye(4, dtype=np.float64)
+            contact_transform_tool[:3, 3] = delta_tool
             optimizer_report = {
-                "mode": "memory_direct",
-                "objective": float(selected["geometry_objective"]),
-                "residual": np.asarray(selected["residual_tool"], dtype=np.float64),
-                "residual_translation_norm": float(np.linalg.norm(selected["residual_tool"])),
-                "initial_delta_tool": contact_initial_delta,
+                "mode": "preferred_initial_direct",
+                "objective": float(
+                    _transformed_geometry_objective(
+                        points_before[optimization_frames] + delta_tool[None, None],
+                        kinematics.point_link_ids_array,
+                        contact_ids,
+                        tool,
+                        settings,
+                        source_active_link_mask=source_active_link_mask,
+                        preferred_region=preferred_region,
+                    )
+                ),
+                "residual": np.zeros(3, dtype=np.float64),
+                "residual_translation_norm": 0.0,
+                "initial_delta_tool": preferred_initial_delta,
                 "final_delta_tool": delta_tool,
                 "final_translation_norm": float(np.linalg.norm(delta_tool)),
                 "final_rotation_degrees": 0.0,
-                "source_tool_mesh_name": selected["tool_mesh_name"],
             }
-            memory_retrieval_report["selected_tool_mesh_name"] = selected["tool_mesh_name"]
-            memory_retrieval_report["direct_validation_passed"] = True
-            _log(
-                "Memory bank 直接候选通过语义几何预验收：{}".format(
-                    selected["tool_mesh_name"]
-                )
-            )
+            _log("优选带初始候选直接通过完整语义几何预验收；跳过后续修正")
         else:
-            initial_residual = None
-            if evaluated_candidates:
-                selected = min(
-                    evaluated_candidates, key=lambda item: item["geometry_objective"]
+            active_preferred_region = None
+            semantic_axis_data = preferred_region.report.get("semantic_axis")
+            if (
+                preferred_region.report.get("reliable_direction", False)
+                and isinstance(semantic_axis_data, Mapping)
+                and "direction_tool" in semantic_axis_data
+            ):
+                ranked_center_candidates = sorted(
+                    center_candidate_search["candidates"],
+                    key=_center_candidate_rank,
+                    reverse=True,
                 )
-                initial_residual = np.asarray(selected["residual_tool"], dtype=np.float64)
-                memory_retrieval_report["selected_tool_mesh_name"] = selected["tool_mesh_name"]
-                memory_retrieval_report["used_as_optimizer_warm_start"] = True
-                _log(
-                    "Memory bank 候选未直接通过；使用 {} 的修正残差作为优化初值".format(
-                        selected["tool_mesh_name"]
+                backoff_attempts = []
+                for center_candidate in ranked_center_candidates[
+                    : max(1, int(args.center_backoff_candidates))
+                ]:
+                    candidate_delta, candidate_backoff = search_contact_backoff_from_black(
+                        points_before[hold_frame_ids],
+                        kinematics.point_link_ids_array,
+                        contact_ids,
+                        tool,
+                        settings,
+                        np.asarray(center_candidate["delta_tool"], dtype=np.float64),
+                        np.asarray(semantic_axis_data["direction_tool"], dtype=np.float64),
+                        source_active_link_mask,
+                        source_contact_frame_mask,
+                        max_backoff_distance=settings.max_shift,
+                        samples=args.black_backoff_samples,
                     )
+                    backoff_evaluation = _evaluate_center_translation_candidate(
+                        points_before[hold_frame_ids],
+                        kinematics.point_link_ids_array,
+                        contact_ids,
+                        tool,
+                        settings,
+                        candidate_delta,
+                        source_active_link_mask,
+                        source_contact_frame_mask,
+                        alpha=center_candidate["alpha"],
+                        source_center_tool=np.asarray(
+                            center_candidate["source_center_tool"], dtype=np.float64
+                        ),
+                        stage="black_backoff",
+                        preferred_region=None,
+                    )
+                    candidate_backoff = dict(candidate_backoff)
+                    candidate_backoff.update(
+                        {
+                            "origin_alpha": center_candidate["alpha"],
+                            "origin_delta_tool": center_candidate["delta_tool"],
+                            "selected_candidate_evaluation": backoff_evaluation,
+                        }
+                    )
+                    backoff_attempts.append(
+                        {
+                            "delta_tool": candidate_delta,
+                            "report": candidate_backoff,
+                            "evaluation": backoff_evaluation,
+                        }
+                    )
+                selected_backoff = max(
+                    backoff_attempts,
+                    key=lambda item: _center_candidate_rank(item["evaluation"]),
                 )
-            delta_tool, optimizer_report = optimize_contact_translation(
-                points_before[optimization_frames],
-                kinematics.point_link_ids_array,
-                contact_ids,
-                tool,
-                settings,
-                contact_initial_delta,
-                max_residual_shift=args.max_residual_shift,
-                max_iterations=args.optimizer_iterations,
-                initial_residual=initial_residual,
+                contact_initial_delta = np.asarray(
+                    selected_backoff["delta_tool"], dtype=np.float64
+                )
+                black_backoff_report = dict(selected_backoff["report"])
+                black_backoff_report["attempts"] = [
+                    item["report"] for item in backoff_attempts
+                ]
+                black_backoff_report["selected_origin_alpha"] = selected_backoff[
+                    "evaluation"
+                ]["alpha"]
+                fallback_direct_passed = bool(
+                    selected_backoff["evaluation"]["passed"]
+                )
+                fallback_transfer = dict(preferred_transfer)
+                fallback_transfer.update(
+                    {
+                        "method": "semantic_axis_black_backoff",
+                        "initial_delta_tool": contact_initial_delta,
+                        "initial_delta_norm": float(np.linalg.norm(contact_initial_delta)),
+                        "black_backoff": black_backoff_report,
+                    }
+                )
+            else:
+                contact_initial_delta = preferred_initial_delta.copy()
+                fallback_transfer = dict(preferred_transfer)
+                fallback_transfer.update(
+                    {
+                        "method": "center_candidate_without_axis_fallback",
+                        "initial_delta_tool": contact_initial_delta,
+                        "initial_delta_norm": float(np.linalg.norm(contact_initial_delta)),
+                    }
+                )
+            direct_geometry_passed = fallback_direct_passed
+            contact_transfer_report = dict(fallback_transfer)
+            contact_transfer_report.update(
+                {
+                    "method": (
+                        "preferred_initial_then_black_backoff"
+                        if black_backoff_report is not None
+                        else "center_candidates_then_local_fallback"
+                    ),
+                    "preferred_initial": preferred_transfer,
+                    "preferred_initial_passed": False,
+                    "preferred_initial_validation": preferred_initial_validation,
+                    "fallback_used": True,
+                    "fallback_method": fallback_transfer["method"],
+                }
             )
+            _log(
+                "优选带初始候选未通过；后续移除优选带约束，"
+                + (
+                    "沿语义轴远离黑区回退"
+                    if black_backoff_report is not None
+                    else "方向不可靠，使用最佳中心候选进入局部优化"
+                )
+            )
+
+            ranked_entries = []
+            if args.bank and require_compatible_sequence(
+                memory_lookup_directory, memory_sequence_metadata
+            ):
+                memory_retrieval_report["sequence_found"] = True
+                ranked_entries = load_ranked_entries(
+                    memory_lookup_directory, memory_descriptor, top_k=3
+                )
+
+            evaluated_candidates = []
+            for entry in ranked_entries:
+                residual = np.asarray(
+                    entry.get("correction", {}).get("residual_tool"), dtype=np.float64
+                )
+                if residual.shape != (3,) or not np.isfinite(residual).all():
+                    continue
+                residual = np.clip(
+                    residual, -args.max_residual_shift, args.max_residual_shift
+                )
+                candidate_delta = contact_initial_delta + residual
+                candidate_metrics = contact_geometry_metrics(
+                    points_before[hold_frame_ids] + candidate_delta[None, None],
+                    kinematics.point_link_ids_array,
+                    contact_ids,
+                    tool,
+                    settings,
+                    source_active_link_mask=source_active_link_mask,
+                    source_contact_frame_mask=source_contact_frame_mask,
+                    preferred_region=None,
+                )
+                candidate_objective = _transformed_geometry_objective(
+                    points_before[optimization_frames] + candidate_delta[None, None],
+                    kinematics.point_link_ids_array,
+                    contact_ids,
+                    tool,
+                    settings,
+                    source_active_link_mask=source_active_link_mask,
+                    preferred_region=None,
+                )
+                candidate_record = {
+                    "tool_mesh_name": entry.get("tool_mesh_name"),
+                    "similarity": entry["similarity"],
+                    "delta_tool": candidate_delta,
+                    "residual_tool": residual,
+                    "geometry_objective": float(candidate_objective),
+                    "source_red_frame_pass_ratio": float(
+                        candidate_metrics["source_red_frame_pass_ratio"]
+                    ),
+                    "black_violation_fraction": float(
+                        candidate_metrics["black_violation_fraction"]
+                    ),
+                    "passed": _is_feasible(candidate_metrics, settings),
+                }
+                evaluated_candidates.append(candidate_record)
+
+            memory_retrieval_report["candidates"] = evaluated_candidates
+            passing_candidates = [item for item in evaluated_candidates if item["passed"]]
+            if fallback_direct_passed:
+                delta_tool = np.asarray(contact_initial_delta, dtype=np.float64)
+                optimizer_report = {
+                    "mode": "black_backoff_direct",
+                    "objective": float(
+                        min(
+                            black_backoff_report["candidates"],
+                            key=lambda item: abs(
+                                item["distance"] - black_backoff_report["selected_distance"]
+                            ),
+                        )["objective"]
+                    ),
+                    "residual": np.zeros(3, dtype=np.float64),
+                    "residual_translation_norm": 0.0,
+                    "initial_delta_tool": preferred_initial_delta,
+                    "final_delta_tool": delta_tool,
+                    "final_translation_norm": float(np.linalg.norm(delta_tool)),
+                    "final_rotation_degrees": 0.0,
+                    "black_backoff": black_backoff_report,
+                    "preferred_constraint_active": False,
+                }
+            elif passing_candidates:
+                selected = min(
+                    passing_candidates, key=lambda item: item["geometry_objective"]
+                )
+                delta_tool = np.asarray(selected["delta_tool"], dtype=np.float64)
+                optimizer_report = {
+                    "mode": "memory_direct_without_preferred",
+                    "objective": float(selected["geometry_objective"]),
+                    "residual": np.asarray(selected["residual_tool"], dtype=np.float64),
+                    "residual_translation_norm": float(np.linalg.norm(selected["residual_tool"])),
+                    "initial_delta_tool": contact_initial_delta,
+                    "final_delta_tool": delta_tool,
+                    "final_translation_norm": float(np.linalg.norm(delta_tool)),
+                    "final_rotation_degrees": 0.0,
+                    "source_tool_mesh_name": selected["tool_mesh_name"],
+                }
+                memory_retrieval_report["selected_tool_mesh_name"] = selected["tool_mesh_name"]
+                memory_retrieval_report["direct_validation_passed"] = True
+            else:
+                initial_residual = None
+                if evaluated_candidates:
+                    selected = min(
+                        evaluated_candidates, key=lambda item: item["geometry_objective"]
+                    )
+                    initial_residual = np.asarray(selected["residual_tool"], dtype=np.float64)
+                    memory_retrieval_report["selected_tool_mesh_name"] = selected["tool_mesh_name"]
+                    memory_retrieval_report["used_as_optimizer_warm_start"] = True
+                delta_tool, optimizer_report = optimize_contact_translation(
+                    points_before[optimization_frames],
+                    kinematics.point_link_ids_array,
+                    contact_ids,
+                    tool,
+                    settings,
+                    contact_initial_delta,
+                    max_residual_shift=args.max_residual_shift,
+                    max_iterations=args.optimizer_iterations,
+                    initial_residual=initial_residual,
+                    source_active_link_mask=source_active_link_mask,
+                    preferred_region=None,
+                )
+
+            if args.translation_mode == "contact-se3" and not fallback_direct_passed:
+                translation_transform = np.eye(4, dtype=np.float64)
+                translation_transform[:3, 3] = delta_tool
+                translation_metrics = contact_geometry_metrics(
+                    points_before[hold_frame_ids] + delta_tool[None, None],
+                    kinematics.point_link_ids_array,
+                    contact_ids,
+                    tool,
+                    settings,
+                    source_active_link_mask=source_active_link_mask,
+                    source_contact_frame_mask=source_contact_frame_mask,
+                    preferred_region=None,
+                )
+                if _is_fully_contact_feasible(translation_metrics, settings):
+                    contact_transform_tool = translation_transform
+                    optimizer_report["mode"] = "contact_se3_translation_only_without_preferred"
+                    optimizer_report["rotation_skipped_reason"] = (
+                        "fallback translation passed the full contact geometry gate"
+                    )
+                else:
+                    pivot_tool = np.asarray(
+                        source_contact_intent["contact_anchor_center_tool"],
+                        dtype=np.float64,
+                    )
+                    contact_transform_tool, delta_tool, se3_report = optimize_contact_se3(
+                        points_before[optimization_frames],
+                        kinematics.point_link_ids_array,
+                        contact_ids,
+                        tool,
+                        settings,
+                        contact_initial_delta,
+                        pivot_tool,
+                        max_residual_shift=args.max_residual_shift,
+                        max_rotation_degrees=args.max_rotation_degrees,
+                        max_iterations=args.optimizer_iterations,
+                        initial_residual=np.asarray(optimizer_report["residual"]),
+                        source_active_link_mask=source_active_link_mask,
+                        preferred_region=None,
+                    )
+                    se3_report["translation_stage"] = optimizer_report
+                    se3_report["preferred_constraint_active"] = False
+                    optimizer_report = se3_report
     elif args.translation_mode == "semantic-axis":
         semantic_axis_direction, semantic_axis_report = estimate_semantic_axis(
             tool, roi_distance=args.axis_roi_distance
@@ -2332,6 +3471,8 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
     # A bounded representative set keeps refinement tractable, while final acceptance
     # is still evaluated on every frame in the complete grasp interval.
     for refinement_round in range(args.max_refinement_rounds):
+        if direct_geometry_passed:
+            break
         hold_transform = np.repeat(
             contact_transform_tool[None], len(hold_frame_ids), axis=0
         )
@@ -2341,11 +3482,25 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
             contact_ids,
             tool,
             settings,
+            source_active_link_mask=source_active_link_mask,
+            source_contact_frame_mask=source_contact_frame_mask,
+            preferred_region=active_preferred_region,
         )
-        if _is_feasible(hold_metrics, settings):
+        if _is_fully_contact_feasible(hold_metrics, settings):
             break
+        failed_ratio_frame = np.asarray(
+            hold_metrics.get("source_red_link_ratio_frame", hold_metrics["red_link_ratio_frame"])
+        )
+        preferred_ratio_frame = np.asarray(
+            hold_metrics.get("source_preferred_link_ratio_frame", failed_ratio_frame)
+        )
+        required_source_ratio = float(
+            hold_metrics.get("required_retained_link_count", 1)
+            / max(1, hold_metrics.get("source_active_link_count", 1))
+        )
         failed_local = np.flatnonzero(
-            (np.asarray(hold_metrics["red_link_ratio_frame"]) < settings.min_red_link_ratio)
+            (failed_ratio_frame < 1.0 - 1e-12)
+            | (preferred_ratio_frame < required_source_ratio - 1e-12)
             | (np.asarray(hold_metrics["black_violation_count_frame"]) > 0)
         )
         if len(failed_local) == 0:
@@ -2385,6 +3540,30 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
                 max_residual_shift=args.max_residual_shift,
                 max_iterations=args.optimizer_iterations,
                 initial_residual=np.asarray(optimizer_history[-1]["residual"]),
+                source_active_link_mask=source_active_link_mask,
+                preferred_region=active_preferred_region,
+            )
+        elif args.translation_mode == "contact-se3":
+            pivot_tool = np.asarray(
+                source_contact_intent["contact_anchor_center_tool"], dtype=np.float64
+            )
+            contact_transform_tool, delta_tool, refinement_report = optimize_contact_se3(
+                points_before[optimization_frames],
+                kinematics.point_link_ids_array,
+                contact_ids,
+                tool,
+                settings,
+                contact_initial_delta,
+                pivot_tool,
+                max_residual_shift=args.max_residual_shift,
+                max_rotation_degrees=args.max_rotation_degrees,
+                max_iterations=args.optimizer_iterations,
+                initial_residual=np.asarray(optimizer_history[-1]["residual"]),
+                initial_rotvec=np.asarray(
+                    optimizer_history[-1].get("rotation_vector_tool", np.zeros(3))
+                ),
+                source_active_link_mask=source_active_link_mask,
+                preferred_region=active_preferred_region,
             )
         elif semantic_axis_direction is not None:
             delta_tool, refinement_report = optimize_tool_translation_along_axis(
@@ -2409,8 +3588,9 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
                 initial_delta=delta_tool,
                 global_search=False,
             )
-        contact_transform_tool = np.eye(4, dtype=np.float64)
-        contact_transform_tool[:3, 3] = delta_tool
+        if args.translation_mode != "contact-se3":
+            contact_transform_tool = np.eye(4, dtype=np.float64)
+            contact_transform_tool[:3, 3] = delta_tool
         refinement_report["round"] = refinement_round + 1
         refinement_report["failed_frame_count"] = int(len(failed_frames))
         refinement_report["optimization_frames"] = optimization_frames
@@ -2422,29 +3602,69 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         args.ramp_in_frames,
         args.ramp_out_frames,
     )
-    delta_world = tool_to_world_offsets(delta_tool, context.object_trajectory) * alpha[:, None]
     corrected = copy.deepcopy(source)
-    corrected["opt_wrist_pos"] = (
-        np.asarray(source["opt_wrist_pos"], dtype=np.float64) + delta_world
-    ).astype(
-        np.asarray(source["opt_wrist_pos"]).dtype
-    )
-    if "opt_joints_pos" in source:
-        corrected["opt_joints_pos"] = (
-            np.asarray(source["opt_joints_pos"], dtype=np.float64) + delta_world[:, None]
-        ).astype(
-            np.asarray(source["opt_joints_pos"]).dtype
-        )
-    corrected["opt_wrist_rot"] = np.asarray(source["opt_wrist_rot"]).copy()
     corrected["opt_dof_pos"] = np.asarray(source["opt_dof_pos"]).copy()
+    transform_schedule_tool = None
+    delta_world = None
+    if args.translation_mode == "contact-se3":
+        pivot_tool = np.asarray(
+            source_contact_intent["contact_anchor_center_tool"], dtype=np.float64
+        )
+        transform_schedule_tool = build_transform_schedule(
+            contact_transform_tool, alpha, pivot_tool=pivot_tool
+        )
+        expected_wrist_pos, expected_wrist_rot, expected_joints_pos = transform_hand_trajectory(
+            np.asarray(source["opt_wrist_pos"], dtype=np.float64),
+            np.asarray(source["opt_wrist_rot"], dtype=np.float64),
+            context.object_trajectory,
+            transform_schedule_tool,
+            None
+            if "opt_joints_pos" not in source
+            else np.asarray(source["opt_joints_pos"], dtype=np.float64),
+        )
+        corrected["opt_wrist_pos"] = expected_wrist_pos.astype(
+            np.asarray(source["opt_wrist_pos"]).dtype
+        )
+        corrected["opt_wrist_rot"] = expected_wrist_rot.astype(
+            np.asarray(source["opt_wrist_rot"]).dtype
+        )
+        if expected_joints_pos is not None:
+            corrected["opt_joints_pos"] = expected_joints_pos.astype(
+                np.asarray(source["opt_joints_pos"]).dtype
+            )
+        points_after = apply_tool_transform_points(points_before, transform_schedule_tool)
+        invariant_report = _invariant_report(
+            source,
+            corrected,
+            expected_wrist_pos=expected_wrist_pos,
+            expected_wrist_rot=expected_wrist_rot,
+            expected_joints_pos=expected_joints_pos,
+        )
+    else:
+        delta_world = tool_to_world_offsets(delta_tool, context.object_trajectory) * alpha[:, None]
+        corrected["opt_wrist_pos"] = (
+            np.asarray(source["opt_wrist_pos"], dtype=np.float64) + delta_world
+        ).astype(np.asarray(source["opt_wrist_pos"]).dtype)
+        if "opt_joints_pos" in source:
+            corrected["opt_joints_pos"] = (
+                np.asarray(source["opt_joints_pos"], dtype=np.float64) + delta_world[:, None]
+            ).astype(np.asarray(source["opt_joints_pos"]).dtype)
+        corrected["opt_wrist_rot"] = np.asarray(source["opt_wrist_rot"]).copy()
+        points_after = points_before + alpha[:, None, None] * delta_tool[None, None]
+        invariant_report = _invariant_report(source, corrected, delta_world)
 
-    points_after = points_before + alpha[:, None, None] * delta_tool[None, None]
+    hold_metric_kwargs = {
+        "source_active_link_mask": source_active_link_mask,
+        "source_contact_frame_mask": source_contact_frame_mask,
+        "preferred_region": active_preferred_region,
+    }
     before_hold = contact_geometry_metrics(
         points_before[hold_frame_ids],
         kinematics.point_link_ids_array,
         contact_ids,
         tool,
         settings,
+        **hold_metric_kwargs,
     )
     after_hold = contact_geometry_metrics(
         points_after[hold_frame_ids],
@@ -2452,6 +3672,7 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         contact_ids,
         tool,
         settings,
+        **hold_metric_kwargs,
     )
     before_full = contact_geometry_metrics(
         points_before,
@@ -2467,12 +3688,12 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         tool,
         settings,
     )
-    invariant_report = _invariant_report(source, corrected, delta_world)
     final_axis_constraint = (
         _axis_constraint_report(delta_tool, semantic_axis_direction)
         if semantic_axis_direction is not None
         else None
     )
+    red_frame_acceptance = _red_frame_acceptance(after_hold, settings)
     geometry_feasible = _is_feasible(after_hold, settings)
     semantic_geometry_passed = bool(
         geometry_feasible
@@ -2484,19 +3705,30 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         "status": "passed" if semantic_geometry_passed else "failed",
         "passed": semantic_geometry_passed,
         "geometry_feasible": geometry_feasible,
+        "red_frame_acceptance": red_frame_acceptance,
         "invariants_passed": bool(invariant_report["passed"]),
         "axis_constraint_passed": bool(
             final_axis_constraint is None or final_axis_constraint["passed"]
         ),
+        "contact_retention_level": after_hold.get("contact_retention_level"),
+        "source_link_retention_ratio": after_hold.get("source_link_retention_ratio"),
+        "preferred_frame_pass_ratio": after_hold.get("preferred_frame_pass_ratio"),
     }
-    final_rotation_degrees = 0.0
+    final_rotation_degrees = float(
+        Rotation.from_matrix(contact_transform_tool[:3, :3]).magnitude() * 180.0 / np.pi
+    )
     _log(
-        "[1/2] 语义几何优化{}：红区合格帧={:.2%}，黑区违规比例={:.6%}，"
-        "工具局部平移={:.2f} mm".format(
+        "[1/2] 语义几何优化{}：源接触合格帧={:.2%}，红区合格帧={:.2%}，"
+        "帧验收来源={}，保留级别={}，黑区违规比例={:.6%}，"
+        "平移={:.2f} mm，旋转={:.2f}°".format(
             "通过" if semantic_geometry_passed else "失败",
+            float(after_hold.get("source_red_frame_pass_ratio", 0.0)),
             float(after_hold["red_frame_pass_ratio"]),
+            red_frame_acceptance["passed_by"],
+            after_hold.get("contact_retention_level", "legacy"),
             float(after_hold["black_violation_fraction"]),
             float(np.linalg.norm(delta_tool)) * 1000.0,
+            final_rotation_degrees,
         )
     )
     if not args.physx:
@@ -2535,6 +3767,14 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
                 max_contact_force=args.physics_max_contact_force,
                 max_initial_overlap=args.physics_max_initial_overlap,
                 timeout=args.physics_timeout,
+                required_contact_names=[
+                    kinematics.point_link_names[item["link_id"]]
+                    for item in source_contact_intent["per_link"]
+                    if item["active"]
+                ],
+                min_required_link_count=int(
+                    source_contact_intent["required_retained_link_count"]
+                ),
             )
         except Exception as error:
             physics_tier = {
@@ -2599,7 +3839,15 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         "translation_mode": args.translation_mode,
         "source_contact_intent": source_contact_intent,
         "contact_transfer": contact_transfer_report,
+        "center_candidate_search": center_candidate_search,
+        "preferred_region": preferred_region.report,
         "contact_transform_tool": contact_transform_tool,
+        "transform_schedule_tool": transform_schedule_tool,
+        "rotation_pivot_tool": (
+            source_contact_intent["contact_anchor_center_tool"]
+            if args.translation_mode == "contact-se3"
+            else None
+        ),
         "semantic_axis": semantic_axis_report,
         "axis_constraint": final_axis_constraint,
         "delta_tool": delta_tool,
@@ -2640,7 +3888,19 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         "translation_mode": args.translation_mode,
         "source_contact_intent": source_contact_intent,
         "contact_transfer": contact_transfer_report,
+        "center_candidate_search": center_candidate_search,
+        "preferred_region": preferred_region.report,
         "contact_transform_tool": contact_transform_tool.astype(np.float32),
+        "transform_schedule_tool": (
+            None
+            if transform_schedule_tool is None
+            else transform_schedule_tool.astype(np.float32)
+        ),
+        "rotation_pivot_tool": (
+            source_contact_intent["contact_anchor_center_tool"]
+            if args.translation_mode == "contact-se3"
+            else None
+        ),
         "semantic_axis": semantic_axis_report,
         "axis_constraint": final_axis_constraint,
         "delta_tool": delta_tool.astype(np.float32),
@@ -2686,7 +3946,10 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         delta_tool,
         contact_transfer_report,
     )
-    if overall_passed or args.allow_infeasible:
+    save_corrected_pkl = _should_save_corrected_pkl(
+        semantic_geometry_tier["passed"], args.allow_infeasible
+    )
+    if save_corrected_pkl:
         _atomic_pickle_dump(corrected, output_path)
         _log(f"修正 PKL 已原子{'覆盖' if output_existed else '写入'}：{output_path}")
         if args.bank and overall_passed:
@@ -2737,12 +4000,14 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
                 if args.physx
                 else "几何轨迹修正完成，语义几何验收通过（未启用 PhysX）"
             )
+        elif semantic_geometry_tier["passed"]:
+            _log("PhysX 未通过；已保留几何验收通过的修正 PKL，Stage-1 仍会按元数据拒绝未通过的物理验收")
         else:
-            _log("已写入诊断 PKL（未通过全部已配置验证）")
+            _log("已写入诊断 PKL（语义几何未通过，仅因 --allow-infeasible 保存）")
     else:
         raise RuntimeError(
-            "Contact trajectory correction did not pass all configured validation tiers. "
-            f"The corrected PKL was not replaced. Inspect {report_path} and {preview_path}, adjust the interval/constraints, "
+            "Contact trajectory correction did not pass semantic geometry validation. "
+            f"The corrected PKL was not replaced. Inspect {report_path} and {preview_path}, "
             "or pass --allow-infeasible only for diagnostic output."
         )
     return report
@@ -2830,12 +4095,36 @@ def run_verification(args: argparse.Namespace) -> Dict[str, object]:
     points_corrected = world_to_tool_points(world_corrected, context.object_trajectory)
     start_frame, end_frame = (int(v) for v in metadata["grasp_interval"])
     frame_ids = np.arange(start_frame, end_frame + 1, dtype=np.int64)
+    world_source = model.world_surface_trajectory(
+        np.asarray(source["opt_wrist_pos"], dtype=np.float64),
+        np.asarray(source["opt_wrist_rot"], dtype=np.float64),
+        np.asarray(source["opt_dof_pos"], dtype=np.float64),
+    )
+    points_source = world_to_tool_points(world_source, context.object_trajectory)
+    source_contact_intent = extract_source_contact_intent(
+        points_source[frame_ids],
+        model.point_link_ids_array,
+        contact_ids,
+        source_tool,
+        settings,
+    )
+    settings.min_red_link_ratio = float(
+        source_contact_intent["dynamic_min_red_link_ratio"]
+    )
+    preferred_region = build_preferred_red_region(tool, settings, roi_distance=0.03)
     metrics = contact_geometry_metrics(
         points_corrected[frame_ids],
         model.point_link_ids_array,
         contact_ids,
         tool,
         settings,
+        source_active_link_mask=np.asarray(
+            source_contact_intent["active_link_mask"], dtype=bool
+        ),
+        source_contact_frame_mask=np.asarray(
+            source_contact_intent["contact_frame_mask"], dtype=bool
+        ),
+        preferred_region=preferred_region,
     )
     translation_mode = metadata.get("translation_mode", "free3d")
     delta_tool = np.asarray(metadata["delta_tool"], dtype=np.float64)
@@ -2912,7 +4201,9 @@ def run_verification(args: argparse.Namespace) -> Dict[str, object]:
         "stored_validation_tiers": stored_validation_tiers,
         "stored_validation_tiers_passed": stored_tiers_passed,
         "translation_mode": translation_mode,
-        "source_contact_intent": metadata.get("source_contact_intent"),
+        "source_contact_intent": source_contact_intent,
+        "stored_source_contact_intent": metadata.get("source_contact_intent"),
+        "preferred_region": preferred_region.report,
         "contact_transfer": metadata.get("contact_transfer"),
         "contact_transform_tool": metadata.get("contact_transform_tool"),
         "semantic_axis": metadata.get("semantic_axis"),
@@ -2947,10 +4238,23 @@ def _add_common_geometry_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--contact-distance", type=float, default=0.006)
     parser.add_argument("--black-clearance", type=float, default=0.006)
     parser.add_argument("--influence-distance", type=float, default=0.02)
-    parser.add_argument("--min-red-link-ratio", type=float, default=0.1)
+    parser.add_argument(
+        "--min-red-link-ratio",
+        type=float,
+        default=0.1,
+        help="legacy grasp-interval detection threshold; final acceptance is set per sequence",
+    )
     parser.add_argument("--min-red-frame-ratio", type=float, default=0.8)
-    # parser.add_argument("--max-black-violation-fraction", type=float, default=0.0)
-    parser.add_argument("--max-black-violation-fraction", type=float, default=0.2)
+    parser.add_argument("--max-black-violation-fraction", type=float, default=0.00001)
+    parser.add_argument("--source-active-frame-ratio", type=float, default=0.3)
+    # parser.add_argument("--min-contact-retention-ratio", type=float, default=0.8)
+    parser.add_argument("--min-contact-retention-ratio", type=float, default=0.4)
+    parser.add_argument("--front-band-min", type=float, default=0.15)
+    parser.add_argument("--front-band-max", type=float, default=0.35)
+    parser.add_argument("--front-semantic-margin", type=float, default=0.002)
+    parser.add_argument("--min-preferred-frame-ratio", type=float, default=0.7)
+    parser.add_argument("--front-loss-weight", type=float, default=0.25)
+    parser.add_argument("--contact-drop-weight", type=float, default=2.0)
     parser.add_argument("--max-optimization-frames", type=int, default=48)
     parser.add_argument("--report")
 
@@ -3006,18 +4310,19 @@ def build_parser() -> argparse.ArgumentParser:
     correct.add_argument("--max-shift", type=float, default=0.05)
     correct.add_argument(
         "--translation-mode",
-        choices=("contact-translation", "free3d", "semantic-axis"),
+        choices=("contact-translation", "contact-se3", "free3d", "semantic-axis"),
         default="contact-translation",
         help=(
-            "contact-translation maps the old red center to the new one and locally refines "
-            "translation only; free3d and semantic-axis retain the legacy solvers"
+            "contact-translation preserves source contacts with translation only; contact-se3 "
+            "tries translation first and then a bounded wrist rotation; free3d and semantic-axis "
+            "retain the legacy solvers"
         ),
     )
     correct.add_argument(
         "--max-residual-shift",
         type=float,
         default=0.01,
-        help="maximum per-axis translation refinement around the old-to-new red-center offset",
+        help="maximum per-axis refinement after preferred initialization or black backoff",
     )
     correct.add_argument(
         "--axis-roi-distance",
@@ -3031,7 +4336,36 @@ def build_parser() -> argparse.ArgumentParser:
         default=201,
         help="number of coarse distance samples for semantic-axis one-dimensional optimization",
     )
+    correct.add_argument(
+        "--center-candidate-alphas",
+        default="1.0,0.75,0.5,0.25,0.0",
+        help="comma-separated interpolation weights from source red center to source contact center",
+    )
+    correct.add_argument(
+        "--center-candidate-dedup-distance",
+        type=float,
+        default=0.001,
+        help="tool-local translation distance below which center candidates are deduplicated",
+    )
+    correct.add_argument(
+        "--center-backoff-candidates",
+        type=int,
+        default=2,
+        help="number of top failed center candidates sent to black-axis backoff",
+    )
+    correct.add_argument(
+        "--black-backoff-samples",
+        type=int,
+        default=11,
+        help="coarse samples along the black-to-red axis after the preferred candidate fails",
+    )
     correct.add_argument("--optimizer-iterations", type=int, default=30)
+    correct.add_argument(
+        "--max-rotation-degrees",
+        type=float,
+        default=5.0,
+        help="maximum wrist rotation used by contact-se3 after translation-only validation fails",
+    )
     correct.add_argument("--max-refinement-rounds", type=int, default=4)
     correct.add_argument("--seed", type=int, default=42)
     correct.add_argument(
@@ -3054,7 +4388,10 @@ def build_parser() -> argparse.ArgumentParser:
     physics_group.add_argument(
         "--physx",
         action="store_true",
-        help="run PhysX validation and require it to pass before saving the corrected PKL",
+        help=(
+            "run PhysX validation; failures are saved in metadata and block Stage1, "
+            "but do not discard a geometrically valid corrected PKL"
+        ),
     )
     physics_group.add_argument(
         "--skip-physics-validation",

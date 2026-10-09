@@ -335,16 +335,14 @@ def run_validation(request: Dict) -> Dict:
                     environment, object_actor, 0, gymapi.DOMAIN_ENV
                 )
             )
-            per_environment_intended = []
+            per_environment_intended = {}
             for body_name in request.get("contact_body_names", ()):
                 body_handle = gym.find_actor_rigid_body_handle(environment, hand_actor, body_name)
                 if body_handle >= 0:
-                    per_environment_intended.append(
-                        gym.get_actor_rigid_body_index(
-                            environment, hand_actor, body_handle, gymapi.DOMAIN_ENV
-                        )
+                    per_environment_intended[body_name] = gym.get_actor_rigid_body_index(
+                        environment, hand_actor, body_handle, gymapi.DOMAIN_ENV
                     )
-            intended_body_indices.append(set(per_environment_intended))
+            intended_body_indices.append(per_environment_intended)
             environments.append(environment)
             actors.append((hand_actor, object_actor))
 
@@ -354,6 +352,11 @@ def run_validation(request: Dict) -> Dict:
             gym.fetch_results(sim, True)
 
         per_frame = []
+        contact_body_names = tuple(request.get("contact_body_names", ()))
+        required_body_names = tuple(
+            request.get("required_contact_body_names", contact_body_names)
+        )
+        per_link_contact_frames = {name: 0 for name in contact_body_names}
         object_contact_frames = 0
         intended_contact_frames = 0
         maximum_overlap = 0.0
@@ -385,18 +388,26 @@ def run_validation(request: Dict) -> Dict:
                     object_contacts["body1"],
                     object_contacts["body0"],
                 )
-                intended_count = int(np.isin(hand_body, list(intended)).sum())
+                contacted_names = [
+                    name for name, body_index in intended.items()
+                    if bool(np.any(hand_body == body_index))
+                ]
+                intended_count = int(len(contacted_names))
+                for name in contacted_names:
+                    per_link_contact_frames[name] += 1
                 if intended_count:
                     intended_contact_frames += 1
             else:
                 frame_overlap = 0.0
                 frame_force = 0.0
                 intended_count = 0
+                contacted_names = []
             per_frame.append(
                 {
                     "frame": int(frame_id),
                     "object_contact_count": contact_count,
                     "intended_link_contact_count": intended_count,
+                    "contacted_link_names": contacted_names,
                     "maximum_initial_overlap": frame_overlap,
                     "maximum_contact_force": frame_force,
                 }
@@ -407,10 +418,22 @@ def run_validation(request: Dict) -> Dict:
         min_contact_ratio = float(request.get("min_contact_frame_ratio", 0.5))
         max_force_limit = float(request.get("max_contact_force", 1000.0))
         max_overlap_limit = float(request.get("max_initial_overlap", 0.01))
+        per_link_contact_ratios = {
+            name: float(per_link_contact_frames[name] / len(frame_ids))
+            for name in contact_body_names
+        }
+        retained_required_names = [
+            name for name in required_body_names
+            if per_link_contact_ratios.get(name, 0.0) >= min_contact_ratio
+        ]
+        minimum_required_link_count = int(
+            request.get("min_required_link_count", 1)
+        )
         passed = bool(
             finite
             and object_contact_ratio >= min_contact_ratio
             and intended_contact_ratio >= min_contact_ratio
+            and len(retained_required_names) >= minimum_required_link_count
             and maximum_force <= max_force_limit # 控制接触力大小
             and maximum_overlap <= max_overlap_limit 
         )
@@ -427,6 +450,11 @@ def run_validation(request: Dict) -> Dict:
             "object_contact_frame_ratio": object_contact_ratio,
             "intended_link_contact_frame_count": int(intended_contact_frames),
             "intended_link_contact_frame_ratio": intended_contact_ratio,
+            "per_link_contact_frame_count": per_link_contact_frames,
+            "per_link_contact_frame_ratio": per_link_contact_ratios,
+            "required_contact_body_names": list(required_body_names),
+            "retained_required_contact_body_names": retained_required_names,
+            "min_required_link_count": minimum_required_link_count,
             "maximum_initial_overlap": maximum_overlap,
             "maximum_contact_force": maximum_force,
             "all_finite": finite,

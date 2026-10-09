@@ -768,5 +768,315 @@ class ContactTrajectoryRetargetTest(unittest.TestCase):
             self.assertTrue(torch.allclose(data["mano_joints"][name], data["wrist_pos"]))
 
 
+    def test_source_contact_count_sets_sequence_specific_80_percent_gate(self):
+        red = np.stack([np.arange(5) * 0.01, np.zeros(5), np.zeros(5)], axis=1)
+        black = red + np.array([0.0, 0.0, 1.0])
+        tool = MODULE["SemanticTool"](
+            mesh=None,
+            red_points=red,
+            black_points=black,
+            red_tree=cKDTree(red),
+            black_tree=cKDTree(black),
+            red_vertex_count=len(red),
+            black_vertex_count=len(black),
+        )
+        points = np.repeat(red[None], 4, axis=0)
+        points[:, 4, 2] = 0.1
+        settings = MODULE["GeometrySettings"](
+            source_active_frame_ratio=0.3, min_contact_retention_ratio=0.8
+        )
+        intent = MODULE["extract_source_contact_intent"](
+            points, np.arange(5), np.arange(5), tool, settings
+        )
+        self.assertEqual(intent["active_link_count"], 4)
+        self.assertEqual(intent["required_retained_link_count"], 3)
+        self.assertAlmostEqual(intent["dynamic_min_red_link_ratio"], 0.6)
+
+    def test_four_source_fingers_relax_to_three_with_source_relative_retention(self):
+        red = np.stack([np.arange(4) * 0.01, np.zeros(4), np.zeros(4)], axis=1)
+        black = red + np.array([0.0, 0.0, 1.0])
+        tool = MODULE["SemanticTool"](
+            mesh=None,
+            red_points=red,
+            black_points=black,
+            red_tree=cKDTree(red),
+            black_tree=cKDTree(black),
+            red_vertex_count=len(red),
+            black_vertex_count=len(black),
+        )
+        points = np.repeat(red[None], 10, axis=0)
+        points[:, 3, 2] = 0.1
+        settings = MODULE["GeometrySettings"](
+            min_red_link_ratio=0.75,
+            min_red_frame_ratio=0.8,
+            min_contact_retention_ratio=0.8,
+            max_black_violation_fraction=0.02,
+        )
+        metrics = MODULE["contact_geometry_metrics"](
+            points,
+            np.arange(4),
+            np.arange(4),
+            tool,
+            settings,
+            source_active_link_mask=np.ones(4, dtype=bool),
+            source_contact_frame_mask=np.ones((10, 4), dtype=bool),
+        )
+        self.assertEqual(metrics["required_retained_link_count"], 3)
+        self.assertEqual(metrics["retained_source_link_count"], 3)
+        self.assertEqual(
+            metrics["per_link_contact_retention_ratio_summary"],
+            [1.0, 1.0, 1.0, 0.0],
+        )
+        self.assertTrue(MODULE["_is_feasible"](metrics, settings))
+        self.assertFalse(MODULE["_is_fully_contact_feasible"](metrics, settings))
+        self.assertEqual(metrics["contact_retention_level"], "relaxed_80")
+
+    def test_relaxed_gate_accepts_four_of_five_only_after_full_gate_fails(self):
+        red = np.stack([np.arange(5) * 0.01, np.zeros(5), np.zeros(5)], axis=1)
+        black = red + np.array([0.0, 0.0, 1.0])
+        tool = MODULE["SemanticTool"](
+            mesh=None,
+            red_points=red,
+            black_points=black,
+            red_tree=cKDTree(red),
+            black_tree=cKDTree(black),
+            red_vertex_count=len(red),
+            black_vertex_count=len(black),
+        )
+        points = np.repeat(red[None], 5, axis=0)
+        points[:, 4, 2] = 0.1
+        settings = MODULE["GeometrySettings"](
+            min_red_link_ratio=0.8,
+            min_red_frame_ratio=0.8,
+            min_contact_retention_ratio=0.8,
+            max_black_violation_fraction=0.02,
+        )
+        metrics = MODULE["contact_geometry_metrics"](
+            points,
+            np.arange(5),
+            np.arange(5),
+            tool,
+            settings,
+            source_active_link_mask=np.ones(5, dtype=bool),
+        )
+        self.assertTrue(MODULE["_is_feasible"](metrics, settings))
+        self.assertFalse(MODULE["_is_fully_contact_feasible"](metrics, settings))
+        self.assertEqual(metrics["contact_retention_level"], "relaxed_80")
+
+    def test_center_candidate_parser_deduplicates_and_validates_alphas(self):
+        parsed = MODULE["_parse_center_candidate_alphas"]("1,0.75,0.75,0")
+        self.assertEqual(parsed, (1.0, 0.75, 0.0))
+        with self.assertRaises(ValueError):
+            MODULE["_parse_center_candidate_alphas"]("1.1,0")
+        with self.assertRaises(ValueError):
+            MODULE["_parse_center_candidate_alphas"]("")
+
+    def test_center_difference_candidates_select_balanced_feasible_mapping(self):
+        red = np.array([[0.0, 0.0, 0.0]])
+        black = np.array([[10.0, 0.0, 0.0]])
+        tool = MODULE["SemanticTool"](
+            mesh=None,
+            red_points=red,
+            black_points=black,
+            red_tree=cKDTree(red),
+            black_tree=cKDTree(black),
+            red_vertex_count=1,
+            black_vertex_count=1,
+        )
+        settings = MODULE["GeometrySettings"](
+            contact_distance=0.05,
+            black_clearance=0.05,
+            min_red_link_ratio=1.0,
+            min_contact_retention_ratio=0.8,
+            max_black_violation_fraction=0.02,
+        )
+        result = MODULE["evaluate_center_difference_candidates"](
+            np.zeros((2, 1, 3), dtype=np.float64),
+            np.array([0]),
+            np.array([0]),
+            tool,
+            settings,
+            source_red_center=np.zeros(3),
+            source_contact_center=np.array([1.0, 0.0, 0.0]),
+            target_preferred_center=np.zeros(3),
+            source_active_link_mask=np.array([True]),
+            source_contact_frame_mask=np.ones((2, 1), dtype=bool),
+            alphas=(1.0, 0.5, 0.0),
+            preferred_region=None,
+            dedup_distance=0.001,
+        )
+        self.assertEqual(len(result["candidates"]), 3)
+        self.assertEqual(result["direct_feasible_count"], 1)
+        self.assertEqual(result["selected_candidate"]["alpha"], 0.0)
+        self.assertTrue(result["selected_candidate"]["passed"])
+        self.assertTrue(
+            np.allclose(result["selected_candidate"]["delta_tool"], np.zeros(3))
+        )
+
+    def test_center_candidates_deduplicate_nearly_identical_translations(self):
+        red = np.array([[0.0, 0.0, 0.0]])
+        black = np.array([[10.0, 0.0, 0.0]])
+        tool = MODULE["SemanticTool"](
+            mesh=None,
+            red_points=red,
+            black_points=black,
+            red_tree=cKDTree(red),
+            black_tree=cKDTree(black),
+            red_vertex_count=1,
+            black_vertex_count=1,
+        )
+        settings = MODULE["GeometrySettings"](
+            contact_distance=0.05,
+            black_clearance=0.05,
+            min_red_link_ratio=1.0,
+            min_contact_retention_ratio=0.8,
+            max_black_violation_fraction=0.02,
+        )
+        result = MODULE["evaluate_center_difference_candidates"](
+            np.zeros((2, 1, 3), dtype=np.float64),
+            np.array([0]),
+            np.array([0]),
+            tool,
+            settings,
+            source_red_center=np.zeros(3),
+            source_contact_center=np.array([0.0005, 0.0, 0.0]),
+            target_preferred_center=np.zeros(3),
+            source_active_link_mask=np.array([True]),
+            source_contact_frame_mask=np.ones((2, 1), dtype=bool),
+            alphas=(1.0, 0.5, 0.0),
+            preferred_region=None,
+            dedup_distance=0.001,
+        )
+        self.assertEqual(len(result["candidates"]), 1)
+        self.assertEqual(result["candidates"][0]["equivalent_alphas"], [1.0, 0.5, 0.0])
+
+    def test_black_backoff_drops_preferred_constraint_and_selects_first_feasible_sample(self):
+        red = np.array([[0.0, 0.0, 0.0]])
+        black = np.array([[1.0, 0.0, 0.0]])
+        tool = MODULE["SemanticTool"](
+            mesh=None,
+            red_points=red,
+            black_points=black,
+            red_tree=cKDTree(red),
+            black_tree=cKDTree(black),
+            red_vertex_count=1,
+            black_vertex_count=1,
+        )
+        settings = MODULE["GeometrySettings"](
+            contact_distance=0.05,
+            black_clearance=0.05,
+            max_shift=1.0,
+            min_red_link_ratio=1.0,
+        )
+        points = np.zeros((2, 1, 3), dtype=np.float64)
+        delta, report = MODULE["search_contact_backoff_from_black"](
+            points,
+            np.array([0]),
+            np.array([0]),
+            tool,
+            settings,
+            preferred_delta=np.array([1.0, 0.0, 0.0]),
+            away_from_black_direction=np.array([-1.0, 0.0, 0.0]),
+            source_active_link_mask=np.array([True]),
+            source_contact_frame_mask=np.ones((2, 1), dtype=bool),
+            max_backoff_distance=1.0,
+            samples=3,
+        )
+        self.assertTrue(report["passed"])
+        self.assertAlmostEqual(report["selected_distance"], 1.0)
+        self.assertTrue(np.allclose(delta, np.zeros(3)))
+
+    def test_source_and_red_frame_acceptance_use_or_logic(self):
+        settings = MODULE["GeometrySettings"](
+            min_red_frame_ratio=0.8, max_black_violation_fraction=0.02
+        )
+        cases = (
+            (0.9, 0.1, True, "source_contact_frames"),
+            (0.1, 0.9, True, "red_frames"),
+            (0.9, 0.9, True, "both"),
+            (0.1, 0.1, False, "neither"),
+        )
+        for source_ratio, red_ratio, expected, passed_by in cases:
+            with self.subTest(source_ratio=source_ratio, red_ratio=red_ratio):
+                metrics = {
+                    "red_frame_pass_ratio": red_ratio,
+                    "source_red_frame_pass_ratio": source_ratio,
+                    "black_violation_fraction": 0.0,
+                    "relaxed_contact_retention_passed": True,
+                }
+                acceptance = MODULE["_red_frame_acceptance"](metrics, settings)
+                self.assertEqual(acceptance["passed"], expected)
+                self.assertEqual(acceptance["passed_by"], passed_by)
+                self.assertEqual(MODULE["_is_feasible"](metrics, settings), expected)
+
+    def test_preferred_quality_is_diagnostic_not_a_final_feasibility_gate(self):
+        settings = MODULE["GeometrySettings"](
+            min_red_frame_ratio=0.8,
+            min_preferred_frame_ratio=0.7,
+            max_black_violation_fraction=0.02,
+        )
+        metrics = {
+            "red_frame_pass_ratio": 0.9,
+            "source_red_frame_pass_ratio": 0.9,
+            "black_violation_fraction": 0.0,
+            "relaxed_contact_retention_passed": True,
+            "preferred_frame_pass_ratio": 0.0,
+        }
+        self.assertTrue(MODULE["_is_feasible"](metrics, settings))
+
+    def test_reliable_front_band_is_on_black_facing_end_of_red_region(self):
+        red_x = np.linspace(0.0, 0.1, 21)
+        red = np.stack([red_x, np.zeros_like(red_x), np.zeros_like(red_x)], axis=1)
+        black_y = np.linspace(-0.01, 0.01, 5)
+        black = np.stack([np.full_like(black_y, -0.02), black_y, np.zeros_like(black_y)], axis=1)
+        tool = MODULE["SemanticTool"](
+            mesh=None,
+            red_points=red,
+            black_points=black,
+            red_tree=cKDTree(red),
+            black_tree=cKDTree(black),
+            red_vertex_count=len(red),
+            black_vertex_count=len(black),
+        )
+        settings = MODULE["GeometrySettings"](front_semantic_margin=0.0)
+        preferred = MODULE["build_preferred_red_region"](tool, settings)
+        self.assertEqual(preferred.report["method"], "semantic_axis_front_band")
+        self.assertLess(preferred.center[0], np.median(red[:, 0]))
+
+    def test_unreliable_front_direction_falls_back_to_complete_red_region(self):
+        red = np.array([[-0.01, 0.0, 0.0], [0.0, 0.0, 0.0], [0.01, 0.0, 0.0]])
+        black = red.copy()
+        tool = MODULE["SemanticTool"](
+            mesh=None,
+            red_points=red,
+            black_points=black,
+            red_tree=cKDTree(red),
+            black_tree=cKDTree(black),
+            red_vertex_count=len(red),
+            black_vertex_count=len(black),
+        )
+        preferred = MODULE["build_preferred_red_region"](
+            tool, MODULE["GeometrySettings"]()
+        )
+        self.assertEqual(preferred.report["method"], "red_center_fallback")
+        self.assertFalse(preferred.report["reliable_direction"])
+        self.assertTrue(np.allclose(preferred.center, np.median(red, axis=0)))
+
+    def test_contact_se3_rotation_is_norm_bounded_and_parser_exposes_mode(self):
+        maximum = np.deg2rad(5.0)
+        bounded = MODULE["_bounded_rotvec"](np.array([0.2, 0.2, 0.2]), maximum)
+        self.assertLessEqual(np.linalg.norm(bounded), maximum + 1e-12)
+        args = MODULE["build_parser"]().parse_args(
+            ["correct", "--data-idx", "9fc3e", "--new-obj", "spoon_01", "--translation-mode", "contact-se3"]
+        )
+        self.assertEqual(args.translation_mode, "contact-se3")
+        self.assertEqual(args.max_rotation_degrees, 5.0)
+
+    def test_geometrically_valid_pkl_is_saved_even_if_physics_fails(self):
+        self.assertTrue(MODULE["_should_save_corrected_pkl"](True, False))
+        self.assertFalse(MODULE["_should_save_corrected_pkl"](False, False))
+        self.assertTrue(MODULE["_should_save_corrected_pkl"](False, True))
+
+
 if __name__ == "__main__":
     unittest.main()
