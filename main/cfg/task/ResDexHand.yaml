@@ -60,6 +60,25 @@ env:
     blackDistance: 0.01
     blackSmooth: 0.002
 
+  # Independent full-operation evaluation, active only when test=true.
+  # GPU-compatible, force-gated full-RH collision-surface contact proxies.
+  semanticContactEval:
+    enabled: True
+    forceThreshold: 1.0
+    contactDistance: 0.01
+    pointsPerLink: 32
+    envChunkSize: 16
+    minRedContactRatio: 0.90
+    maxBlackContactRatio: 0.05
+    maxBlackViolationFrameRatio: 0.05
+    minContactFrames: 3
+    minPlannedSemanticContactCoverage: 0.80
+    expectedContactDistance: 0.03
+    # Shared operation-ID -> boolean masks or required_intervals. Null first
+    # uses original-tool intent (or legacy grasp interval) in a common corrected
+    # PKL, then tip distances.
+    contactRequiredMaskFile: null
+
   actionScale: 1.0
   useQuatRot: false
 

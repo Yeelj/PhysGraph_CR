@@ -186,6 +186,7 @@ eval*.py
 test*.py
 !tests/test_contact_trajectory_retarget.py
 !tests/test_semantic_contact.py
+!tests/test_semantic_contact_eval.py
 annotator*.py
 make*.py
 

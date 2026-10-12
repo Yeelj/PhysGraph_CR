@@ -152,6 +152,10 @@ We follow the prerequisit of [ManipTrans](https://maniptrans.github.io/) to prep
     semantic AdaLN-Zero, and sparse geometric attention bias, see
     [Stage-1 semantic contact reward and bias](docs/stage1_semantic_contact_reward_bias.md).
 
+    For test-only operation completion, planned semantic contact coverage, and
+    semantic success evaluated from saved checkpoints over the full operation, see
+    [Checkpoint semantic contact evaluation](docs/checkpoint_semantic_contact_evaluation.md).
+
 2. **Training**
   Train bi-manual policies:
     ```bash

@@ -17,6 +17,10 @@ from rl_games.algos_torch.torch_ext import safe_filesystem_op
 import h5py
 
 from lib.utils.tree_utils import stack_sequence_fields, unstack_sequence_fields
+from main.semantic_contact_eval import (
+    format_semantic_episode_summary,
+    summarize_semantic_episodes,
+)
 
 
 def safe_load(filename):
@@ -402,6 +406,8 @@ class MyBasePlayer(object):
         steps = torch.zeros(batch_size, dtype=torch.float32)
 
         done = None
+        semantic_eval_episodes = 0
+        semantic_eval_successes = 0
 
         while True:
 
@@ -496,6 +502,13 @@ class MyBasePlayer(object):
             done_count = len(done_indices)
 
             if done_count > 0:
+                semantic_summary = None
+                if "semantic_contact_eval" in info:
+                    semantic_summary = summarize_semantic_episodes(
+                        info["semantic_contact_eval"], all_done_indices
+                    )
+                    semantic_eval_episodes += semantic_summary["episodes"]
+                    semantic_eval_successes += semantic_summary["semantic_successes"]
                 if self.is_rnn:
                     for s in self.states:
                         s[:, all_done_indices, :] = s[:, all_done_indices, :] * 0.0
@@ -511,7 +524,21 @@ class MyBasePlayer(object):
                 if self.print_stats:
                     cur_rewards_done = cur_rewards / done_count
                     cur_steps_done = cur_steps / done_count
-                    print(f"reward: {cur_rewards_done:.2f} steps: {cur_steps_done:.1f}")
+                    log = f"reward: {cur_rewards_done:.2f} steps: {cur_steps_done:.1f}"
+                    if semantic_summary is not None:
+                        log += format_semantic_episode_summary(semantic_summary)
+                        log += (
+                            f" semantic_sr_total: {semantic_eval_successes / semantic_eval_episodes:.4f}"
+                            f" eval_frames: {semantic_summary['frames']}"
+                            f" complete_episodes: {semantic_summary['complete_episodes']}/{done_count}"
+                            f" no_contact_episodes: {semantic_summary['no_contact_episodes']}"
+                            f" planned_frames: {semantic_summary['planned_frames']}"
+                            f" required_frames: {semantic_summary['planned_required_frames']}"
+                            f" compliant_required_frames: {semantic_summary['compliant_required_frames']}"
+                            f" missing_contact_frames: {semantic_summary['missing_contact_frames']}"
+                            f" unexecuted_required_frames: {semantic_summary['unexecuted_required_frames']}"
+                        )
+                    print(log)
 
     def get_batch_size(self, obses, batch_size):
         obs_shape = self.obs_shape

@@ -16,6 +16,7 @@ from isaacgym import gymapi, gymtorch, gymutil
 from isaacgym.torch_utils import normalize_angle, quat_conjugate, quat_mul
 from copy import deepcopy
 import math
+from pathlib import Path
 from physgraph_envs.lib.envs.dexhands.factory import DexHandFactory
 from main.dataset.factory import ManipDataFactory
 
@@ -40,6 +41,12 @@ from main.dataset.transform import aa_to_quat, aa_to_rotmat, quat_to_rotmat, rot
 from main.new_object_paths import (
     object_asset_cache_key,
     replacement_object_for_side,
+)
+from main.semantic_contact_eval import (
+    CollisionSurfaceContactEvaluator,
+    SemanticContactEpisodeAccumulator,
+    SemanticContactEvalConfig,
+    load_contact_required_masks,
 )
 from torch import Tensor
 from tqdm import tqdm
@@ -156,6 +163,15 @@ class DexHandManipBiHEnv(VecTask):
         self.semantic_black_distance = float(semantic_cfg.get("blackDistance", 0.01))
         self.semantic_black_smooth = float(semantic_cfg.get("blackSmooth", 0.002))
         self._semantic_contact_cache = None
+
+        # Evaluation never enters the policy observation, reward, or training path.
+        self.semantic_contact_eval_config = None
+        self._semantic_eval_detector = None
+        self._semantic_eval_accumulator = None
+        if not self.training:
+            self.semantic_contact_eval_config = SemanticContactEvalConfig.from_mapping(
+                self.cfg["env"].get("semanticContactEval", {})
+            )
 
         assert len(self.dataIndices) == 1 or self.rollout_len is None, "rolloutLen only works with one data"
         assert len(self.dataIndices) == 1 or self.rollout_begin is None, "rolloutBegin only works with one data"
@@ -275,6 +291,8 @@ class DexHandManipBiHEnv(VecTask):
             obj_verts_lh = obj_verts_lh.unsqueeze(0)
         self.obj_bps_lh = self.bps_layer.encode(obj_verts_lh, feature_type=self.bps_feat_type)[self.bps_feat_type]
 
+        self._init_semantic_contact_evaluation()
+
         # Reset all environments
         self.reset_idx(torch.arange(self.num_envs, device=self.device))
 
@@ -297,6 +315,87 @@ class DexHandManipBiHEnv(VecTask):
 
         if self.randomize:
             self.apply_randomizations(self.dr_randomizations)
+
+    def _init_semantic_contact_evaluation(self):
+        eval_cfg = self.semantic_contact_eval_config
+        if eval_cfg is None or not eval_cfg.enabled:
+            return
+        # Reuse the offline, deterministic collision sampler; no FK or RNG is
+        # needed at runtime because Isaac Gym already supplies each body pose.
+        from main.dataset.contact_trajectory_retarget import PROJECT_ROOT, URDFCollisionKinematics
+        from main.contact_retarget_memory import corrected_retarget_path
+
+        geometry = URDFCollisionKinematics(
+            Path(self.dexhand_rh.urdf_path), self.dexhand_rh.dof_names,
+            points_per_link=eval_cfg.points_per_link,
+        )
+        env_ptr = self.envs[0]
+        actor = self.gym.find_actor_handle(env_ptr, "dexhand_r")
+        handles = {
+            name: self.gym.find_actor_rigid_body_handle(env_ptr, actor, name)
+            for name in geometry.link_points
+        }
+        if any(handle < 0 for handle in handles.values()):
+            raise ValueError("A right-hand collision link is missing from the simulation")
+        self._semantic_eval_detector = CollisionSurfaceContactEvaluator(
+            geometry.link_points, handles,
+            self.demo_data_rh["tool_red_points"], self.demo_data_rh["tool_black_points"],
+            self.demo_data_rh["tool_semantic_scale"], eval_cfg,
+        )
+        # Existing success checks operate on frame t with t + 1 + 3 >= length.
+        # Match that normal stopping point instead of penalizing inaccessible
+        # final look-ahead frames. Do not shorten the operation for rolloutLen.
+        length = torch.minimum(
+            self.demo_data_rh["seq_len"], self.demo_data_lh["seq_len"]
+        ).clamp(max=self.max_episode_length)
+        end_frame = (length - 4).clamp_min(0)
+        data_ids = [self.dataIndices[i % len(self.dataIndices)] for i in range(self.num_envs)]
+        reference_pkls = []
+        loaded_paths = self.demo_data_rh.get("retargeted_data_path")
+        for i, data_id in enumerate(data_ids):
+            current = loaded_paths[i] if loaded_paths is not None else None
+            reference = Path(current) if current is not None and self.correct else None
+            # A baseline keeps its own policy reference, but can use the SAME
+            # original-tool contact annotation stored in our canonical PKL.
+            if current is not None and not self.correct and self.new_obj is not None:
+                reference = corrected_retarget_path(
+                    PROJECT_ROOT / "data" / "retargeting_contact",
+                    f"mano2{self.dexhand_rh}", str(data_id),
+                    str(self.demo_data_rh["replacement_obj_id"][i]), Path(current).name,
+                    dataset_name=self.demo_data_rh["dataset_name"][i],
+                )
+            reference_pkls.append(reference)
+        required, required_sources = load_contact_required_masks(
+            data_ids, end_frame, self.demo_data_rh.get("tips_distance"), eval_cfg, reference_pkls
+        )
+        self._semantic_eval_accumulator = SemanticContactEpisodeAccumulator(end_frame, eval_cfg, required)
+        print(
+            "[Semantic contact eval] backend=collision_surface_proxy "
+            "events=force_gated_surface_sample_frames scope=full_dataIndices_operation "
+            f"RH_collision_links={len(geometry.link_points)} "
+            f"samples={len(self._semantic_eval_detector.local_points)} "
+            f"force_threshold={eval_cfg.force_threshold:g} "
+            f"contact_distance={eval_cfg.contact_distance:g} "
+            f"min_red_ratio={eval_cfg.min_red_contact_ratio:g} "
+            f"max_black_ratio={eval_cfg.max_black_contact_ratio:g} "
+            f"max_black_frame_ratio={eval_cfg.max_black_violation_frame_ratio:g} "
+            f"min_contact_frames={eval_cfg.min_contact_frames} "
+            f"min_planned_coverage={eval_cfg.min_planned_semantic_contact_coverage:g}"
+        )
+        for source in sorted(set(required_sources)):
+            print(f"[Semantic contact eval] contact_required_source={source}")
+        if "reference_tips_distance" in required_sources:
+            print(
+                "[Semantic contact eval] No shared source annotation for some operations; "
+                "using checkpoint-reference tip distances. For matched cross-method coverage, "
+                "supply the same task.env.semanticContactEval.contactRequiredMaskFile JSON."
+            )
+        if self.random_state_init or self.rollout_begin not in (None, 0) or self.rollout_len is not None:
+            print(
+                "[Semantic contact eval] Partial/random-start rollouts retain contact metrics, "
+                "but semantic success requires the full operation from frame 0. "
+                "Use randomStateInit=false rolloutBegin=null rolloutLen=null for full evaluation."
+            )
 
     def _create_ground_plane(self):
         plane_params = gymapi.PlaneParams()
@@ -1684,6 +1783,9 @@ class DexHandManipBiHEnv(VecTask):
         self.curr_targets[env_ids] = 0
         self.prev_targets[env_ids] = 0
 
+        if self._semantic_eval_accumulator is not None:
+            self._semantic_eval_accumulator.reset(env_ids)
+
         if self.use_pid_control:
             self.rh_prev_pos_error[env_ids] = 0
             self.rh_prev_rot_error[env_ids] = 0
@@ -1794,6 +1896,8 @@ class DexHandManipBiHEnv(VecTask):
             'diff_joints': diff_joints,
             'diff_ft': diff_ft
         }
+        if self._semantic_eval_accumulator is not None:
+            info["semantic_contact_eval"] = self._semantic_eval_accumulator.snapshot(self.success_buf)
         return obs, rew, done, info
 
     def pre_physics_step(self, actions):
@@ -2081,6 +2185,15 @@ class DexHandManipBiHEnv(VecTask):
 
         self.compute_observations()
         self.compute_reward(self.actions)
+
+        if self._semantic_eval_detector is not None:
+            red, black = self._semantic_eval_detector.detect(
+                self._rigid_body_state, self.net_cf,
+                self.rh_states["manip_obj_pos"], self.rh_states["manip_obj_quat"],
+            )
+            # progress_buf still identifies the reference frame used by reward.
+            # Include terminal contacts before incrementing progress or resetting.
+            self._semantic_eval_accumulator.update(red, black, self.progress_buf)
 
         self.progress_buf += 1
         self.running_progress_buf += 1
