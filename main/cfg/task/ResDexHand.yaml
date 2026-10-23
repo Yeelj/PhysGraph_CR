@@ -8,6 +8,7 @@ seed: ${..seed}
 env:
   numEnvs: ${resolve_default:8192,${...num_envs}}
   dexhand: ${...dexhand}
+  policyMode: ${...policy_mode}
 
   episodeLength: 1200
   training: ${if:${...test},False,True}

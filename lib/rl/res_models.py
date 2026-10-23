@@ -36,6 +36,9 @@ class ModelA2CContinuousLogStdBiH(BaseModel):
             # AdaLN-Zero. Newly introduced modules start from their current
             # initialization (AdaLN projections are exactly zero initialized).
             state_dict = dict(state_dict)
+            # Validate embodiment even when action shapes happen to match
+            # (Artimano and Shadow), before copying any policy parameters.
+            self.a2c_network.prepare_checkpoint_state_dict(state_dict, "a2c_network.")
             compatible_new_key_fragments = (
                 "semantic_condition_encoder.",
                 ".semantic_adaln.",

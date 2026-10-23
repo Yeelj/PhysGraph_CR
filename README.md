@@ -157,6 +157,10 @@ We follow the prerequisit of [ManipTrans](https://maniptrans.github.io/) to prep
     [Checkpoint semantic contact evaluation](docs/checkpoint_semantic_contact_evaluation.md).
 
 2. **Training**
+  Artimano, Allegro, Inspire and Shadow share the direct-action Transformer;
+  each hand uses its own retarget trajectories and PPO checkpoint. No pretrained
+  single-hand imitator is required. See [four-hand direct-policy setup](docs/multi_hand_direct_policy.md).
+
   Train bi-manual policies:
     ```bash
     python main/rl/train.py task=ResDexHand dexhand=artimano side=BiH headless=true num_envs=4096 learning_rate=2e-4 test=false randomStateInit=true dataIndices=[083f7@0] early_stop_epochs=10000 actionsMovingAverage=0.4 experiment=083f7@0_artimano

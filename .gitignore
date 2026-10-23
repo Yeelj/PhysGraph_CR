@@ -143,6 +143,9 @@ command.sh
 data
 data/*
 
+.review
+docs
+
 tmp
 tmp/*
 
@@ -187,6 +190,10 @@ test*.py
 !tests/test_contact_trajectory_retarget.py
 !tests/test_semantic_contact.py
 !tests/test_semantic_contact_eval.py
+!tests/test_dexhand_spec.py
+!tests/test_multi_hand_policy.py
+!tests/test_multi_hand_environment.py
+!tests/test_retarget_metadata.py
 annotator*.py
 make*.py
 

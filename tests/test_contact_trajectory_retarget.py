@@ -1,6 +1,7 @@
 import runpy
 import hashlib
 import os
+import pickle
 import sys
 import tempfile
 import types
@@ -14,6 +15,7 @@ from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 from main.new_object_paths import object_asset_cache_key, replacement_object_for_side
 from main.contact_retarget_memory import corrected_retarget_path, right_hand_retarget_path
+from main.dexhand_spec import get_hand_spec
 
 
 MODULE = runpy.run_path(
@@ -493,6 +495,64 @@ class ContactTrajectoryRetargetTest(unittest.TestCase):
         self.assertEqual(points.shape[1], 3)
         self.assertGreaterEqual(len(model.link_points), len(hand.contact_body_names))
         self.assertTrue(np.isfinite(points).all())
+
+    def test_offline_specs_match_exported_order_and_count_real_contact_links(self):
+        for hand_name in ("artimano", "allegro", "inspire", "shadow"):
+            for side in ("right", "left"):
+                with self.subTest(hand=hand_name, side=side):
+                    hand = MODULE["_resolve_dexhand"](hand_name, side)
+                    spec = get_hand_spec(hand_name, side)
+                    self.assertEqual(hand.dof_names, spec.dof_names)
+                    self.assertEqual(len(hand.contact_body_names), 4 if hand_name == "allegro" else 5)
+                    model = MODULE["URDFCollisionKinematics"](
+                        hand.urdf_path, hand.dof_names, points_per_link=4
+                    )
+                    contact_ids = MODULE["_contact_link_ids"](model, hand.contact_body_names)
+                    self.assertEqual(len(contact_ids), len(set(contact_ids)))
+                    points = model.root_frame_surface_points(np.zeros(len(hand.dof_names)))
+                    self.assertTrue(np.isfinite(points).all())
+
+    def test_dataset_reorders_named_dofs_before_computing_velocity(self):
+        base_module = load_base_module_without_training_dependencies()
+
+        class TestManipData(base_module["ManipData"]):
+            def __getitem__(self, index):
+                raise NotImplementedError
+
+        spec = get_hand_spec("inspire", "right")
+        dataset = object.__new__(TestManipData)
+        dataset.dexhand = types.SimpleNamespace(
+            name="inspire", side="rh", dof_names=spec.dof_names, n_dofs=spec.n_dofs
+        )
+        dataset.device = "cpu"
+        dataset.output_fps = 60
+        dataset.max_seq_len = 100
+        dataset.verbose = False
+        length = 5
+        canonical_q = np.arange(length, dtype=np.float32)[:, None] * np.arange(
+            1, spec.n_dofs + 1, dtype=np.float32
+        )[None]
+        payload = {
+            "dexhand": "inspire",
+            "side": "right",
+            "dof_names": list(reversed(spec.dof_names)),
+            "opt_wrist_pos": np.zeros((length, 3), dtype=np.float32),
+            "opt_wrist_rot": np.zeros((length, 3), dtype=np.float32),
+            "opt_dof_pos": canonical_q[:, ::-1],
+        }
+        data = {"obj_trajectory": torch.eye(4).repeat(length, 1, 1)}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "trajectory.pkl"
+            with path.open("wb") as stream:
+                pickle.dump(payload, stream)
+            dataset.load_retargeted_data(data, path)
+        np.testing.assert_array_equal(data["opt_dof_pos"].numpy(), canonical_q)
+        expected_velocity = np.broadcast_to(
+            np.arange(1, spec.n_dofs + 1, dtype=np.float32)[None] * 60,
+            (length, spec.n_dofs),
+        )
+        np.testing.assert_allclose(data["opt_dof_velocity"].numpy(), expected_velocity, atol=1e-4)
+        self.assertEqual(data["opt_dof_names"], list(spec.dof_names))
 
     def test_correct_command_recomputes_without_overwrite_flag(self):
         args = MODULE["build_parser"]().parse_args(

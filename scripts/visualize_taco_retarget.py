@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Replay a bimanual TACO retargeting result in an Isaac Gym viewer.
+"""Replay bimanual TACO or OakInk-V2 retargeting results in Isaac Gym.
 
 The retargeting pickle contains only dexterous-hand states.  Object assets,
 object trajectories, and the source-to-Gym transform are intentionally loaded
-through ``TacoDatasetDexHand`` so this viewer uses exactly the same data path as
-training.
+through the corresponding ``ManipDataFactory`` datasets so this viewer uses
+the same data path as training.
 """
 
 import os
@@ -36,23 +36,38 @@ TABLE_HEIGHT = 0.03
 TABLE_POSITION = (-TABLE_WIDTH_OFFSET / 2, 0.0, 0.4)
 TABLE_SURFACE_Z = TABLE_POSITION[2] + TABLE_HEIGHT / 2
 REQUIRED_RETARGET_KEYS = ("opt_wrist_pos", "opt_wrist_rot", "opt_dof_pos")
+DATASET_NAMES = {"taco": "TACO", "oakink2": "OakInk-v2"}
 
 
-def _retarget_path(dexhand, data_idx: str) -> Path:
-    return PROJECT_ROOT / "data" / "retargeting" / "TACO" / f"mano2{dexhand}" / f"{data_idx}.pkl"
+def _retarget_path(
+    dexhand, data_idx: str, dataset_name: str = "TACO", *, filename: Optional[str] = None
+) -> Path:
+    return (
+        PROJECT_ROOT / "data" / "retargeting" / dataset_name / f"mano2{dexhand}"
+        / (filename if filename is not None else f"{data_idx}.pkl")
+    )
 
 
-def _right_retarget_path(dexhand, data_idx: str, new_obj: Optional[str], correct: bool):
-    normalized_new_obj = None if new_obj is None else normalize_taco_object_id(new_obj)
+def _right_retarget_path(
+    dexhand,
+    data_idx: str,
+    new_obj: Optional[str],
+    correct: bool,
+    *,
+    dataset_name: str = "TACO",
+    filename: Optional[str] = None,
+):
+    if new_obj is not None and dataset_name == "TACO":
+        new_obj = normalize_taco_object_id(new_obj)
     return right_hand_retarget_path(
         PROJECT_ROOT / "data" / "retargeting",
         PROJECT_ROOT / "data" / "retargeting_contact",
         f"mano2{dexhand}",
         data_idx,
-        normalized_new_obj,
-        f"{data_idx}.pkl",
+        new_obj,
+        filename if filename is not None else f"{data_idx}.pkl",
         correct=correct,
-        dataset_name="TACO",
+        dataset_name=dataset_name,
     )
 
 
@@ -111,7 +126,9 @@ def _mujoco_to_gym_transform(device: torch.device) -> torch.Tensor:
     return torch.as_tensor(transform, dtype=torch.float32, device=device)
 
 
-def _validate_loaded_data(data, side: str, frame_count: int, expected_dofs: int) -> None:
+def _validate_loaded_data(
+    data, side: str, frame_count: int, expected_dofs: int, dataset_name: str = "TACO"
+) -> None:
     expected_shapes = {
         "opt_wrist_pos": (frame_count, 3),
         "opt_wrist_rot": (frame_count, 3),
@@ -120,14 +137,14 @@ def _validate_loaded_data(data, side: str, frame_count: int, expected_dofs: int)
     }
     for key, expected_shape in expected_shapes.items():
         if key not in data:
-            raise KeyError(f"The {side}-hand TACO sample is missing {key!r}")
+            raise KeyError(f"The {side}-hand {dataset_name} sample is missing {key!r}")
         if tuple(data[key].shape) != expected_shape:
             raise ValueError(
-                f"The {side}-hand TACO sample has {key}.shape={tuple(data[key].shape)}, "
+                f"The {side}-hand {dataset_name} sample has {key}.shape={tuple(data[key].shape)}, "
                 f"expected {expected_shape}"
             )
         if not torch.isfinite(data[key]).all().item():
-            raise ValueError(f"The {side}-hand TACO sample has NaN or Inf in {key}")
+            raise ValueError(f"The {side}-hand {dataset_name} sample has NaN or Inf in {key}")
 
     urdf_path = Path(data["obj_urdf_path"])
     if not urdf_path.is_file():
@@ -137,26 +154,25 @@ def _validate_loaded_data(data, side: str, frame_count: int, expected_dofs: int)
 def _load_replay_data(args, device, dexhand_rh, dexhand_lh):
     if not args.data_idx:
         raise ValueError("--data_idx is required")
-    if ManipDataFactory.dataset_type(args.data_idx) != "taco":
-        raise ValueError(f"Expected a compact TACO sequence ID, got {args.data_idx!r}")
+    dataset_type = ManipDataFactory.dataset_type(args.data_idx)
+    if dataset_type not in DATASET_NAMES:
+        raise ValueError(
+            "Expected a TACO sequence ID (e.g. db_teapot_0930049) or an "
+            f"OakInk-V2 sequence ID (e.g. 083f7@0), got {args.data_idx!r}"
+        )
+    dataset_name = DATASET_NAMES[dataset_type]
+    data_idx = args.data_idx
+    if dataset_type == "oakink2":
+        parts = data_idx.split("@")
+        if len(parts) != 2 or len(parts[0]) != 5 or not parts[1].isdigit():
+            raise ValueError(f"Expected an OakInk-V2 ID in hash@stage form, e.g. 083f7@0, got {data_idx!r}")
+        sequence_hash, stage_text = parts
+        stage = int(stage_text)
+        data_idx = f"{sequence_hash}@{stage}"
+    if args.correct and not args.new_obj:
+        raise ValueError("--correct requires --new_obj to select the right-hand corrected trajectory")
 
-    rh_pickle, rh_retarget_kind = _right_retarget_path(
-        dexhand_rh,
-        args.data_idx,
-        args.new_obj or None,
-        args.correct,
-    )
-    lh_pickle = _retarget_path(dexhand_lh, args.data_idx)
-    rh_retarget, rh_frames = _load_and_validate_pickle(
-        rh_pickle,
-        dexhand_rh.n_dofs,
-        rh_retarget_kind,
-    )
-    lh_retarget, lh_frames = _load_and_validate_pickle(lh_pickle, dexhand_lh.n_dofs)
-    if rh_frames != lh_frames:
-        raise ValueError(f"Right/left retarget frame mismatch: {rh_frames} vs {lh_frames}")
-
-    data_dir = Path(args.data_dir)
+    data_dir = Path(args.data_dir) if args.data_dir else PROJECT_ROOT / "data" / dataset_name
     if not data_dir.is_absolute():
         data_dir = PROJECT_ROOT / data_dir
     transform = _mujoco_to_gym_transform(device)
@@ -167,42 +183,72 @@ def _load_replay_data(args, device, dexhand_rh, dexhand_lh):
         "dexhand": None,
         "verbose": False,
     }
+    rh_kwargs = {
+        **common_kwargs,
+        "dexhand": dexhand_rh,
+        "new_obj": args.new_obj or None,
+        "correct": args.correct,
+    }
+    if dataset_type == "oakink2":
+        rh_kwargs["load_tool_semantics"] = False
     rh_dataset = ManipDataFactory.create_data(
-        manipdata_type="taco",
+        manipdata_type=dataset_type,
         side="right",
-        **{
-            **common_kwargs,
-            "dexhand": dexhand_rh,
-            "new_obj": args.new_obj or None,
-            "correct": args.correct,
-        },
+        **rh_kwargs,
     )
     lh_dataset = ManipDataFactory.create_data(
-        manipdata_type="taco",
+        manipdata_type=dataset_type,
         side="left",
         **{**common_kwargs, "dexhand": dexhand_lh},
     )
-    rh_data = rh_dataset[args.data_idx]
-    lh_data = lh_dataset[args.data_idx]
-    # Use the already validated files directly. This also avoids depending on
-    # the caller's current working directory; the dataset's legacy PKL lookup
-    # is relative to the repository root.
+    if dataset_type == "oakink2":
+        # OakInk PKLs use the full annotation filename, while the dataset and
+        # corrected-trajectory directory use the compact hash@stage ID.
+        if sequence_hash not in rh_dataset.seq_hashes:
+            raise ValueError(f"OakInk-V2 sequence hash {sequence_hash!r} not found under {data_dir}")
+        annotation_path = Path(rh_dataset.data_pathes[rh_dataset.seq_hashes[sequence_hash]])
+        filename = f"{annotation_path.stem}@{stage}.pkl"
+    else:
+        filename = f"{data_idx}.pkl"
+    rh_pickle, rh_retarget_kind = _right_retarget_path(
+        dexhand_rh,
+        data_idx,
+        args.new_obj or None,
+        args.correct,
+        dataset_name=dataset_name,
+        filename=filename,
+    )
+    lh_pickle = _retarget_path(dexhand_lh, data_idx, dataset_name, filename=filename)
+    rh_retarget, rh_frames = _load_and_validate_pickle(
+        rh_pickle, dexhand_rh.n_dofs, rh_retarget_kind
+    )
+    lh_retarget, lh_frames = _load_and_validate_pickle(lh_pickle, dexhand_lh.n_dofs)
+    if rh_frames != lh_frames:
+        raise ValueError(f"Right/left retarget frame mismatch: {rh_frames} vs {lh_frames}")
+
+    rh_data = rh_dataset[data_idx]
+    lh_data = lh_dataset[data_idx]
+    # Replay the selected, validated PKLs directly. Dataset loading above also
+    # preserves the training-time checks for corrected trajectories and meshes.
     for key in REQUIRED_RETARGET_KEYS:
         rh_data[key] = torch.as_tensor(rh_retarget[key], dtype=torch.float32, device=device)
         lh_data[key] = torch.as_tensor(lh_retarget[key], dtype=torch.float32, device=device)
-    _validate_loaded_data(rh_data, "right", rh_frames, dexhand_rh.n_dofs)
-    _validate_loaded_data(lh_data, "left", lh_frames, dexhand_lh.n_dofs)
+    _validate_loaded_data(rh_data, "right", rh_frames, dexhand_rh.n_dofs, dataset_name)
+    _validate_loaded_data(lh_data, "left", lh_frames, dexhand_lh.n_dofs, dataset_name)
 
-    print(f"Sequence: {args.data_idx}")
+    print(f"Dataset: {dataset_name}")
+    print(f"Sequence: {data_idx}")
     print(f"Frames: {rh_frames} at {args.playback_fps:g} FPS")
     print(f"Right retarget ({rh_retarget_kind}): {rh_pickle}")
     print(f"Left retarget:  {lh_pickle}")
-    print(f"Right tool: {rh_data['obj_id']} ({rh_data['obj_urdf_path']})")
+    print(f"Right tool: {rh_data.get('selected_obj_id', rh_data['obj_id'])} ({rh_data['obj_urdf_path']})")
     print(f"Left target: {lh_data['obj_id']} ({lh_data['obj_urdf_path']})")
     return rh_data, lh_data, rh_frames
 
 
 class TacoRetargetViewer:
+    """Shared viewer for TACO and OakInk-V2; keep the original public name."""
+
     def __init__(self, args):
         if args.physics_engine != gymapi.SIM_PHYSX:
             raise ValueError("This viewer supports the PhysX backend only")
@@ -478,13 +524,13 @@ class TacoRetargetViewer:
 
 def parse_args():
     return gymutil.parse_arguments(
-        description="Replay bimanual TACO retargeting results in Isaac Gym",
+        description="Replay bimanual TACO or OakInk-V2 retargeting results in Isaac Gym",
         headless=False,
         custom_parameters=[
             {
                 "name": "--data_idx",
                 "type": str,
-                "help": "Compact TACO sequence ID, e.g. db_teapot_0930049",
+                "help": "Sequence ID: TACO db_teapot_0930049 or OakInk-V2 083f7@0 (auto-detected)",
             },
             {
                 "name": "--dexhand",
@@ -495,14 +541,14 @@ def parse_args():
             {
                 "name": "--data_dir",
                 "type": str,
-                "default": "data/TACO",
-                "help": "TACO dataset root",
+                "default": None,
+                "help": "Dataset root (default: data/TACO or data/OakInk-v2, selected from --data_idx)",
             },
             {
                 "name": "--new_obj",
                 "type": str,
                 "default": "",
-                "help": "Optional three-digit replacement ID for the right-hand tool mesh",
+                "help": "Right-hand tool replacement: TACO object ID (004) or OakInk-V2 new_obj name (kni@2)",
             },
             {
                 "name": "--correct",

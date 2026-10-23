@@ -11,6 +11,7 @@ from torch.utils.data import Dataset
 from pytorch3d.ops import sample_points_from_meshes
 from termcolor import cprint
 import pickle
+from main.retarget_metadata import normalize_retarget_data
 
 
 def _contact_retarget_validation_tiers_passed(metadata):
@@ -410,6 +411,10 @@ class ManipData(Dataset, ABC):
             data["joints_distance"] = data["joints_distance"][: self.max_seq_len]
 
     def load_retargeted_data(self, data, retargeted_data_path, *, expected_kind=None):
+        hand_name = getattr(self.dexhand, "name", None)
+        canonical_names = getattr(self.dexhand, "dof_names", None)
+        if hand_name in {"artimano", "allegro", "inspire", "shadow"} and canonical_names is not None:
+            data["opt_dof_names"] = list(canonical_names)
         if not os.path.exists(retargeted_data_path):
             if expected_kind is not None:
                 raise FileNotFoundError(
@@ -432,6 +437,17 @@ class ManipData(Dataset, ABC):
         else:
             with open(retargeted_data_path, "rb") as stream:
                 opt_params = pickle.load(stream)
+            if hand_name in {"artimano", "allegro", "inspire", "shadow"}:
+                opt_params = normalize_retarget_data(
+                    opt_params,
+                    hand_name,
+                    self.dexhand.side,
+                    source_path=retargeted_data_path,
+                    target_dof_names=canonical_names,
+                )
+                # Kept as names, not a trajectory tensor. The environment uses
+                # this canonical DOF order at its simulator boundary as well.
+                data["opt_dof_names"] = list(opt_params["dof_names"])
             contact_metadata = opt_params.get("contact_retarget")
             retargeting_kind = _validate_retargeting_source(
                 contact_metadata, retargeted_data_path, expected_kind

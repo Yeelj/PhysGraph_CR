@@ -27,7 +27,7 @@ import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -74,6 +74,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from main.new_object_paths import resolve_new_object_assets
+from main.dexhand_spec import get_hand_spec
+from main.retarget_metadata import normalize_retarget_data
 from main.contact_retarget_memory import (
     bank_sequence_dir,
     build_mesh_descriptor,
@@ -2301,111 +2303,21 @@ class OfflineHandSpec:
         return f"{self.name}_{'rh' if self.side == 'right' else 'lh'}"
 
 
-def _urdf_actuated_joint_names(urdf_path: Path) -> Tuple[str, ...]:
-    root = ET.parse(urdf_path).getroot()
-    result = []
-    for joint in root.findall("joint"):
-        if joint.attrib.get("type", "fixed") in ("fixed", "floating"):
-            continue
-        # Mimic joints are functions of an actuated joint and do not consume a
-        # column in the project's opt_dof_pos arrays.
-        if joint.find("mimic") is not None:
-            continue
-        result.append(joint.attrib["name"])
-    return tuple(result)
-
-
 def _resolve_dexhand(name: str, side: str) -> OfflineHandSpec:
     """Resolve hand metadata without importing Isaac/PyTorch dataset modules."""
 
-    suffix = "right" if side == "right" else "left"
-    urdf_relpaths = {
-        ("artimano", "right"): "physgraph_envs/assets/mano_urdf/rh_mano.urdf",
-        ("artimano", "left"): "physgraph_envs/assets/mano_urdf/lh_mano.urdf",
-        ("inspire", "right"): "physgraph_envs/assets/inspire_hand/inspire_hand_right.urdf",
-        ("inspire", "left"): "physgraph_envs/assets/inspire_hand/inspire_hand_left.urdf",
-        ("allegro", "right"): "physgraph_envs/assets/allegro_hand/allegro_hand_right.urdf",
-        ("allegro", "left"): "physgraph_envs/assets/allegro_hand/allegro_hand_left.urdf",
-        ("shadow", "right"): "physgraph_envs/assets/shadow_hand/shadow_hand_right_woarm.urdf",
-        ("shadow", "left"): "physgraph_envs/assets/shadow_hand/shadow_hand_left_woarm.urdf",
-    }
-    artimano_dofs = (
-        "j_index1y", "j_index1z", "j_index2", "j_index3",
-        "j_middle1y", "j_middle1z", "j_middle2", "j_middle3",
-        "j_pinky1y", "j_pinky1z", "j_pinky2", "j_pinky3",
-        "j_ring1y", "j_ring1z", "j_ring2", "j_ring3",
-        "j_thumb1x", "j_thumb1y", "j_thumb1z", "j_thumb2y", "j_thumb2z", "j_thumb3",
-    )
-    inspire_base_dofs = (
-        "thumb_proximal_yaw_joint", "thumb_proximal_pitch_joint",
-        "index_proximal_joint", "index_intermediate_joint",
-        "middle_proximal_joint", "middle_intermediate_joint",
-        "pinky_proximal_joint", "pinky_intermediate_joint",
-        "ring_proximal_joint", "ring_intermediate_joint",
-        "thumb_intermediate_joint", "thumb_distal_joint",
-    )
-    allegro_dofs = (
-        "joint_0.0", "joint_1.0", "joint_2.0", "joint_3.0",
-        "joint_12.0", "joint_13.0", "joint_14.0", "joint_15.0",
-        "joint_4.0", "joint_5.0", "joint_6.0", "joint_7.0",
-        "joint_8.0", "joint_9.0", "joint_10.0", "joint_11.0",
-    )
-    shadow_dofs = (
-        "FFJ4", "FFJ3", "FFJ2", "FFJ1",
-        "LFJ5", "LFJ4", "LFJ3", "LFJ2", "LFJ1",
-        "MFJ4", "MFJ3", "MFJ2", "MFJ1",
-        "RFJ4", "RFJ3", "RFJ2", "RFJ1",
-        "THJ5", "THJ4", "THJ3", "THJ2", "THJ1",
-    )
-    dof_names = {
-        ("artimano", "right"): artimano_dofs,
-        ("artimano", "left"): artimano_dofs,
-        ("inspire", "right"): tuple("R_" + value for value in inspire_base_dofs),
-        ("inspire", "left"): tuple("L_" + value for value in inspire_base_dofs),
-        ("allegro", "right"): allegro_dofs,
-        ("allegro", "left"): allegro_dofs,
-        ("shadow", "right"): shadow_dofs,
-        ("shadow", "left"): shadow_dofs,
-    }
-    contact_names = {
-        ("artimano", "right"): ("thumb3", "index3", "middle3", "ring3", "pinky3"),
-        ("artimano", "left"): ("thumb3", "index3", "middle3", "ring3", "pinky3"),
-        ("inspire", "right"): (
-            "R_thumb_distal",
-            "R_index_intermediate",
-            "R_middle_intermediate",
-            "R_ring_intermediate",
-            "R_pinky_intermediate",
-        ),
-        ("inspire", "left"): (
-            "L_thumb_distal",
-            "L_index_intermediate",
-            "L_middle_intermediate",
-            "L_ring_intermediate",
-            "L_pinky_intermediate",
-        ),
-        ("allegro", "right"): ("link_15.0", "link_3.0", "link_7.0", "link_11.0"),
-        ("allegro", "left"): ("link_15.0", "link_11.0", "link_7.0", "link_3.0"),
-        ("shadow", "right"): ("thdistal", "ffdistal", "mfdistal", "rfdistal", "lfdistal"),
-        ("shadow", "left"): ("thdistal", "ffdistal", "mfdistal", "rfdistal", "lfdistal"),
-    }
-    key = (name.lower(), suffix)
-    if key not in urdf_relpaths:
-        raise ValueError(f"Unsupported offline dex hand {name!r}/{side!r}")
-    urdf_path = (PROJECT_ROOT / urdf_relpaths[key]).resolve()
+    spec = get_hand_spec(name, side)
+    urdf_path = Path(spec.urdf_path).resolve()
     if not urdf_path.exists():
         raise FileNotFoundError(f"Dex-hand URDF does not exist: {urdf_path}")
-    default_contacts = contact_names.get(key)
-    if default_contacts is None:
-        raise ValueError(
-            f"{name}/{side} requires explicit contact-link metadata; add it to _resolve_dexhand before use"
-        )
     return OfflineHandSpec(
-        name=name.lower(),
-        side=side,
+        name=spec.name,
+        side="right" if spec.side in {"right", "rh"} else "left",
         urdf_path=urdf_path,
-        dof_names=dof_names.get(key, _urdf_actuated_joint_names(urdf_path)),
-        contact_body_names=default_contacts,
+        dof_names=tuple(spec.dof_names),
+        # Canonical policy slots can share a real finger (Allegro ring/pinky).
+        # Geometry metrics count actual collision links, not duplicate slots.
+        contact_body_names=tuple(dict.fromkeys(spec.contact_body_names)),
     )
 
 
@@ -2906,15 +2818,17 @@ def run_correction(args: argparse.Namespace) -> Dict[str, object]:
         raise ValueError(
             f"Input is already contact-corrected: {input_path}. Use its original source PKL instead."
         )
+    source = normalize_retarget_data(
+        source, args.dexhand, args.side, source_path=input_path
+    )
+    # Preserve the original PKL's column order throughout correction and its
+    # rigid-transform invariants. FK uses the recorded names for those columns.
+    hand = replace(hand, dof_names=tuple(source["dof_names"]))
     length = len(source["opt_wrist_pos"])
     if len(context.object_trajectory) != length:
         raise ValueError(
             f"Object trajectory length {len(context.object_trajectory)} != retarget PKL length {length}. "
             "Check --skip, data index, and source PKL."
-        )
-    if np.asarray(source["opt_dof_pos"]).shape[1] != len(hand.dof_names):
-        raise ValueError(
-            f"PKL DOF count {np.asarray(source['opt_dof_pos']).shape[1]} != {hand} DOF count {len(hand.dof_names)}"
         )
     kinematics = URDFCollisionKinematics(
         Path(hand.urdf_path), hand.dof_names, points_per_link=args.points_per_link
@@ -4056,6 +3970,14 @@ def run_verification(args: argparse.Namespace) -> Dict[str, object]:
     mesh_path = context.mesh_path
     collision_urdf_path = context.collision_urdf_path
     hand = _resolve_dexhand(dexhand_name, side)
+    source = normalize_retarget_data(
+        source, dexhand_name, side, source_path=source_path
+    )
+    corrected = normalize_retarget_data(
+        corrected, dexhand_name, side, source_path=corrected_path,
+        target_dof_names=source["dof_names"],
+    )
+    hand = replace(hand, dof_names=tuple(source["dof_names"]))
     model = URDFCollisionKinematics(Path(hand.urdf_path), hand.dof_names, args.points_per_link)
     source_tool = load_semantic_tool(context.source_mesh_path, label="old/source")
     tool = load_semantic_tool(mesh_path, label="new/target")

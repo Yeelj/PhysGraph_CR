@@ -12,8 +12,12 @@ experiment: ''
 side: 'Local'
 bimanual_mode: united
 dexhand: inspire
-rh_base_model_checkpoint: assets/imitator_rh_inspire.pth
-lh_base_model_checkpoint: assets/imitator_lh_inspire.pth
+# The bimanual Transformer predicts complete actions; no base imitator is loaded.
+policy_mode: direct
+compile_encoder: true
+# Retained as CLI compatibility fields; unused by policy_mode=direct.
+rh_base_model_checkpoint: null
+lh_base_model_checkpoint: null
 
 # if set to positive integer, overrides the default number of environments
 num_envs: ''

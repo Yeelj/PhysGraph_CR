@@ -77,6 +77,15 @@ def launch_rlg_hydra(cfg: DictConfig):
     import os
     from datetime import datetime
 
+    if str(cfg.task.name).startswith("ResDexHand"):
+        from main.dexhand_runtime import validate_direct_control
+        from main.dexhand_spec import get_hand_spec
+
+        get_hand_spec(cfg.dexhand)
+        validate_direct_control(cfg.task.env)
+        if cfg.side != "BiH":
+            raise ValueError("The direct Transformer requires side=BiH")
+
     import isaacgym
     from hydra.utils import to_absolute_path
 

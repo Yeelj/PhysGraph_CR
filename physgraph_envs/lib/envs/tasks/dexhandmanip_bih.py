@@ -19,6 +19,8 @@ import math
 from pathlib import Path
 from physgraph_envs.lib.envs.dexhands.factory import DexHandFactory
 from main.dataset.factory import ManipDataFactory
+from main.dexhand_spec import ObservationLayout, get_hand_spec
+from main.dexhand_runtime import joint_order_indices, validate_direct_control
 
 # from main.dataset.favor_dataset_dexhand import FavorDatasetDexHand
 from main.dataset.oakink2_dataset_dexhand_lh import OakInk2DatasetDexHandLH
@@ -78,6 +80,14 @@ class DexHandManipBiHEnv(VecTask):
     ):
         self._record = record
         self.cfg = cfg
+        validate_direct_control(self.cfg["env"])
+        self.hand_specs = {
+            side: get_hand_spec(self.cfg["env"]["dexhand"], side)
+            for side in ("rh", "lh")
+        }
+        self.observation_layout = ObservationLayout(
+            self.hand_specs["rh"], self.cfg["env"]["obsFutureLength"]
+        )
 
         use_quat_rot = self.use_quat_rot = self.cfg["env"]["useQuatRot"]
         self.max_episode_length = self.cfg["env"]["episodeLength"]
@@ -86,6 +96,11 @@ class DexHandManipBiHEnv(VecTask):
         self.training = self.cfg["env"]["training"]
         self.dexhand_rh = DexHandFactory.create_hand(self.cfg["env"]["dexhand"], "right")
         self.dexhand_lh = DexHandFactory.create_hand(self.cfg["env"]["dexhand"], "left")
+        for side, hand in (("rh", self.dexhand_rh), ("lh", self.dexhand_lh)):
+            spec = self.hand_specs[side]
+            for field in ("dof_names", "body_names", "contact_body_names"):
+                if tuple(getattr(hand, field)) != tuple(getattr(spec, field)):
+                    raise ValueError(f"{spec.name}/{side} {field} disagrees with the policy specification")
         self._mano_joint_marker_geometries = None
         if not headless:
             self._mano_joint_marker_geometries = {
@@ -205,29 +220,7 @@ class DexHandManipBiHEnv(VecTask):
             record=record,
             headless=headless,
         )
-        TARGET_OBS_DIM = (
-            128
-            + 5
-            + (
-                3
-                + 3
-                + 3
-                + 4
-                + 4
-                + 3
-                + 3
-                + (self.dexhand_rh.n_bodies - 1) * 9
-                + 3
-                + 3
-                + 3
-                + 4
-                + 4
-                + 3
-                + 3
-                + self.dexhand_rh.n_bodies
-            )
-            * self.obs_future_length
-        ) * 2
+        TARGET_OBS_DIM = 2 * self.observation_layout.target_dim
         self.obs_dict.update(
             {
                 "target": torch.zeros((self.num_envs, TARGET_OBS_DIM), device=self.device),
@@ -239,7 +232,7 @@ class DexHandManipBiHEnv(VecTask):
             high=np.inf,
             shape=(TARGET_OBS_DIM,),
         )
-        # Match ManoTopology order: RH bodies, LH bodies, Tool (RH object), Object (LH object).
+        # Match the topology's named body order, independently of Gym actor order.
         num_phys_nodes = self.dexhand_rh.n_bodies + self.dexhand_lh.n_bodies + 2
         self.obs_dict["phys_node_pos"] = torch.zeros(
             (self.num_envs, num_phys_nodes, 3), device=self.device
@@ -476,6 +469,8 @@ class DexHandManipBiHEnv(VecTask):
         asset_options.use_mesh_materials = True
         dexhand_rh_asset = self.gym.load_asset(self.sim, *os.path.split(dexhand_rh_asset_file), asset_options)
         dexhand_lh_asset = self.gym.load_asset(self.sim, *os.path.split(dexhand_lh_asset_file), asset_options)
+        self._configure_hand_joint_order(dexhand_rh_asset, "rh")
+        self._configure_hand_joint_order(dexhand_lh_asset, "lh")
         dexhand_rh_dof_stiffness = torch.tensor(
             [500] * self.dexhand_rh.n_dofs,
             dtype=torch.float,
@@ -572,6 +567,21 @@ class DexHandManipBiHEnv(VecTask):
         self.dexhand_lh_dof_upper_limits = torch.tensor(self.dexhand_lh_dof_upper_limits, device=self.sim_device)
         self._dexhand_lh_effort_limits = torch.tensor(self._dexhand_lh_effort_limits, device=self.sim_device)
         self._dexhand_lh_dof_speed_limits = torch.tensor(self._dexhand_lh_dof_speed_limits, device=self.sim_device)
+
+        # Policy, demonstrations, limits and observations share the same named
+        # order. Only the simulator state/target tensors retain Gym's order.
+        for side in ("rh", "lh"):
+            order = getattr(self, f"_{side}_policy_from_sim")
+            for field in (
+                f"dexhand_{side}_dof_lower_limits",
+                f"dexhand_{side}_dof_upper_limits",
+                f"_dexhand_{side}_effort_limits",
+                f"_dexhand_{side}_dof_speed_limits",
+            ):
+                setattr(self, field, getattr(self, field).index_select(0, order))
+            indices = order.cpu().tolist()
+            for bound in ("lower", "upper"):
+                self.limit_info[side][bound] = self.limit_info[side][bound][indices]
 
         # compute aggregate size
         num_dexhand_rh_bodies = self.gym.get_asset_rigid_body_count(dexhand_rh_asset)
@@ -718,6 +728,22 @@ class DexHandManipBiHEnv(VecTask):
 
         # Setup data
         self.init_data()
+
+    def _configure_hand_joint_order(self, asset, side):
+        spec = self.hand_specs[side]
+        if asset is None:
+            raise RuntimeError(f"Failed to load {spec.name}/{side} hand asset: {spec.urdf_path}")
+        simulation_names = tuple(self.gym.get_asset_dof_names(asset))
+        policy_from_sim, sim_from_policy = joint_order_indices(spec.dof_names, simulation_names)
+        simulation_bodies = tuple(self.gym.get_asset_rigid_body_names(asset))
+        if len(simulation_bodies) != spec.n_bodies or set(simulation_bodies) != set(spec.body_names):
+            raise ValueError(f"{spec.name}/{side} asset body names disagree with the policy specification")
+        setattr(self, f"_{side}_policy_from_sim", torch.tensor(
+            policy_from_sim, dtype=torch.long, device=self.sim_device
+        ))
+        setattr(self, f"_{side}_sim_from_policy", torch.tensor(
+            sim_from_policy, dtype=torch.long, device=self.sim_device
+        ))
 
     def _validate_bimanual_training_sources(self):
         """Guarantee the Stage-1 hand trajectories and assets cannot cross sides."""
@@ -1144,12 +1170,14 @@ class DexHandManipBiHEnv(VecTask):
         return pose
 
     def _update_states(self):
+        rh_q = self._q[:, :self.num_dexhand_rh_dofs].index_select(1, self._rh_policy_from_sim)
+        lh_q = self._q[:, self.num_dexhand_rh_dofs:].index_select(1, self._lh_policy_from_sim)
         self.rh_states.update(
             {
-                "q": self._q[:, : self.num_dexhand_rh_dofs],
-                "cos_q": torch.cos(self._q[:, : self.num_dexhand_rh_dofs]),
-                "sin_q": torch.sin(self._q[:, : self.num_dexhand_rh_dofs]),
-                "dq": self._qd[:, : self.num_dexhand_rh_dofs],
+                "q": rh_q,
+                "cos_q": torch.cos(rh_q),
+                "sin_q": torch.sin(rh_q),
+                "dq": self._qd[:, :self.num_dexhand_rh_dofs].index_select(1, self._rh_policy_from_sim),
                 "base_state": self._rh_base_state[:, :],
             }
         )
@@ -1168,10 +1196,10 @@ class DexHandManipBiHEnv(VecTask):
 
         self.lh_states.update(
             {
-                "q": self._q[:, self.num_dexhand_rh_dofs :],
-                "cos_q": torch.cos(self._q[:, self.num_dexhand_rh_dofs :]),
-                "sin_q": torch.sin(self._q[:, self.num_dexhand_rh_dofs :]),
-                "dq": self._qd[:, self.num_dexhand_rh_dofs :],
+                "q": lh_q,
+                "cos_q": torch.cos(lh_q),
+                "sin_q": torch.sin(lh_q),
+                "dq": self._qd[:, self.num_dexhand_rh_dofs:].index_select(1, self._lh_policy_from_sim),
                 "base_state": self._lh_base_state[:, :],
             }
         )
@@ -1272,11 +1300,11 @@ class DexHandManipBiHEnv(VecTask):
 
         side_states = getattr(self, f"{side}_states")
         if side == "rh":
-            power = torch.abs(torch.multiply(self.dof_force[:, : self.dexhand_rh.n_dofs], side_states["dq"])).sum(
+            power = torch.abs(torch.multiply(self.dof_force[:, : self.dexhand_rh.n_dofs].index_select(1, self._rh_policy_from_sim), side_states["dq"])).sum(
                 dim=-1
             )
         else:
-            power = torch.abs(torch.multiply(self.dof_force[:, self.dexhand_rh.n_dofs :], side_states["dq"])).sum(
+            power = torch.abs(torch.multiply(self.dof_force[:, self.dexhand_rh.n_dofs :].index_select(1, self._lh_policy_from_sim), side_states["dq"])).sum(
                 dim=-1
             )
         target_state["power"] = power
@@ -1559,6 +1587,7 @@ class DexHandManipBiHEnv(VecTask):
         cur_idx = torch.stack(
             [cur_idx + t for t in range(self.obs_future_length)], dim=-1
         )  # [B, K], K = obs_future_length
+        cur_idx = torch.minimum(cur_idx, side_demo_data["seq_len"][:, None] - 1)
         nE, nT = side_demo_data["wrist_pos"].shape[:2] #nE=B, nT = max timesteps in the demo buffers.
         nF = self.obs_future_length
 
@@ -1633,8 +1662,7 @@ class DexHandManipBiHEnv(VecTask):
 
         next_target_state["gt_tips_distance"] = indicing(side_demo_data["tips_distance"], cur_idx).reshape(nE, -1)
 
-        # Keep the Stage-1 target observation byte-for-byte compatible: the
-        # frozen base policy must always see the complete tool/object BPS.
+        # Keep complete tool/object BPS in the direct policy's target observation.
         next_target_state["bps"] = getattr(self, f"obj_bps_{side}")
         obs_dict["target"] = torch.cat(
             [
@@ -1827,6 +1855,10 @@ class DexHandManipBiHEnv(VecTask):
 
         getattr(self, f"_{side}_base_state")[env_ids, :] = opt_hand_pose_vel
 
+        simulation_order = getattr(self, f"_{side}_sim_from_policy")
+        dof_pos = dof_pos.index_select(1, simulation_order)
+        dof_vel = dof_vel.index_select(1, simulation_order)
+
         if side == "rh":
             self._q[env_ids, : self.num_dexhand_rh_dofs] = dof_pos
             self._qd[env_ids, : self.num_dexhand_rh_dofs] = dof_vel
@@ -1901,6 +1933,9 @@ class DexHandManipBiHEnv(VecTask):
         return obs, rew, done, info
 
     def pre_physics_step(self, actions):
+        expected_actions = 12 + self.dexhand_rh.n_dofs + self.dexhand_lh.n_dofs
+        if actions.ndim != 2 or actions.shape[1] != expected_actions:
+            raise ValueError(f"Expected complete bimanual actions [batch, {expected_actions}], got {tuple(actions.shape)}")
         # ? >>> for visualization
         if not self.headless:
 
@@ -1994,14 +2029,14 @@ class DexHandManipBiHEnv(VecTask):
         )
         self.rh_curr_targets = (
             curr_act_moving_average * self.rh_curr_targets
-            + (1.0 - curr_act_moving_average) * self.prev_targets[:, : self.num_dexhand_rh_dofs]
+            + (1.0 - curr_act_moving_average) * self.prev_targets[:, : self.num_dexhand_rh_dofs].index_select(1, self._rh_policy_from_sim)
         )
         self.rh_curr_targets = torch_jit_utils.tensor_clamp(
             self.rh_curr_targets,
             self.dexhand_rh_dof_lower_limits,
             self.dexhand_rh_dof_upper_limits,
         )
-        self.prev_targets[:, : self.num_dexhand_rh_dofs] = self.rh_curr_targets[:]
+        self.prev_targets[:, : self.num_dexhand_rh_dofs] = self.rh_curr_targets.index_select(1, self._rh_sim_from_policy)
 
         self.lh_curr_targets = torch_jit_utils.scale(
             lh_dof_pos,
@@ -2010,14 +2045,14 @@ class DexHandManipBiHEnv(VecTask):
         )
         self.lh_curr_targets = (
             curr_act_moving_average * self.lh_curr_targets
-            + (1.0 - curr_act_moving_average) * self.prev_targets[:, self.num_dexhand_rh_dofs :]
+            + (1.0 - curr_act_moving_average) * self.prev_targets[:, self.num_dexhand_rh_dofs :].index_select(1, self._lh_policy_from_sim)
         )
         self.lh_curr_targets = torch_jit_utils.tensor_clamp(
             self.lh_curr_targets,
             self.dexhand_lh_dof_lower_limits,
             self.dexhand_lh_dof_upper_limits,
         )
-        self.prev_targets[:, self.num_dexhand_rh_dofs :] = self.lh_curr_targets[:]
+        self.prev_targets[:, self.num_dexhand_rh_dofs :] = self.lh_curr_targets.index_select(1, self._lh_sim_from_policy)
 
         if self.use_pid_control:
             rh_position_error = base_action[:, 0:3]

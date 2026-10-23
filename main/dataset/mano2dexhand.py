@@ -26,6 +26,7 @@ from main.dataset.transform import (
     rotmat_to_rot6d,
 )
 from physgraph_envs.lib.envs.dexhands.factory import DexHandFactory
+from main.retarget_metadata import normalize_retarget_data
 
 
 def pack_data(data, dexhand):
@@ -251,6 +252,7 @@ class Mano2Dexhand:
 
         env_ptr = self.envs[0]
         dexhand_handle = 0
+        self.actor_dof_names = tuple(self.gym.get_actor_dof_names(env_ptr, dexhand_handle))
         self.dexhand_handles = {
             k: self.gym.find_actor_rigid_body_handle(env_ptr, dexhand_handle, k) for k in self.dexhand.body_names
         }
@@ -273,7 +275,7 @@ class Mano2Dexhand:
         self._base_state = self._root_state[:, 0, :]
 
         self.isaac2chain_order = [
-            self.gym.get_actor_dof_names(env_ptr, dexhand_handle).index(j)
+            self.actor_dof_names.index(j)
             for j in self.chain.get_joint_parameter_names()
         ]
 
@@ -428,11 +430,19 @@ class Mano2Dexhand:
                 past_loss = loss.item()
 
         to_dump = {
+            "dexhand": self.dexhand.name,
+            "side": self.dexhand.side,
+            "dof_names": list(self.actor_dof_names),
+            # isaac_joints is explicitly gathered in this order above; this
+            # need not match the actor's raw rigid-body order in other assets.
+            "body_names": list(self.dexhand.body_names),
             "opt_wrist_pos": opt_wrist_pos.detach().cpu().numpy(),
             "opt_wrist_rot": rot6d_to_aa(opt_wrist_rot).detach().cpu().numpy(),
             "opt_dof_pos": opt_dof_pos_clamped.detach().cpu().numpy(),
             "opt_joints_pos": isaac_joints.detach().cpu().numpy(),
         }
+        if self.dexhand.name in {"artimano", "allegro", "inspire", "shadow"}:
+            to_dump = normalize_retarget_data(to_dump, self.dexhand.name, self.dexhand.side)
 
         if not self.headless:
             self.gym.destroy_viewer(self.viewer)

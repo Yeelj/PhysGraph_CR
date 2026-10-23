@@ -12,15 +12,15 @@ def _is_cuda_solver(x, y):
 
 
 def get_ndof(hand_name):
-    from physgraph_envs.lib.envs.dexhands.factory import DexHandFactory
+    from main.dexhand_spec import get_hand_spec
 
-    return DexHandFactory.create_hand(hand_name, "right").n_dofs
+    return get_hand_spec(hand_name, "right").n_dofs
 
 
 def get_nbody(hand_name):
-    from physgraph_envs.lib.envs.dexhands.factory import DexHandFactory
+    from main.dexhand_spec import get_hand_spec
 
-    return DexHandFactory.create_hand(hand_name, "right").n_bodies
+    return get_hand_spec(hand_name, "right").n_bodies
 
 
 OmegaConf.register_new_resolver("eq", lambda x, y: x.lower() == y.lower())

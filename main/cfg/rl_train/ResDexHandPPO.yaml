@@ -15,6 +15,10 @@ params:
 
   network:
     name: ${res_side:${....side},dict_obs_actor_critic}
+    dexhand: ${....dexhand}
+    policy_mode: ${....policy_mode}
+    obs_future_length: ${....task.env.obsFutureLength}
+    compile_encoder: ${....compile_encoder}
     separate: False
 
     space:

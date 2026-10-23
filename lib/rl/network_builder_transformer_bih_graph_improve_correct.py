@@ -1,8 +1,10 @@
 import torch
 import torch.nn as nn
+from copy import deepcopy
 from typing import Dict, Any
 import torch.nn.functional as F
 from rl_games.algos_torch.network_builder import A2CBuilder, NetworkBuilder
+from main.dexhand_spec import ObservationLayout, get_hand_spec
 from main.dataset.semantic_contact import (
     ACTUAL_CONTACT,
     BLACK_PROXIMITY,
@@ -221,79 +223,62 @@ class TransformerLayer(nn.Module):
         
         return src
 
-class ManoTopology(nn.Module):
-    """
-    Exact 28-node graph for MANO.
-    0: Palm, 1-5: Index, 6-10: Middle, 11-15: Pinky, 16-20: Ring, 21-27: Thumb
-    """
-    def __init__(self):
+class DexHandTopology(nn.Module):
+    """URDF topology in the canonical rigid-body order used by observations."""
+
+    def __init__(self, rh_spec=None, lh_spec=None):
         super().__init__()
-        self.num_phys_nodes = 58 
-        self.register_buffer('dist_mat', self._build_dist_mat())
-        self.register_buffer('serial_mask', self._build_serial_mask())
-        self.register_buffer('synergy_mask', self._build_synergy_mask())
-        self.register_buffer('centrality', self._build_centrality())
+        self.rh_spec = rh_spec or get_hand_spec("artimano", "right")
+        self.lh_spec = lh_spec or get_hand_spec("artimano", "left")
+        self.lh_offset = self.rh_spec.n_bodies
+        self.tool_node_id = self.lh_offset + self.lh_spec.n_bodies
+        self.object_node_id = self.tool_node_id + 1
+        self.num_phys_nodes = self.object_node_id + 1
+        self.register_buffer("dist_mat", self._build_dist_mat())
+        self.register_buffer("serial_mask", self._build_serial_mask())
+        self.register_buffer("synergy_mask", self._build_synergy_mask())
+        self.register_buffer("centrality", self._build_centrality())
 
     def _build_dist_mat(self):
-        dists = torch.full((self.num_phys_nodes, self.num_phys_nodes), 10, dtype=torch.long)#.cuda()
+        dists = torch.full((self.num_phys_nodes, self.num_phys_nodes), 10, dtype=torch.long)
         dists.fill_diagonal_(0)
-        def connect(i, j): dists[i, j] = 1; dists[j, i] = 1
-
-        def wire_hand(offset):
-            palm = offset
-            # Index (1-5)
-            connect(palm, offset+1); connect(offset+1, offset+2); connect(offset+2, offset+3)
-            connect(offset+3, offset+4); connect(offset+4, offset+5)
-            # Middle (6-10)
-            connect(palm, offset+6); connect(offset+6, offset+7); connect(offset+7, offset+8)
-            connect(offset+8, offset+9); connect(offset+9, offset+10)
-            # Pinky (11-15)
-            connect(palm, offset+11); connect(offset+11, offset+12); connect(offset+12, offset+13)
-            connect(offset+13, offset+14); connect(offset+14, offset+15)
-            # Ring (16-20)
-            connect(palm, offset+16); connect(offset+16, offset+17); connect(offset+17, offset+18)
-            connect(offset+18, offset+19); connect(offset+19, offset+20)
-            # Thumb (21-27)
-            connect(palm, offset+21); connect(offset+21, offset+22); connect(offset+22, offset+23)
-            connect(offset+23, offset+24); connect(offset+24, offset+25); connect(offset+25, offset+26)
-            connect(offset+26, offset+27)
-
-        wire_hand(0); wire_hand(28)
-        tool, obj = 56, 57
-        # connect to palms
-        connect(0, tool); connect(28, tool)
-        connect(0, obj);  connect(28, obj)
-        # tool-object edge
-        connect(tool, obj)
-        # Calculating Shortest Paths (Floyd-Warshall)
+        for spec, offset in ((self.rh_spec, 0), (self.lh_spec, self.lh_offset)):
+            for parent, child in spec.graph_edges:
+                dists[parent + offset, child + offset] = 1
+                dists[child + offset, parent + offset] = 1
+            palm = spec.root_body_id + offset
+            for node in (self.tool_node_id, self.object_node_id):
+                dists[palm, node] = dists[node, palm] = 1
+        dists[self.tool_node_id, self.object_node_id] = 1
+        dists[self.object_node_id, self.tool_node_id] = 1
         for k in range(self.num_phys_nodes):
-            for i in range(self.num_phys_nodes):
-                for j in range(self.num_phys_nodes):
-                    dists[i,j] = min(dists[i,j], dists[i,k] + dists[k,j])
+            dists = torch.minimum(dists, dists[:, k:k + 1] + dists[k:k + 1, :])
         return dists.clamp(max=5)
 
     def _build_serial_mask(self):
-        mask = torch.full((self.num_phys_nodes, self.num_phys_nodes), float('-inf'))#.cuda()
-        mask[self._build_dist_mat() <= 1] = 0.0
-        return mask
+        return torch.where(self.dist_mat <= 1, 0.0, float("-inf"))
 
     def _build_synergy_mask(self):
-        mask = torch.full((self.num_phys_nodes, self.num_phys_nodes), float('-inf'))#.cuda()
+        mask = torch.full((self.num_phys_nodes, self.num_phys_nodes), float("-inf"))
         mask.fill_diagonal_(0.0)
-        tips = [5, 10, 15, 20, 27]
-        mcps = [1, 6, 11, 16, 21]
-        pips = [3, 8, 13, 18, 24]
-        for grp in [tips, mcps, pips]:
-            for x in [0, 28]: # RH then LH
-                indices = [i + x for i in grp]
-                for i in indices:
-                    for j in indices: mask[i, j] = 0.0
+        for spec, offset in ((self.rh_spec, 0), (self.lh_spec, self.lh_offset)):
+            for group in spec.synergy_groups:
+                for i in group:
+                    for j in group:
+                        mask[i + offset, j + offset] = 0.0
         return mask
 
     def _build_centrality(self):
-        degs = torch.ones(self.num_phys_nodes, dtype=torch.long)#.cuda()
-        degs[0] = 5; degs[28] = 5; degs[56] = 0; degs[57] = 0
-        return degs
+        # Preserve the Artimano checkpoint's palm/finger/object convention.
+        degrees = torch.ones(self.num_phys_nodes, dtype=torch.long)
+        for spec, offset in ((self.rh_spec, 0), (self.lh_spec, self.lh_offset)):
+            degrees[spec.root_body_id + offset] = len(set(group[0] for group in spec.finger_groups))
+        degrees[self.tool_node_id:] = 0
+        return degrees
+
+
+class ManoTopology(DexHandTopology):
+    """Backward-compatible name for the default Artimano topology."""
 
 class PhysicallyGroundedBias(nn.Module):
     # Semantic relations are intentionally excluded from attention logits in A1.
@@ -301,9 +286,11 @@ class PhysicallyGroundedBias(nn.Module):
     TOOL_NODE_ID = 56
     OBJECT_NODE_ID = 57
 
-    def __init__(self, topo: ManoTopology, num_heads=8):
+    def __init__(self, topo: DexHandTopology, num_heads=8):
         super().__init__()
         self.topo = topo
+        self.TOOL_NODE_ID = topo.tool_node_id
+        self.OBJECT_NODE_ID = topo.object_node_id
         self.num_heads = num_heads
         self.spatial_bias = nn.Embedding(6, num_heads)
         self.edge_encoder = nn.Embedding(4, num_heads)
@@ -343,13 +330,19 @@ class PhysicallyGroundedBias(nn.Module):
         # Dataset/contact-body order: thumb, index, middle, ring, pinky.
         self.register_buffer(
             "rh_contact_node_ids",
-            torch.tensor([26, 4, 9, 19, 14], dtype=torch.long),
+            torch.tensor(topo.rh_spec.contact_body_ids, dtype=torch.long),
             persistent=False,
         )
         self.register_buffer(
             "lh_contact_node_ids",
-            torch.tensor([54, 32, 37, 47, 42], dtype=torch.long),
+            torch.tensor([i + topo.lh_offset for i in topo.lh_spec.contact_body_ids], dtype=torch.long),
             persistent=False,
+        )
+        unique_nodes = tuple(dict.fromkeys(topo.rh_spec.contact_body_ids))
+        self.register_buffer("unique_rh_contact_node_ids", torch.tensor(unique_nodes), persistent=False)
+        self.rh_contact_slot_groups = tuple(
+            tuple(i for i, value in enumerate(topo.rh_spec.contact_body_ids) if value == node)
+            for node in unique_nodes
         )
 
         # Restrict the generic geometric bias to the physically relevant,
@@ -405,13 +398,19 @@ class PhysicallyGroundedBias(nn.Module):
             "ijr,rh->hij", self.static_edge_relations, self.edge_encoder.weight
         ).unsqueeze(0)
         soft_bias = topo_bias + self.edge_bias_scale * static_edge_bias
-        nodes = self.rh_contact_node_ids
+        nodes = self.unique_rh_contact_node_ids
         tool_node = self.TOOL_NODE_ID
         # Backward-compatible fallback for observations created before the
         # standalone physical_contact field was introduced.
         if physical_contact is None and semantic_contact is not None:
             physical_contact = semantic_contact[:, :, ACTUAL_CONTACT]
         if physical_contact is not None:
+            # Allegro's ring/pinky semantic slots share a physical link. A link
+            # gets one physical edge, with the strongest observation of contact.
+            physical_contact = torch.stack([
+                physical_contact[:, slots].amax(dim=-1)
+                for slots in self.rh_contact_slot_groups
+            ], dim=-1)
             # For a soft physical edge, interpolate only its legacy NONE/PHYSICAL
             # channel. This path is independent of semanticContact.enabled.
             physical_delta = physical_contact[:, None, :] * (
@@ -463,25 +462,25 @@ class MLP_new(nn.Module):
         return self.net(x)
 
 class MLP_action(nn.Module):
-    def __init__(self):
+    def __init__(self, action_dim=56):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(64, 1024),
             nn.SiLU(),
             nn.Linear(1024, 512),
             nn.SiLU(),
-            nn.Linear(512, 56),
+            nn.Linear(512, action_dim),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
     
 class MLP_value(nn.Module):
-    def __init__(self):
+    def __init__(self, privileged_dim=118):
         super().__init__()
         
         self.net = nn.Sequential(
-            nn.Linear(64+118, 256),
+            nn.Linear(64 + privileged_dim, 256),
             nn.SiLU(),
             nn.Linear(256, 128),
             nn.SiLU(),
@@ -518,37 +517,50 @@ class LATENT_ENCODER(nn.Module):
         lh_target_in_dim: int = 256,
         tool_target_in_dim: int = 128,
         obj_target_in_dim: int = 128,
-        action_dim: int = 56, #28 per hand
+        action_dim: int = None,
         d_model: int = 64,
         num_heads: int = 8,
         num_global_layers: int = 4,
-        mlp_hidden_dim: int = 64
+        mlp_hidden_dim: int = 64,
+        dexhand: str = "artimano",
+        obs_future_length: int = 1,
     ):
         super().__init__()
 
         self.d_model = d_model
-        self.action_dim = action_dim
         self.num_global_layers = num_global_layers
+        self.rh_spec = get_hand_spec(dexhand, "right")
+        self.lh_spec = get_hand_spec(dexhand, "left")
+        self.layout = ObservationLayout(self.rh_spec, future_length=obs_future_length)
+        action_dim = action_dim if action_dim is not None else 2 * (6 + self.rh_spec.n_dofs)
+        self.action_dim = action_dim
+        if d_model != 64:
+            raise ValueError("The existing modality tokenizers require d_model=64")
+        if action_dim != 2 * (6 + self.rh_spec.n_dofs):
+            raise ValueError(f"action_dim={action_dim} does not match {dexhand} DOFs")
 
-        self.rlink_tokenizer = MLP_new(243)
-        self.llink_tokenizer = MLP_new(243)
-        self.rh_tokenizer = MLP_new(137)
-        self.lh_tokenizer = MLP_new(137)
+        # Retain even the unused legacy tokenizer modules and their names so
+        # existing Artimano checkpoints still load strictly.
+        link_flat_dim = (self.rh_spec.n_bodies - 1) * self.layout.link_token_dim
+        self.rlink_tokenizer = MLP_new(link_flat_dim)
+        self.llink_tokenizer = MLP_new(link_flat_dim)
+        self.rh_tokenizer = MLP_new(self.layout.hand_token_dim)
+        self.lh_tokenizer = MLP_new(self.layout.hand_token_dim)
         self.tool_tokenizer = MLP_new(129)
         self.obj_tokenizer = MLP_new(129)
         self.rh_target_tokenizer = MLP_new(76)
         self.lh_target_tokenizer = MLP_new(76)
 
-        self.rh_curr_tokenizer = MLP_new(74)
-        self.rlink_curr_tokenizer = MLP_new(9)
-        self.lh_curr_tokenizer = MLP_new(74)
-        self.llink_curr_tokenizer = MLP_new(9)
+        self.rh_curr_tokenizer = MLP_new(self.layout.curr_token_dim)
+        self.rlink_curr_tokenizer = MLP_new(self.layout.link_token_dim)
+        self.lh_curr_tokenizer = MLP_new(self.layout.curr_token_dim)
+        self.llink_curr_tokenizer = MLP_new(self.layout.link_token_dim)
         self.palm_fuser = MLP_new(128)
 
         # Type & side embeddings
         self.type_embedding = nn.Embedding(6, d_model)
         self.side_embedding = nn.Embedding(3, d_model)
-        self.id_embed = nn.Embedding(58, d_model)
+        self.id_embed = nn.Embedding(self.rh_spec.n_bodies + self.lh_spec.n_bodies + 2, d_model)
 
         # Learnable policy token
         self.policy_token_param = nn.Parameter(torch.zeros(d_model))
@@ -564,16 +576,16 @@ class LATENT_ENCODER(nn.Module):
         self.rh_tgt_ln    = nn.LayerNorm(64)
         self.lh_tgt_ln    = nn.LayerNorm(64)
 
-        self.topo = ManoTopology()
+        self.topo = DexHandTopology(self.rh_spec, self.lh_spec)
         self.bias_gen = PhysicallyGroundedBias(self.topo, num_heads)
         self.semantic_condition_encoder = SemanticConditionEncoder(d_model=d_model)
 
         physical_token_node_ids = torch.cat([
-            torch.tensor([0, 0]),                    # RH Palm & Curr -> Node 0
-            torch.arange(1, 28),                     # RH Links
-            torch.tensor([28, 28]),                  # LH Palm & Curr -> Node 28
-            torch.arange(29, 56),                    # LH Links
-            torch.tensor([56, 57]),                  # Tool, Obj
+            torch.tensor([0, 0]),
+            torch.arange(1, self.rh_spec.n_bodies),
+            torch.tensor([self.topo.lh_offset, self.topo.lh_offset]),
+            torch.arange(self.topo.lh_offset + 1, self.topo.tool_node_id),
+            torch.tensor([self.topo.tool_node_id, self.topo.object_node_id]),
         ])
         self.register_buffer(
             "physical_token_node_ids", physical_token_node_ids, persistent=False
@@ -587,6 +599,9 @@ class LATENT_ENCODER(nn.Module):
         self.register_buffer(
             "rh_contact_token_ids", rh_contact_token_ids, persistent=False
         )
+        contact_counts = torch.zeros(len(physical_token_node_ids) + 1)
+        contact_counts.index_add_(0, rh_contact_token_ids, torch.ones(5))
+        self.register_buffer("rh_contact_token_counts", contact_counts.clamp_min(1), persistent=False)
 
         self.layers = nn.ModuleList([
             TransformerLayer(
@@ -613,15 +628,17 @@ class LATENT_ENCODER(nn.Module):
         finger_condition = self.semantic_condition_encoder(semantic_contact)
         finger_condition = finger_condition.to(dtype=tokens.dtype)
         token_condition = tokens.new_zeros(tokens.shape)
-        token_condition = token_condition.index_copy(
+        token_condition = token_condition.index_add(
             1, self.rh_contact_token_ids, finger_condition
         )
+        token_condition = token_condition / self.rh_contact_token_counts[None, :, None]
         token_mask = tokens.new_zeros(tokens.shape[0], tokens.shape[1], 1)
         curriculum_mask = semantic_contact[:, :, CURRICULUM_WEIGHT].unsqueeze(-1)
         curriculum_mask = curriculum_mask.to(dtype=tokens.dtype)
-        token_mask = token_mask.index_copy(
+        token_mask = token_mask.index_add(
             1, self.rh_contact_token_ids, curriculum_mask
         )
+        token_mask = token_mask / self.rh_contact_token_counts[None, :, None]
         return token_condition, token_mask
 
     # type+side embeddings and token builders
@@ -689,104 +706,44 @@ class LATENT_ENCODER(nn.Module):
         policy_vec = self.policy_token_param.view(1, 1, -1).expand(batch_size, 1, -1)
         return policy_vec
 
+    def unpack_hand_observation(self, prop, priv, target):
+        """Read field-major environment targets without mixing future frames."""
+        fields = {name: target[:, index] for name, index in self.layout.target_slices.items()}
+        hand_obs = torch.cat([prop, priv[:, :-1]], dim=-1)
+        current_fields = (
+            "delta_wrist_pos", "wrist_vel", "delta_wrist_vel", "wrist_quat",
+            "delta_wrist_quat", "wrist_ang_vel", "delta_wrist_ang_vel",
+            "delta_manip_obj_pos", "manip_obj_vel", "delta_manip_obj_vel",
+            "manip_obj_quat", "delta_manip_obj_quat", "manip_obj_ang_vel",
+            "delta_manip_obj_ang_vel", "obj_to_joints",
+        )
+        current_obs = torch.cat([fields[name] for name in current_fields], dim=-1).unsqueeze(1)
+        batch_size = target.shape[0]
+        link_fields = [
+            fields[name].reshape(batch_size, self.layout.future_length, self.rh_spec.n_bodies - 1, 3)
+            for name in ("delta_joints_pos", "joints_vel", "delta_joints_vel")
+        ]
+        link_obs = torch.stack(link_fields, dim=3).permute(0, 2, 1, 3, 4)
+        link_obs = link_obs.reshape(batch_size, self.rh_spec.n_bodies - 1, self.layout.link_token_dim)
+        object_obs = torch.cat([priv[:, -1:], fields["bps"]], dim=-1)
+        return hand_obs, current_obs, link_obs, object_obs
+
     def forward(self, obs: Dict[str, Any], pre_action=None) -> Dict[str, torch.Tensor]:
-        r_prop = obs['proprioception'][:, :79]
-        l_prop = obs['proprioception'][:, 79:]
-        r_priv = obs['privileged'][:, :59]
-        l_priv = obs['privileged'][:, 59:]
-        r_curr = obs['target'][:, None, :450]
-        l_curr = obs['target'][:, None, 450:]
-
-        r_q = r_prop[:, :22]
-        r_cosq = r_prop[:, 22:44]
-        r_sinq = r_prop[:, 44:66]
-        r_base_state = r_prop[::, 66:]
-        l_q = l_prop[:, :22]
-        l_cosq = l_prop[:, 22:44]
-        l_sinq = l_prop[:, 44:66]
-        l_base_state = l_prop[::, 66:]
-
-        r_dq = r_priv[:, :22]
-        r_manip_obj_pos = r_priv[:, 22:25]
-        r_manip_obj_quat = r_priv[:, 25:29]
-        r_manip_obj_vel = r_priv[:, 29:32]
-        r_manip_obj_ang_vel = r_priv[:, 32:35]
-        r_tip_force = r_priv[:, 35:55]
-        r_manip_obj_com = r_priv[:, 55:58]
-        r_manip_obj_weight = r_priv[:, -1:]
-        l_dq = l_priv[:, :22]
-        l_manip_obj_pos = l_priv[:, 22:25]
-        l_manip_obj_quat = l_priv[:, 25:29]
-        l_manip_obj_vel = l_priv[:, 29:32]
-        l_manip_obj_ang_vel = l_priv[:, 32:35]
-        l_tip_force = l_priv[:, 35:55]
-        l_manip_obj_com = l_priv[:, 55:58]
-        l_manip_obj_weight = l_priv[:, -1:]
-
-        r_delta_wrist_pos_curr = r_curr[:, :, :3]
-        r_wrist_vel_curr = r_curr[:, :, 3:6]
-        r_delta_wrist_vel_curr = r_curr[:, :, 6:9]
-        r_wrist_quat_curr = r_curr[:, :, 9:13] 
-        r_delta_wrist_quat_curr = r_curr[:, :, 13:17]
-        r_wrist_ang_vel_curr = r_curr[:, :, 17:20] 
-        r_delta_wrist_ang_vel_curr = r_curr[:, :, 20:23]
-        r_delta_joints_pos_curr = r_curr[:, :, 23:104]
-        r_joints_vel_target_curr = r_curr[:, :, 104:185] 
-        r_delta_joints_vel_curr = r_curr[:, :, 185:266]
-        r_delta_manip_obj_pos_curr = r_curr[:, :, 266:269]
-        r_manip_obj_vel_target_curr = r_curr[:, :, 269:272]
-        r_delta_manip_obj_vel_curr = r_curr[:, :, 272:275]
-        r_manip_obj_quat_target_curr = r_curr[:, :, 275:279] 
-        r_delta_manip_obj_quat_curr = r_curr[:, :, 279:283]
-        r_manip_obj_ang_vel_target_curr = r_curr[:, :, 283:286] 
-        r_delta_manip_obj_ang_vel_curr = r_curr[:, :, 286:289]
-        r_obj_to_joints_curr = r_curr[:, :, 289:317]
-        r_bps = r_curr[:, 0, 322:]
-        l_delta_wrist_pos_curr = l_curr[:, :, :3]
-        l_wrist_vel_curr = l_curr[:, :, 3:6]
-        l_delta_wrist_vel_curr = l_curr[:, :, 6:9]
-        l_wrist_quat_curr = l_curr[:, :, 9:13] 
-        l_delta_wrist_quat_curr = l_curr[:, :, 13:17]
-        l_wrist_ang_vel_curr = l_curr[:, :, 17:20] 
-        l_delta_wrist_ang_vel_curr = l_curr[:, :, 20:23]
-        l_delta_joints_pos_curr = l_curr[:, :, 23:104]
-        l_joints_vel_target_curr = l_curr[:, :, 104:185] 
-        l_delta_joints_vel_curr = l_curr[:, :, 185:266]
-        l_delta_manip_obj_pos_curr = l_curr[:, :, 266:269]
-        l_manip_obj_vel_target_curr = l_curr[:, :, 269:272]
-        l_delta_manip_obj_vel_curr = l_curr[:, :, 272:275]
-        l_manip_obj_quat_target_curr = l_curr[:, :, 275:279] 
-        l_delta_manip_obj_quat_curr = l_curr[:, :, 279:283]
-        l_manip_obj_ang_vel_target_curr = l_curr[:, :, 283:286] 
-        l_delta_manip_obj_ang_vel_curr = l_curr[:, :, 286:289]
-        l_obj_to_joints_curr = l_curr[:, :, 289:317]
-        l_bps = l_curr[:, 0, 322:]
-
-        rh_obs = torch.cat([r_q, r_cosq, r_sinq, r_base_state, r_dq, r_manip_obj_pos, r_manip_obj_quat,
-                            r_manip_obj_vel, r_manip_obj_ang_vel, r_tip_force, r_manip_obj_com], dim=-1)
-        lh_obs = torch.cat([l_q, l_cosq, l_sinq, l_base_state, l_dq, l_manip_obj_pos, l_manip_obj_quat,
-                            l_manip_obj_vel, l_manip_obj_ang_vel, l_tip_force, l_manip_obj_com], dim=-1)
-        rh_links_obs_curr = torch.cat([r_delta_joints_pos_curr, r_joints_vel_target_curr, r_delta_joints_vel_curr], dim=-1)
-        lh_links_obs_curr = torch.cat([l_delta_joints_pos_curr, l_joints_vel_target_curr, l_delta_joints_vel_curr], dim=-1)
-        rh_links_obs_curr = rh_links_obs_curr.view(rh_links_obs_curr.shape[0], 3, 27, 3)
-        rh_links_obs_curr = torch.stack([rh_links_obs_curr[:, 0], rh_links_obs_curr[:, 1], rh_links_obs_curr[:, 2],], dim=2)
-        rh_links_obs_curr = rh_links_obs_curr.view(rh_links_obs_curr.shape[0], rh_links_obs_curr.shape[1], -1)
-        lh_links_obs_curr = lh_links_obs_curr.view(lh_links_obs_curr.shape[0], 3, 27, 3)
-        lh_links_obs_curr = torch.stack([lh_links_obs_curr[:, 0], lh_links_obs_curr[:, 1], lh_links_obs_curr[:, 2],], dim=2)
-        lh_links_obs_curr = lh_links_obs_curr.view(lh_links_obs_curr.shape[0], lh_links_obs_curr.shape[1], -1)
-        rh_curr_obs = torch.cat([r_delta_wrist_pos_curr, r_wrist_vel_curr, r_delta_wrist_vel_curr, r_wrist_quat_curr, 
-                                   r_delta_wrist_quat_curr, r_wrist_ang_vel_curr, r_delta_wrist_ang_vel_curr,
-                                    r_delta_manip_obj_pos_curr, r_manip_obj_vel_target_curr, r_delta_manip_obj_vel_curr,
-                                    r_manip_obj_quat_target_curr, r_delta_manip_obj_quat_curr, r_manip_obj_ang_vel_target_curr,
-                                    r_delta_manip_obj_ang_vel_curr, r_obj_to_joints_curr], dim=-1)
-        lh_curr_obs = torch.cat([l_delta_wrist_pos_curr, l_wrist_vel_curr, l_delta_wrist_vel_curr, l_wrist_quat_curr, 
-                                   l_delta_wrist_quat_curr, l_wrist_ang_vel_curr, l_delta_wrist_ang_vel_curr,
-                                    l_delta_manip_obj_pos_curr, l_manip_obj_vel_target_curr, l_delta_manip_obj_vel_curr,
-                                    l_manip_obj_quat_target_curr, l_delta_manip_obj_quat_curr, l_manip_obj_ang_vel_target_curr,
-                                    l_delta_manip_obj_ang_vel_curr, l_obj_to_joints_curr], dim=-1)
-        tool_obs = torch.cat([r_manip_obj_weight, r_bps], dim=-1)
-        obj_obs = torch.cat([l_manip_obj_weight, l_bps], dim=-1)
-
+        dimensions = {
+            "proprioception": 2 * self.layout.hand_proprioception_dim,
+            "privileged": 2 * self.layout.hand_privileged_dim,
+            "target": 2 * self.layout.hand_target_dim,
+        }
+        for name, width in dimensions.items():
+            if obs[name].ndim != 2 or obs[name].shape[1] != width:
+                raise ValueError(f"{name} must have shape [batch, {width}], got {tuple(obs[name].shape)}")
+        if obs["phys_node_pos"].shape[1:] != (self.topo.num_phys_nodes, 3):
+            raise ValueError(f"phys_node_pos must describe {self.topo.num_phys_nodes} graph nodes")
+        r_prop, l_prop = obs["proprioception"].split(self.layout.hand_proprioception_dim, dim=-1)
+        r_priv, l_priv = obs["privileged"].split(self.layout.hand_privileged_dim, dim=-1)
+        r_target, l_target = obs["target"].split(self.layout.hand_target_dim, dim=-1)
+        rh_obs, rh_curr_obs, rh_links_obs_curr, tool_obs = self.unpack_hand_observation(r_prop, r_priv, r_target)
+        lh_obs, lh_curr_obs, lh_links_obs_curr, obj_obs = self.unpack_hand_observation(l_prop, l_priv, l_target)
 
         device = tool_obs.device
         B = tool_obs.shape[0]
@@ -838,18 +795,15 @@ class LATENT_ENCODER(nn.Module):
             physical_contact=physical_contact,
             x_pos=x_pos,
         )
-        # define mapping: 60 Physical Tokens -> 58 Graph Nodes
-        # we duplicate Node 0 (RH Palm) and Node 28 (LH Palm)
+        # Each palm has two tokens sharing one physical graph node.
         # sequence: [RH_Palm, RH_Curr, RH_Links..., LH_Palm, LH_Curr, LH_Links..., Tool, Obj]
         idx_map = self.physical_token_node_ids
-        # 3. Expand the Bias Matrix [B, H, 60, 60]
-        # duplicate the rows/cols for the palms/wrists so they share the same bias
+        # Expand the graph bias to tokens, then pad the policy-token row/column.
         attn_bias = attn_bias_base[:, :, idx_map, :][:, :, :, idx_map]
         attn_bias = F.pad(attn_bias, (1,0, 1,0), value=0.0).to(device)
 
         deg_base = self.topo.centrality.to(device)
-        # Expand degrees to match the 60 tokens
-        deg = deg_base[idx_map] # [60]
+        deg = deg_base[idx_map]
         deg = deg.clamp(min=0, max=self.bias_gen.cls_centrality_bias.num_embeddings - 1)
         b = self.bias_gen.cls_centrality_bias(deg) 
         b = b.t().unsqueeze(0) 
@@ -875,21 +829,86 @@ class LATENT_ENCODER(nn.Module):
         
 class BimanualHandToolPolicy(A2CBuilder.Network):
     def __init__(self, params, **kwargs):
-        #super().__init__()
         NetworkBuilder.BaseNetwork.__init__(self)
+        params = params or {}
+        if params.get("policy_mode", "direct") != "direct":
+            raise ValueError("BimanualHandToolPolicy supports policy_mode='direct' only")
+        self.dexhand = str(params.get("dexhand", "artimano")).lower()
+        self.rh_spec = get_hand_spec(self.dexhand, "right")
+        self.lh_spec = get_hand_spec(self.dexhand, "left")
+        self.obs_future_length = params.get("obs_future_length", 1)
+        self.layout = ObservationLayout(self.rh_spec, future_length=self.obs_future_length)
+        action_dim = int(kwargs.get("actions_num", 2 * (6 + self.rh_spec.n_dofs)))
+        expected_action_dim = 2 * (6 + self.rh_spec.n_dofs)
+        if action_dim != expected_action_dim:
+            raise ValueError(
+                f"{self.dexhand} direct policy requires {expected_action_dim} actions, got {action_dim}"
+            )
         self.tau = 0.01
-        self.latent_encoder = LATENT_ENCODER()
-        try:
-            self.latent_encoder = torch.compile(self.latent_encoder)
-            print("Successfully compile LATENT_ENCODER with torch.compile hahaha")
-        except Exception as e:
-            print(f"Couldn't compile encoder: {e}")
-        self.action_miu_head = MLP_action()
-        self.value_head = MLP_value()
-        action_dim = 56
+        self.latent_encoder = LATENT_ENCODER(
+            dexhand=self.dexhand,
+            obs_future_length=self.obs_future_length,
+            action_dim=action_dim,
+        )
+        if params.get("compile_encoder", True):
+            try:
+                self.latent_encoder = torch.compile(self.latent_encoder)
+            except Exception as exc:
+                print(f"Couldn't compile encoder: {exc}")
+        self.action_miu_head = MLP_action(action_dim)
+        self.value_head = MLP_value(2 * self.layout.hand_privileged_dim)
         self.sigma = nn.Parameter(
             -torch.ones(action_dim, dtype=torch.float), requires_grad=True
         )
+        self._checkpoint_metadata = {
+            "version": 1,
+            "policy_mode": "direct",
+            "rh_hand": self.rh_spec.signature(),
+            "lh_hand": self.lh_spec.signature(),
+            "observation_layout_version": 1,
+            "obs_future_length": self.obs_future_length,
+            "action_dim": action_dim,
+        }
+
+    def get_extra_state(self):
+        return deepcopy(self._checkpoint_metadata)
+
+    def set_extra_state(self, state):
+        if state != self._checkpoint_metadata:
+            raise RuntimeError(
+                "Checkpoint hand/DOF/body ordering or observation layout does not match "
+                f"the current {self.dexhand} direct policy"
+            )
+
+    def prepare_checkpoint_state_dict(self, state_dict, prefix=""):
+        """Validate embodiment before copying weights; accept old Artimano models."""
+        metadata_key = prefix + "_extra_state"
+        if metadata_key not in state_dict:
+            if self.dexhand != "artimano" or self.obs_future_length != 1:
+                raise RuntimeError(
+                    "Checkpoint has no hand metadata. Only legacy Artimano "
+                    "checkpoints with obs_future_length=1 can be loaded without metadata."
+                )
+            state_dict[metadata_key] = self.get_extra_state()
+        self.set_extra_state(state_dict[metadata_key])
+
+        # torch.compile adds _orig_mod to state-dict paths. Permit restoring a
+        # checkpoint with compilation either enabled or disabled.
+        source_prefix = prefix + "latent_encoder."
+        compiled = hasattr(self.latent_encoder, "_orig_mod")
+        for key in tuple(state_dict):
+            if not key.startswith(source_prefix):
+                continue
+            suffix = key[len(source_prefix):]
+            if suffix.startswith("_orig_mod."):
+                suffix = suffix[len("_orig_mod."):]
+            destination = source_prefix + ("_orig_mod." if compiled else "") + suffix
+            if destination != key:
+                state_dict[destination] = state_dict.pop(key)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        self.prepare_checkpoint_state_dict(state_dict, prefix)
+        return super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def forward(self, obs: Dict[str, Any], pre_action=None) -> Dict[str, torch.Tensor]:
         z = self.latent_encoder(obs, pre_action)
