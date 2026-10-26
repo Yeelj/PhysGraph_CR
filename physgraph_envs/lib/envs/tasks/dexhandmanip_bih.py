@@ -21,6 +21,7 @@ from physgraph_envs.lib.envs.dexhands.factory import DexHandFactory
 from main.dataset.factory import ManipDataFactory
 from main.dexhand_spec import ObservationLayout, get_hand_spec
 from main.dexhand_runtime import joint_order_indices, validate_direct_control
+from main.visualization import TestVisualizationConfig
 
 # from main.dataset.favor_dataset_dexhand import FavorDatasetDexHand
 from main.dataset.oakink2_dataset_dexhand_lh import OakInk2DatasetDexHandLH
@@ -94,6 +95,9 @@ class DexHandManipBiHEnv(VecTask):
         self.action_scale = self.cfg["env"]["actionScale"]
         self.aggregate_mode = self.cfg["env"]["aggregateMode"]
         self.training = self.cfg["env"]["training"]
+        self.test_visualization = TestVisualizationConfig.from_mapping(
+            self.cfg["env"].get("testVisualization"), training=self.training
+        )
         self.dexhand_rh = DexHandFactory.create_hand(self.cfg["env"]["dexhand"], "right")
         self.dexhand_lh = DexHandFactory.create_hand(self.cfg["env"]["dexhand"], "left")
         for side, hand in (("rh", self.dexhand_rh), ("lh", self.dexhand_lh)):
@@ -728,6 +732,39 @@ class DexHandManipBiHEnv(VecTask):
 
         # Setup data
         self.init_data()
+        self._apply_test_visualization()
+
+    def _apply_test_visualization(self):
+        """Override actor visuals without touching assets or physical properties."""
+        if self.training or self.graphics_device_id < 0:
+            return
+        colors = (
+            ("dexhand_l", self.test_visualization.left_hand_color),
+            ("dexhand_r", self.test_visualization.right_hand_color),
+            ("manip_obj_lh", self.test_visualization.object_color),
+            ("manip_obj_rh", self.test_visualization.tool_color),
+        )
+        if all(color is None for _, color in colors):
+            return
+        # White replaces existing textures, so RGB is a solid color rather than
+        # a tint of the original mesh. Gym owns this shared texture until teardown.
+        texture = self.gym.create_texture_from_buffer(
+            self.sim, 1, 1, np.full((1, 4), 255, dtype=np.uint8)
+        )
+        if texture == gymapi.INVALID_HANDLE:
+            raise RuntimeError("Failed to create the test_visualization solid-color texture")
+        for env_ptr in self.envs:
+            for actor_name, color in colors:
+                if color is None:
+                    continue
+                actor = self.gym.find_actor_handle(env_ptr, actor_name)
+                for body_index in range(self.gym.get_actor_rigid_body_count(env_ptr, actor)):
+                    self.gym.set_rigid_body_texture(
+                        env_ptr, actor, body_index, gymapi.MESH_VISUAL, texture
+                    )
+                    self.gym.set_rigid_body_color(
+                        env_ptr, actor, body_index, gymapi.MESH_VISUAL, gymapi.Vec3(*color)
+                    )
 
     def _configure_hand_joint_order(self, asset, side):
         spec = self.hand_specs[side]
@@ -1944,30 +1981,35 @@ class DexHandManipBiHEnv(VecTask):
             self.gym.clear_lines(self.viewer)
 
             def set_side_joint(cur_idx, side="rh"):
-                side_demo_data = getattr(self, f"demo_data_{side}")
-                side_idx = torch.minimum(cur_idx, side_demo_data["seq_len"] - 1)
-                env_idx = torch.arange(self.num_envs, device=self.device)
-                cur_wrist_pos = side_demo_data["wrist_pos"][env_idx, side_idx]
-                cur_mano_joint_pos = side_demo_data["mano_joints"][env_idx, side_idx].reshape(
-                    self.num_envs, -1, 3
-                )
-                cur_mano_joint_pos = torch.concat([cur_wrist_pos[:, None], cur_mano_joint_pos], dim=1)
+                if self.test_visualization.show_mano:
+                    side_demo_data = getattr(self, f"demo_data_{side}")
+                    side_idx = torch.minimum(cur_idx, side_demo_data["seq_len"] - 1)
+                    env_idx = torch.arange(self.num_envs, device=self.device)
+                    cur_wrist_pos = side_demo_data["wrist_pos"][env_idx, side_idx]
+                    cur_mano_joint_pos = side_demo_data["mano_joints"][env_idx, side_idx].reshape(
+                        self.num_envs, -1, 3
+                    )
+                    cur_mano_joint_pos = torch.concat([cur_wrist_pos[:, None], cur_mano_joint_pos], dim=1)
                 dexhand_template = self.dexhand_rh if side == "rh" else self.dexhand_lh
                 for env_id, env_ptr in enumerate(self.envs):
-                    for body_name in dexhand_template.body_names:
-                        self.set_force_vis(
-                            env_ptr,
-                            body_name,
-                            torch.norm(
-                                self.net_cf[
-                                    env_id,
-                                    getattr(self, f"dexhand_{side}_handles")[body_name],
-                                ],
-                                dim=-1,
+                    if self.test_visualization.contact_highlight:
+                        for body_name in dexhand_template.body_names:
+                            self.set_force_vis(
+                                env_ptr,
+                                body_name,
+                                torch.norm(
+                                    self.net_cf[
+                                        env_id,
+                                        getattr(self, f"dexhand_{side}_handles")[body_name],
+                                    ],
+                                    dim=-1,
+                                )
+                                != 0,
+                                side,
                             )
-                            != 0,
-                            side,
-                        )
+
+                    if not self.test_visualization.show_mano:
+                        continue
 
                     def add_lines(viewer, env_ptr, hand_joints, color):
                         assert hand_joints.shape[0] == dexhand_template.n_bodies and hand_joints.shape[1] == 3
@@ -2268,6 +2310,12 @@ class DexHandManipBiHEnv(VecTask):
         return camera
 
     def set_force_vis(self, env_ptr, part_k, has_force, side):
+        if not self.test_visualization.contact_highlight:
+            return
+        base_color = (
+            self.test_visualization.left_hand_color if side == "lh"
+            else self.test_visualization.right_hand_color
+        )
         self.gym.set_rigid_body_color(
             env_ptr,
             self.gym.find_actor_handle(env_ptr, "dexhand_l" if side == "lh" else "dexhand_r"),
@@ -2280,7 +2328,7 @@ class DexHandManipBiHEnv(VecTask):
                     0.6,
                 )
                 if has_force
-                else gymapi.Vec3(1.0, 1.0, 1.0)
+                else gymapi.Vec3(*(base_color if base_color is not None else (1.0, 1.0, 1.0)))
             ),
         )
 

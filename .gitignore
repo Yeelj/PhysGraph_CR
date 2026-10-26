@@ -194,6 +194,7 @@ test*.py
 !tests/test_multi_hand_policy.py
 !tests/test_multi_hand_environment.py
 !tests/test_retarget_metadata.py
+!tests/test_retarget_viewer.py
 annotator*.py
 make*.py
 

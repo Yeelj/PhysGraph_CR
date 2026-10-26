@@ -98,6 +98,16 @@ n_successful_videos_to_record: 50
 display: False
 headless: True
 
+# ResDexHand/BiH display overrides, applied only when test=true.
+# null keeps the existing appearance. RGB values in [0, 1] select a solid color.
+test_visualization:
+  left_hand_color: null
+  right_hand_color: null
+  object_color: null  # left-hand task object
+  tool_color: null    # right-hand tool, including new_obj replacements
+  show_mano: true     # viewer lines only; requires headless=false
+  contact_highlight: true
+
 # set the directory where the output files get saved
 hydra:
   output_subdir: null

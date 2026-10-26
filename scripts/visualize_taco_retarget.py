@@ -7,6 +7,8 @@ through the corresponding ``ManipDataFactory`` datasets so this viewer uses
 the same data path as training.
 """
 
+import argparse
+import math
 import os
 import pickle
 import sys
@@ -37,6 +39,27 @@ TABLE_POSITION = (-TABLE_WIDTH_OFFSET / 2, 0.0, 0.4)
 TABLE_SURFACE_Z = TABLE_POSITION[2] + TABLE_HEIGHT / 2
 REQUIRED_RETARGET_KEYS = ("opt_wrist_pos", "opt_wrist_rot", "opt_dof_pos")
 DATASET_NAMES = {"taco": "TACO", "oakink2": "OakInk-v2"}
+# State key -> CLI component, actor name, legacy display color.
+REPLAY_COMPONENTS = {
+    "hand_rh": ("right_hand", "dexhand_r", (0.35, 0.75, 0.95)),
+    "hand_lh": ("left_hand", "dexhand_l", (0.75, 0.45, 0.95)),
+    "object_rh": ("tool", "manip_obj_rh", (1.0, 0.45, 0.08)),
+    "object_lh": ("object", "manip_obj_lh", (0.2, 0.7, 0.35)),
+}
+
+
+def _parse_color(value: str):
+    """Accept an explicit solid RGB override or the URDF material mode."""
+    if value.strip().lower() == "urdf":
+        return "urdf"
+    message = "Expected urdf or three comma-separated RGB numbers in [0, 1], e.g. 0.3,0.6,1.0"
+    try:
+        color = tuple(float(channel) for channel in value.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError(message) from None
+    if len(color) != 3 or any(not math.isfinite(channel) or not 0 <= channel <= 1 for channel in color):
+        raise argparse.ArgumentTypeError(message)
+    return color
 
 
 def _retarget_path(
@@ -314,7 +337,7 @@ class TacoRetargetViewer:
         plane_params.normal = gymapi.Vec3(0.0, 0.0, 1.0)
         self.gym.add_ground(self.sim, plane_params)
 
-    def _load_hand_asset(self, dexhand):
+    def _load_hand_asset(self, dexhand, *, use_urdf_materials=False):
         options = gymapi.AssetOptions()
         options.thickness = 0.001
         options.fix_base_link = False
@@ -322,7 +345,7 @@ class TacoRetargetViewer:
         options.flip_visual_attachments = False
         options.collapse_fixed_joints = False
         options.default_dof_drive_mode = int(gymapi.DOF_MODE_NONE)
-        options.use_mesh_materials = True
+        options.use_mesh_materials = not use_urdf_materials
         urdf_path = os.path.abspath(dexhand.urdf_path)
         asset = self.gym.load_asset(self.sim, os.path.dirname(urdf_path), os.path.basename(urdf_path), options)
         if asset is None:
@@ -336,14 +359,14 @@ class TacoRetargetViewer:
             )
         return asset
 
-    def _load_object_asset(self, urdf_path):
+    def _load_object_asset(self, urdf_path, *, use_urdf_materials=False):
         options = gymapi.AssetOptions()
         options.mesh_normal_mode = gymapi.COMPUTE_PER_VERTEX
         options.thickness = 0.001
         options.fix_base_link = False
         options.disable_gravity = True
         options.collapse_fixed_joints = False
-        options.use_mesh_materials = True
+        options.use_mesh_materials = not use_urdf_materials
         urdf_path = os.path.abspath(urdf_path)
         asset = self.gym.load_asset(self.sim, os.path.dirname(urdf_path), os.path.basename(urdf_path), options)
         if asset is None:
@@ -351,10 +374,25 @@ class TacoRetargetViewer:
         return asset
 
     def _create_scene(self):
-        hand_rh_asset = self._load_hand_asset(self.dexhand_rh)
-        hand_lh_asset = self._load_hand_asset(self.dexhand_lh)
-        object_rh_asset = self._load_object_asset(self.rh_data["obj_urdf_path"])
-        object_lh_asset = self._load_object_asset(self.lh_data["obj_urdf_path"])
+        # Omitted arguments keep the legacy appearance and all four actors.
+        self.colors = {
+            key: getattr(self.args, f"{component}_color", None)
+            for key, (component, _, _) in REPLAY_COMPONENTS.items()
+        }
+        visible = {
+            key: not getattr(self.args, f"hide_{component}", False)
+            for key, (component, _, _) in REPLAY_COMPONENTS.items()
+        }
+        self._solid_color_texture = None
+        assets = {}
+        for key, hand in (("hand_rh", self.dexhand_rh), ("hand_lh", self.dexhand_lh)):
+            if visible[key]:
+                assets[key] = self._load_hand_asset(hand, use_urdf_materials=self.colors[key] == "urdf")
+        for key, data in (("object_rh", self.rh_data), ("object_lh", self.lh_data)):
+            if visible[key]:
+                assets[key] = self._load_object_asset(
+                    data["obj_urdf_path"], use_urdf_materials=self.colors[key] == "urdf"
+                )
 
         table_options = gymapi.AssetOptions()
         table_options.fix_base_link = True
@@ -369,56 +407,78 @@ class TacoRetargetViewer:
         # A shared non-zero filter bit suppresses contacts between replay
         # actors. Their poses should come solely from the recorded trajectory.
         replay_filter = 1
-        self.hand_rh_actor = self.gym.create_actor(
-            self.env, hand_rh_asset, identity, "dexhand_r", 0, replay_filter
-        )
-        self.hand_lh_actor = self.gym.create_actor(
-            self.env, hand_lh_asset, identity, "dexhand_l", 0, replay_filter
-        )
+        self.actor_handles = {}
+        for key in ("hand_rh", "hand_lh"):
+            if visible[key]:
+                self.actor_handles[key] = self.gym.create_actor(
+                    self.env, assets[key], identity, REPLAY_COMPONENTS[key][1], 0, replay_filter
+                )
 
         table_pose = gymapi.Transform()
         table_pose.p = gymapi.Vec3(*TABLE_POSITION)
         self.table_actor = self.gym.create_actor(
             self.env, table_asset, table_pose, "table", 0, replay_filter
         )
-        self.object_rh_actor = self.gym.create_actor(
-            self.env, object_rh_asset, identity, "manip_obj_rh", 0, replay_filter
-        )
-        self.object_lh_actor = self.gym.create_actor(
-            self.env, object_lh_asset, identity, "manip_obj_lh", 0, replay_filter
-        )
+        for key in ("object_rh", "object_lh"):
+            if visible[key]:
+                self.actor_handles[key] = self.gym.create_actor(
+                    self.env, assets[key], identity, REPLAY_COMPONENTS[key][1], 0, replay_filter
+                )
 
-        self._set_actor_color(self.hand_rh_actor, gymapi.Vec3(0.35, 0.75, 0.95))
-        self._set_actor_color(self.hand_lh_actor, gymapi.Vec3(0.75, 0.45, 0.95))
-        self._set_actor_color(self.object_rh_actor, gymapi.Vec3(1.0, 0.45, 0.08))
-        self._set_actor_color(self.object_lh_actor, gymapi.Vec3(0.2, 0.7, 0.35))
+        for key, (_, _, default_color) in REPLAY_COMPONENTS.items():
+            actor = self.actor_handles.get(key)
+            setattr(self, f"{key}_actor", actor)
+            if actor is None or self.colors[key] == "urdf":
+                continue
+            color = self.colors[key]
+            self._set_actor_color(
+                actor, gymapi.Vec3(*(default_color if color is None else color)),
+                solid=color is not None,
+            )
         self._set_actor_color(self.table_actor, gymapi.Vec3(0.12, 0.12, 0.12))
 
-    def _set_actor_color(self, actor, color):
+    def _set_actor_color(self, actor, color, *, solid=False):
+        if solid and self._solid_color_texture is None:
+            # Gym owns this shared white texture until the simulation is destroyed.
+            self._solid_color_texture = self.gym.create_texture_from_buffer(
+                self.sim, 1, 1, np.full((1, 4), 255, dtype=np.uint8)
+            )
+            if self._solid_color_texture == gymapi.INVALID_HANDLE:
+                raise RuntimeError("Failed to create the replay solid-color texture")
         body_count = self.gym.get_actor_rigid_body_count(self.env, actor)
         for body_index in range(body_count):
+            if solid:
+                self.gym.set_rigid_body_texture(
+                    self.env, actor, body_index, gymapi.MESH_VISUAL, self._solid_color_texture
+                )
             self.gym.set_rigid_body_color(self.env, actor, body_index, gymapi.MESH_VISUAL, color)
 
     def _acquire_state_tensors(self):
-        root_tensor = self.gym.acquire_actor_root_state_tensor(self.sim)
-        dof_tensor = self.gym.acquire_dof_state_tensor(self.sim)
-        self.root_state = gymtorch.wrap_tensor(root_tensor).view(-1, 13)
-        self.dof_state = gymtorch.wrap_tensor(dof_tensor).view(-1, 2)
-
         self.actor_indices = {
-            "hand_rh": self.gym.get_actor_index(self.env, self.hand_rh_actor, gymapi.DOMAIN_SIM),
-            "hand_lh": self.gym.get_actor_index(self.env, self.hand_lh_actor, gymapi.DOMAIN_SIM),
-            "object_rh": self.gym.get_actor_index(self.env, self.object_rh_actor, gymapi.DOMAIN_SIM),
-            "object_lh": self.gym.get_actor_index(self.env, self.object_lh_actor, gymapi.DOMAIN_SIM),
+            key: self.gym.get_actor_index(self.env, actor, gymapi.DOMAIN_SIM)
+            for key, actor in self.actor_handles.items()
         }
+        self.root_state = None
+        if self.actor_indices:
+            root_tensor = self.gym.acquire_actor_root_state_tensor(self.sim)
+            self.root_state = gymtorch.wrap_tensor(root_tensor).view(-1, 13)
 
-        expected_dofs = self.dexhand_rh.n_dofs + self.dexhand_lh.n_dofs
-        if self.dof_state.shape[0] != expected_dofs:
+        # Hands are created RH then LH, but either may be absent. Object/table
+        # assets must remain rigid, as in the original bimanual replay.
+        rh_dofs = self.dexhand_rh.n_dofs if self.hand_rh_actor is not None else 0
+        lh_dofs = self.dexhand_lh.n_dofs if self.hand_lh_actor is not None else 0
+        expected_dofs = rh_dofs + lh_dofs
+        actual_dofs = self.gym.get_sim_dof_count(self.sim)
+        if actual_dofs != expected_dofs:
             raise RuntimeError(
-                f"Unexpected simulation DOF count: {self.dof_state.shape[0]}, expected {expected_dofs}"
+                f"Unexpected simulation DOF count: {actual_dofs}, expected {expected_dofs}"
             )
-        self.rh_dof_slice = slice(0, self.dexhand_rh.n_dofs)
-        self.lh_dof_slice = slice(self.dexhand_rh.n_dofs, expected_dofs)
+        self.rh_dof_slice = slice(0, rh_dofs) if rh_dofs else None
+        self.lh_dof_slice = slice(rh_dofs, expected_dofs) if lh_dofs else None
+        self.dof_state = None
+        if expected_dofs:
+            dof_tensor = self.gym.acquire_dof_state_tensor(self.sim)
+            self.dof_state = gymtorch.wrap_tensor(dof_tensor).view(-1, 2)
 
     def _prepare_trajectories(self):
         self.hand_rh_pos = self.rh_data["opt_wrist_pos"].to(self.device, dtype=torch.float32)
@@ -443,11 +503,13 @@ class TacoRetargetViewer:
         self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_SPACE, "pause")
         self.gym.subscribe_viewer_keyboard_event(self.viewer, gymapi.KEY_R, "restart")
 
-        all_positions = torch.cat(
-            [self.hand_rh_pos, self.hand_lh_pos, self.object_rh_pos, self.object_lh_pos], dim=0
-        )
-        center = (all_positions.amin(dim=0) + all_positions.amax(dim=0)) / 2
-        center = center.detach().cpu().numpy()
+        positions = [getattr(self, f"{key}_pos") for key in self.actor_indices]
+        if positions:
+            all_positions = torch.cat(positions, dim=0)
+            center = (all_positions.amin(dim=0) + all_positions.amax(dim=0)) / 2
+            center = center.detach().cpu().numpy()
+        else:
+            center = np.array([TABLE_POSITION[0], TABLE_POSITION[1], TABLE_SURFACE_Z])
         camera_target = gymapi.Vec3(float(center[0]), float(center[1]), float(center[2]))
         camera_position = gymapi.Vec3(
             float(center[0] + 0.9), float(center[1] + 0.9), float(max(center[2] + 0.65, 0.8))
@@ -456,6 +518,8 @@ class TacoRetargetViewer:
         print("Controls: Space=pause/resume, R=restart, Esc=quit")
 
     def _write_root_pose(self, key, position, quaternion):
+        if key not in self.actor_indices:
+            return
         state = self.root_state[self.actor_indices[key]]
         state[:3] = position
         state[3:7] = quaternion
@@ -466,11 +530,16 @@ class TacoRetargetViewer:
         self._write_root_pose("hand_lh", self.hand_lh_pos[frame], self.hand_lh_quat[frame])
         self._write_root_pose("object_rh", self.object_rh_pos[frame], self.object_rh_quat[frame])
         self._write_root_pose("object_lh", self.object_lh_pos[frame], self.object_lh_quat[frame])
-        self.dof_state[:, 1] = 0
-        self.dof_state[self.rh_dof_slice, 0] = self.hand_rh_dof[frame]
-        self.dof_state[self.lh_dof_slice, 0] = self.hand_lh_dof[frame]
-        self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.root_state))
-        self.gym.set_dof_state_tensor(self.sim, gymtorch.unwrap_tensor(self.dof_state))
+        if self.dof_state is not None:
+            self.dof_state[:, 1] = 0
+            if self.rh_dof_slice is not None:
+                self.dof_state[self.rh_dof_slice, 0] = self.hand_rh_dof[frame]
+            if self.lh_dof_slice is not None:
+                self.dof_state[self.lh_dof_slice, 0] = self.hand_lh_dof[frame]
+        if self.root_state is not None:
+            self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.root_state))
+        if self.dof_state is not None:
+            self.gym.set_dof_state_tensor(self.sim, gymtorch.unwrap_tensor(self.dof_state))
 
     def run(self):
         frame = self.args.start_frame
@@ -572,6 +641,22 @@ def parse_args():
                 "action": "store_true",
                 "help": "Exit after one playback instead of looping",
             },
+        ] + [
+            {
+                "name": f"--{component}_color",
+                "type": _parse_color,
+                "default": None,
+                "help": f"{component.replace('_', ' ').capitalize()} appearance: solid RGB r,g,b in [0,1], "
+                        "or urdf for URDF materials (omitted: legacy color and textures)",
+            }
+            for component, _, _ in REPLAY_COMPONENTS.values()
+        ] + [
+            {
+                "name": f"--hide_{component}",
+                "action": "store_true",
+                "help": f"Hide the {component.replace('_', ' ')} in this replay",
+            }
+            for component, _, _ in REPLAY_COMPONENTS.values()
         ],
     )
 

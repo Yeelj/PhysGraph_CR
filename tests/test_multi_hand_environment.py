@@ -21,6 +21,7 @@ from scipy.spatial.transform import Rotation
 
 from main.dexhand_runtime import joint_order_indices, validate_direct_control
 from main.dexhand_spec import ObservationLayout, SUPPORTED_HANDS, get_hand_spec
+from main.visualization import TestVisualizationConfig as VisualizationConfig
 
 
 SOURCE_PATH = Path(__file__).resolve().parents[1] / "physgraph_envs/lib/envs/tasks/dexhandmanip_bih.py"
@@ -72,7 +73,7 @@ def load_environment_methods():
     source = SOURCE_PATH.read_text()
     tree = ast.parse(source)
     environment = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "DexHandManipBiHEnv")
-    wanted = {"_configure_hand_joint_order", "_update_states", "_reset_default_side", "pre_physics_step", "compute_observations_side", "compute_reward_side"}
+    wanted = {"_configure_hand_joint_order", "_update_states", "_reset_default_side", "pre_physics_step", "compute_observations_side", "compute_reward_side", "_apply_test_visualization", "set_force_vis"}
     methods = [deepcopy(node) for node in environment.body if isinstance(node, ast.FunctionDef) and node.name in wanted]
     if len(methods) != len(wanted):
         raise AssertionError("Environment methods changed; update the integration fixture")
@@ -96,7 +97,7 @@ def load_environment_methods():
         "joint_order_indices": joint_order_indices,
         "torch_jit_utils": SimpleNamespace(tensor_clamp=clamp_tensor, scale=lambda x, low, high: low + (x + 1) * 0.5 * (high - low)),
         "gymtorch": SimpleNamespace(unwrap_tensor=lambda x: x),
-        "gymapi": SimpleNamespace(ENV_SPACE=0),
+        "gymapi": SimpleNamespace(ENV_SPACE=0, MESH_VISUAL=1, INVALID_HANDLE=-1, Vec3=lambda *rgb: rgb),
         "aa_to_quat": aa_to_quat,
         "rotmat_to_quat": rotmat_to_quat,
         "quat_to_rotmat": quat_to_rotmat,
@@ -116,12 +117,42 @@ class FakeGym:
         self.assets = assets
         self.last_targets = None
         self.last_forces = None
+        self.colors = {}
+        self.textures = {}
+        self.texture_buffers = []
+        self.lines = []
+        self.lines_cleared = 0
 
     def get_asset_dof_names(self, asset):
         return self.assets[asset]["dof_names"]
 
     def get_asset_rigid_body_names(self, asset):
         return self.assets[asset]["body_names"]
+
+    def find_actor_handle(self, env, actor_name):
+        return actor_name
+
+    def get_actor_rigid_body_count(self, env, actor):
+        if actor in ("dexhand_r", "dexhand_l"):
+            return len(self.assets["rh" if actor == "dexhand_r" else "lh"]["body_names"])
+        return 2 if actor == "manip_obj_rh" else 3
+
+    def create_texture_from_buffer(self, sim, width, height, pixels):
+        self.texture_buffers.append((width, height, pixels.copy()))
+        return 700
+
+    def set_rigid_body_texture(self, env, actor, body_index, mesh, texture):
+        self.textures[env, actor, body_index, mesh] = texture
+
+    def set_rigid_body_color(self, env, actor, body_index, mesh, color):
+        self.colors[env, actor, body_index, mesh] = color
+
+    def clear_lines(self, viewer):
+        self.lines.clear()
+        self.lines_cleared += 1
+
+    def add_lines(self, viewer, env, count, vertices, color):
+        self.lines.append((env, vertices.copy(), color.copy()))
 
     def apply_rigid_body_force_tensors(self, sim, force, torque, space):
         self.last_forces = force.clone(), torque.clone()
@@ -155,8 +186,12 @@ def fixture(name, future_length=1):
         }
         setattr(env, "dexhand_" + side, SimpleNamespace(
             n_dofs=dofs, n_bodies=bodies, dof_names=spec.dof_names, body_names=spec.body_names,
+            bone_links=spec.graph_edges,
             contact_body_names=spec.contact_body_names, weight_idx={}, to_dex=lambda _: (right.body_names[0],),
         ))
+        setattr(env, f"dexhand_{side}_body_indices", {
+            body: assets[side]["body_names"].index(body) for body in spec.body_names
+        })
     # Bind side-specific wrist lookup (Inspire has side prefixes).
     for side in ("rh", "lh"):
         getattr(env, "dexhand_" + side).to_dex = lambda _, side=side: (env.hand_specs[side].body_names[0],)
@@ -192,6 +227,10 @@ def fixture(name, future_length=1):
     env.reset_buf = torch.zeros(env.num_envs, dtype=torch.bool)
     env.total_rew_buf = torch.zeros(env.num_envs)
     env.training, env.headless = True, True
+    env.test_visualization = VisualizationConfig()
+    env.envs = list(range(env.num_envs))
+    env.viewer = object()
+    env.graphics_device_id = 0
     env.max_episode_length = frames
     env.use_pid_control = False
     env.act_moving_average = 0.4
@@ -238,6 +277,129 @@ def fixture(name, future_length=1):
     env.actions = torch.zeros(env.num_envs, 12 + 2 * dofs)
     env._update_states()
     return env
+
+
+class VisualizationTests(unittest.TestCase):
+    def test_yaml_overrides_reach_test_environment_and_training_keeps_defaults(self):
+        from omegaconf import OmegaConf
+        import lib  # Registers the same resolvers as the training entry point.
+
+        root = SOURCE_PATH.parents[4]
+        cfg = OmegaConf.load(root / "main/cfg/config.yaml")
+        cfg.task = OmegaConf.load(root / "main/cfg/task/ResDexHand.yaml")
+        OmegaConf.set_struct(cfg, True)
+        defaults = VisualizationConfig.from_mapping(cfg.task.env.testVisualization)
+        self.assertEqual(defaults, VisualizationConfig())
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist([
+            "test=true", "test_visualization.tool_color=[0.8,0.2,0.2]",
+            "test_visualization.show_mano=false", "test_visualization.contact_highlight=false",
+        ]))
+        parsed = VisualizationConfig.from_mapping(
+            cfg.task.env.testVisualization, training=cfg.task.env.training
+        )
+        self.assertEqual(parsed.tool_color, (0.8, 0.2, 0.2))
+        self.assertFalse(parsed.show_mano)
+        self.assertFalse(parsed.contact_highlight)
+        cfg.test = False
+        self.assertEqual(VisualizationConfig.from_mapping(
+            cfg.task.env.testVisualization, training=cfg.task.env.training
+        ), VisualizationConfig())
+
+    def test_invalid_colors_and_switches_fail_before_simulation(self):
+        for color in ([0, 1], [0, 1, 2], [-0.1, 0, 0], [float("nan"), 0, 0],
+                      [float("inf"), 0, 0], [True, 0, 0], "red", 0.5):
+            with self.subTest(color=color), self.assertRaisesRegex(ValueError, "left_hand_color"):
+                VisualizationConfig.from_mapping({"left_hand_color": color})
+        for switch in ("show_mano", "contact_highlight"):
+            with self.subTest(switch=switch), self.assertRaisesRegex(ValueError, switch):
+                VisualizationConfig.from_mapping({switch: "false"})
+        self.assertEqual(VisualizationConfig.from_mapping(
+            {"left_hand_color": [999], "show_mano": "false"}, training=True
+        ), VisualizationConfig())
+
+    def test_each_actor_gets_its_own_solid_color_on_every_body_in_headless_camera_mode(self):
+        colors = {
+            "left_hand_color": [0.1, 0.2, 0.3], "right_hand_color": [0.3, 0.2, 0.1],
+            "object_color": [0.5, 0.6, 0.7], "tool_color": [0.7, 0.6, 0.5],
+        }
+        for hand in SUPPORTED_HANDS:
+            with self.subTest(hand=hand):
+                env = fixture(hand)
+                env.training = False
+                env.test_visualization = VisualizationConfig.from_mapping(colors)
+                tensors = [env._q.clone(), env._rigid_body_state.clone(), env.net_cf.clone()]
+                env._apply_test_visualization()
+                self.assertEqual(len(env.gym.texture_buffers), 1)
+                width, height, pixels = env.gym.texture_buffers[0]
+                self.assertEqual((width, height, pixels.shape, pixels.dtype), (1, 1, (1, 4), np.uint8))
+                np.testing.assert_array_equal(pixels, 255)
+                expected = {}
+                for actor, field in (("dexhand_l", "left_hand_color"), ("dexhand_r", "right_hand_color"),
+                                     ("manip_obj_lh", "object_color"), ("manip_obj_rh", "tool_color")):
+                    for env_id in env.envs:
+                        for body in range(env.gym.get_actor_rigid_body_count(env_id, actor)):
+                            expected[env_id, actor, body, 1] = tuple(colors[field])
+                self.assertEqual(env.gym.colors, expected)
+                self.assertEqual(env.gym.textures, {key: 700 for key in expected})
+                for actual, original in zip((env._q, env._rigid_body_state, env.net_cf), tensors):
+                    torch.testing.assert_close(actual, original)
+
+    def test_null_colors_training_and_disabled_graphics_do_not_change_materials(self):
+        for training, graphics, values in (
+            (False, 0, {}), (True, 0, {"tool_color": [1, 0, 0]}),
+            (False, -1, {"tool_color": [1, 0, 0]}),
+        ):
+            with self.subTest(training=training, graphics=graphics, values=values):
+                env = fixture("inspire")
+                env.training, env.graphics_device_id = training, graphics
+                env.test_visualization = VisualizationConfig.from_mapping(values)
+                env._apply_test_visualization()
+                self.assertFalse(env.gym.colors)
+                self.assertFalse(env.gym.textures)
+                self.assertFalse(env.gym.texture_buffers)
+        env.training, env.graphics_device_id = False, 0
+        env._apply_test_visualization()
+        self.assertEqual({key[1] for key in env.gym.colors}, {"manip_obj_rh"})
+
+    def test_contact_highlight_restores_custom_or_legacy_colors_with_actor_local_indices(self):
+        for values in ({}, {"left_hand_color": [0, 0.5, 1], "right_hand_color": [1, 0.5, 0]}):
+            env = fixture("inspire")
+            env.test_visualization = VisualizationConfig.from_mapping(values)
+            for side, actor, field in (("lh", "dexhand_l", "left_hand_color"),
+                                      ("rh", "dexhand_r", "right_hand_color")):
+                part = env.hand_specs[side].body_names[0]
+                body = getattr(env, f"dexhand_{side}_body_indices")[part]
+                self.assertNotEqual(body, 0)  # The fixture reverses imported body order.
+                env.set_force_vis(0, part, True, side)
+                self.assertEqual(env.gym.colors[0, actor, body, 1], (1, 0.6, 0.6))
+                env.set_force_vis(0, part, False, side)
+                self.assertEqual(env.gym.colors[0, actor, body, 1], tuple(values.get(field, (1, 1, 1))))
+            original_colors = dict(env.gym.colors)
+            env.test_visualization = VisualizationConfig.from_mapping({"contact_highlight": False})
+            env.set_force_vis(0, part, True, side)
+            self.assertEqual(env.gym.colors, original_colors)
+
+    def test_mano_and_contact_switches_are_independent_and_do_not_change_actions(self):
+        for hand in SUPPORTED_HANDS:
+            reference = fixture(hand)
+            actions = torch.linspace(-1, 1, reference.actions.shape[1]).repeat(reference.num_envs, 1)
+            reference.pre_physics_step(actions)
+            for show_mano in (True, False):
+                for highlight in (True, False):
+                    with self.subTest(hand=hand, mano=show_mano, highlight=highlight):
+                        env = fixture(hand)
+                        env.training, env.headless = False, False
+                        env.test_visualization = VisualizationConfig.from_mapping({
+                            "show_mano": show_mano, "contact_highlight": highlight,
+                        })
+                        env.pre_physics_step(actions)
+                        expected_lines = sum(len(spec.graph_edges) for spec in env.hand_specs.values()) * env.num_envs
+                        self.assertEqual(len(env.gym.lines), expected_lines if show_mano else 0)
+                        self.assertEqual(env.gym.lines_cleared, 1)
+                        self.assertEqual(bool(env.gym.colors), highlight)
+                        torch.testing.assert_close(env.gym.last_targets, reference.gym.last_targets)
+                        for actual, expected in zip(env.gym.last_forces, reference.gym.last_forces):
+                            torch.testing.assert_close(actual, expected)
 
 
 class MultiHandEnvironmentTests(unittest.TestCase):

@@ -179,6 +179,51 @@ We follow the prerequisit of [ManipTrans](https://maniptrans.github.io/) to prep
     ```bash
     python main/rl/train.py task=ResDexHand dexhand=artimano side=BiH headless=false num_envs=4 learning_rate=2e-4 test=true randomStateInit=false dataIndices=[083f7@0] actionsMovingAverage=0.4 checkpoint=runs/083f7@0_artimano__xxxxxx/nn/083f7@0_artimano.pth
     ```
+
+  For `task=ResDexHand side=BiH`, append any of these display overrides to the
+  test command:
+
+    ```bash
+    test_visualization.left_hand_color='[0.3,0.6,1.0]' \
+    test_visualization.right_hand_color='[1.0,0.6,0.3]' \
+    test_visualization.object_color='[0.7,0.7,0.7]' \
+    test_visualization.tool_color='[0.8,0.2,0.2]' \
+    test_visualization.show_mano=false \
+    test_visualization.contact_highlight=false
+    ```
+
+  These options apply only with `test=true`; training ignores them. Colors are
+  RGB values in `[0, 1]`, with `null` preserving the existing appearance. A custom
+  color replaces that actor's display texture with white for a solid color;
+  source assets, collision geometry and semantic contact labels stay unchanged.
+  `object_color` selects the left-hand task object; `tool_color` selects the
+  right-hand tool, including a `new_obj` replacement. Both colors and textures
+  apply to the viewer and camera images. By default, both switches are `true`
+  and all colors are `null`, preserving the existing behavior. In the viewer,
+  contact highlighting temporarily makes contacting hand links pink and restores
+  their custom color (or the legacy white) after contact ends. Set
+  `contact_highlight=false` for fixed hand colors or the original hand materials.
+  `show_mano` controls both hands' reference skeleton lines in the viewer
+  (`headless=false`); camera recordings do not include these lines.
+
+  To replay retarget results directly (TACO and OakInk-V2 are both supported):
+
+    ```bash
+    python scripts/visualize_taco_retarget.py --data_idx '083f7@0' --dexhand artimano \
+      --left_hand_color 0.3,0.6,1.0 --right_hand_color 1.0,0.6,0.3 \
+      --object_color 0.7,0.7,0.7 --tool_color 0.8,0.2,0.2
+    ```
+
+  Each of the four `--*_color` arguments accepts comma-separated RGB numbers in
+  `[0, 1]` for a solid color, or `urdf` to prefer URDF materials without the
+  viewer's fixed color override (for example, `--tool_color urdf`). Omitted color
+  arguments retain the existing colors and textures. Use `--hide_left_hand`,
+  `--hide_right_hand`, `--hide_object`, and `--hide_tool` independently to hide
+  parts at startup. `object` is the left-hand target and `tool` is the right-hand
+  tool, including `--new_obj` replacements. All parts are visible by default.
+  The replay still loads and validates both retarget trajectories; hiding parts
+  only changes the viewer scene. The camera centers on visible parts, or the
+  table when all four are hidden. Space pauses/resumes, R restarts, and Esc exits.
 ---
 
 
